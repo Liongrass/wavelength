@@ -16,7 +16,8 @@ helpers for end-to-end tests.
   `GenerateAndWait`), funding (`Faucet`, `FundOperatorLND`), reorg
   (`Reorg`, `ReorgDepth`, `ReconsiderBlock`), and multi-node helpers
   (`StartAdditionalLND`, `StartAdditionalLNDWithBackend`,
-  `SetupChannelBetween`).
+  `SetupChannelBetween`), and seed recovery helpers
+  (`StartAdditionalLNDWithSeed`, `RestoreLNDFromSeed`, `RescanLND`).
 - `Options` — `NewHarness` configuration: image tags, `LNDRequireInterceptor`,
   `LNDBuildPath`, `ArtifactsBaseDir`, `GroupName`, log-to-stdout toggles,
   `StartTapd`, `AlwaysKeepArtifacts`. `DefaultOptions()` gives safe defaults.
@@ -48,6 +49,24 @@ helpers for end-to-end tests.
   primary LND node resyncs to the new tip.
 - `LNDRequireInterceptor` only applies to the primary LND node; additional
   nodes started via `StartAdditionalLND*` never set it.
+- Seed recovery helpers operate on instances from
+  `StartAdditionalLNDWithSeed`. Serialize their lifecycle and client use
+  with other harness lifecycle operations, including `Stop`.
+- `RestoreLNDFromSeed` requires removal of the old container before deleting
+  the wallet and macaroons under the chain-specific directory. TLS survives.
+  LND then performs default-account seed recovery and waits for chain sync.
+- Custom accounts require the original key scope and account index, a
+  matching xpub, and at least the original external AND internal address
+  counts. Reconstruct them before calling `RescanLND`. A rescan reaching
+  the chain tip does not prove complete recovery; assert expected outpoints
+  and spendability in the caller's test.
+- Restore and rescan replace the container and close the old harness RPC
+  connection. The instance pointer remains stable, but its ports and client
+  are refreshed. Rebuild any separately constructed clients.
+- `systest.TestLNDSeedRestore` tests real wallet deletion, both address
+  branches, incomplete custom-account reconstruction, and spending restored
+  default-account coins. The custom fixture is watch-only because the pinned
+  image predates native custom-account creation.
 - Container teardown (`Stop`) is guarded by `sync.Once`; a signal handler
   also calls `Stop` as a safety net against orphaned containers.
 
