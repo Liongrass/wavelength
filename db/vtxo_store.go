@@ -546,41 +546,10 @@ func (s *VTXOPersistenceStore) ListVTXOsByStatus(ctx context.Context,
 	return result, err
 }
 
-// ListLiveVTXOsLight returns the same descriptors as ListLiveVTXOs with a
-// nil Ancestry on every entry. The ancestry side table's TLV tree fragments
-// grow with OOR chain depth, and the batched join sorts those blobs through
-// SQLite's external sorter on every call, so consumers that never walk the
-// lineage (the ListVTXOs RPC response carries no ancestry) skip the side
-// table entirely.
-func (s *VTXOPersistenceStore) ListLiveVTXOsLight(ctx context.Context) (
-	[]*vtxo.Descriptor, error) {
-
-	readTxOpts := ReadTxOption()
-
-	var result []*vtxo.Descriptor
-
-	err := s.db.ExecTx(ctx, readTxOpts, func(q RoundStore) error {
-		rows, err := q.ListLiveVTXOs(ctx)
-		if err != nil {
-			return fmt.Errorf("list live VTXOs: %w", err)
-		}
-
-		descs, err := s.rowsToDescriptorsNoAncestry(ctx, q, rows)
-		if err != nil {
-			return err
-		}
-
-		result = descs
-
-		return nil
-	})
-
-	return result, err
-}
-
 // ListVTXOsByStatusLight returns the same descriptors as ListVTXOsByStatus
-// with a nil Ancestry on every entry. See ListLiveVTXOsLight for why
-// listing-only consumers skip the ancestry side table.
+// without ancestry. The ancestry side table's TLV blobs grow with OOR chain
+// depth and sort through SQLite's external sorter, so listings that never
+// walk the lineage skip it.
 func (s *VTXOPersistenceStore) ListVTXOsByStatusLight(ctx context.Context,
 	status vtxo.VTXOStatus) ([]*vtxo.Descriptor, error) {
 

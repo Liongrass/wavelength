@@ -786,10 +786,6 @@ func TestListVTXOsLightSkipsAncestry(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assertLight(light)
-
-	liveLight, err := vtxoStore.ListLiveVTXOsLight(ctx)
-	require.NoError(t, err)
-	assertLight(liveLight)
 }
 
 // addAncestryFragment appends a synthetic ancestry fragment to a
