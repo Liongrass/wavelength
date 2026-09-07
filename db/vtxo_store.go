@@ -2,11 +2,13 @@ package db
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -594,6 +596,71 @@ func (s *VTXOPersistenceStore) ListVTXOsByStatusLight(ctx context.Context,
 
 		// A non-nil empty index keeps rowToDescriptor on the preloaded
 		// (zero ancestry) path, matching rowsToDescriptorsNoAncestry.
+		noAncestry := map[wire.OutPoint][]vtxo.Ancestry{}
+		descs, err := s.byStatusRowsToDescriptors(
+			ctx, q, rows, noAncestry,
+		)
+		if err != nil {
+			return err
+		}
+
+		result = descs
+
+		return nil
+	})
+
+	return result, err
+}
+
+// ListVTXOsByStatusesLight returns the descriptors in any of the given
+// statuses, newest first, without ancestry. One indexed query per status runs
+// inside a single read transaction; a parameterised IN list is not portable
+// across SQLite and Postgres.
+func (s *VTXOPersistenceStore) ListVTXOsByStatusesLight(ctx context.Context,
+	statuses []vtxo.VTXOStatus) ([]*vtxo.Descriptor, error) {
+
+	readTxOpts := ReadTxOption()
+
+	var result []*vtxo.Descriptor
+
+	err := s.db.ExecTx(ctx, readTxOpts, func(q RoundStore) error {
+		var rows []sqlc.ListVTXOsByStatusRow
+		seen := make(map[vtxo.VTXOStatus]struct{}, len(statuses))
+		for _, status := range statuses {
+			if _, dup := seen[status]; dup {
+				continue
+			}
+			seen[status] = struct{}{}
+
+			statusRows, err := q.ListVTXOsByStatus(
+				ctx, int32(status),
+			)
+			if err != nil {
+				return fmt.Errorf("list VTXOs by status: %w",
+					err)
+			}
+
+			rows = append(rows, statusRows...)
+		}
+
+		// Legacy rows flagged spent stay hidden under other statuses.
+		rows = slices.DeleteFunc(
+			rows, func(row sqlc.ListVTXOsByStatusRow) bool {
+				return row.Vtxo.Spent &&
+					vtxo.VTXOStatus(row.Vtxo.Status) !=
+						vtxo.VTXOStatusSpent
+			},
+		)
+
+		slices.SortStableFunc(
+			rows, func(a, b sqlc.ListVTXOsByStatusRow) int {
+				return cmp.Compare(
+					b.Vtxo.CreationTime,
+					a.Vtxo.CreationTime,
+				)
+			},
+		)
+
 		noAncestry := map[wire.OutPoint][]vtxo.Ancestry{}
 		descs, err := s.byStatusRowsToDescriptors(
 			ctx, q, rows, noAncestry,
