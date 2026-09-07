@@ -8,6 +8,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/lightninglabs/wavelength/rpc/wavewalletrpc"
 	"github.com/lightninglabs/wavelength/waverpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Local cooperative-leave fee-floor sizing. These virtual sizes drive the
@@ -84,16 +86,19 @@ func (r *router) fetchOnchainTerms(ctx context.Context) onchainTerms {
 // lifetimes determine the operator's per-forfeit charges. sweepAll sizes
 // the local fallback's outputs; terms supplies the chain height and policy.
 func (r *router) estimateOnchainFee(ctx context.Context, inputs []*waverpc.VTXO,
-	sweepAll bool, terms onchainTerms) onchainFeeQuote {
+	sweepAll bool, terms onchainTerms) (onchainFeeQuote, error) {
 
-	fee, ok := r.quoteOnchainInputs(ctx, inputs, terms.blockHeight)
+	fee, ok, err := r.quoteOnchainInputs(ctx, inputs, terms.blockHeight)
+	if err != nil {
+		return onchainFeeQuote{}, err
+	}
 	if ok {
 		return onchainFeeQuote{
 			feeSat:   fee,
 			feeKnown: true,
 			quoteStatus: wavewalletrpc.
 				SendQuoteStatus_SEND_QUOTE_STATUS_COMPLETE,
-		}
+		}, nil
 	}
 
 	// Operator quote unavailable: fall back to a local floor derived
@@ -112,7 +117,7 @@ func (r *router) estimateOnchainFee(ctx context.Context, inputs []*waverpc.VTXO,
 			"one; a complete per-input operator quote was " +
 			"unavailable; the binding fee is set when the round " +
 			"seals",
-	}
+	}, nil
 }
 
 // onchainQuoteKey identifies VTXOs that can reuse the same operator quote.
@@ -128,18 +133,20 @@ type onchainQuoteKey struct {
 // Quotes assume batch size one; the binding fee uses actual round occupancy.
 // Any missing timing context or invalid quote discards the entire remote
 // estimate, so a partial sum can never masquerade as a complete quote.
+// An explicit economic warning instead rejects the preview: substituting a
+// local floor would hide an operator quote that is already known to be costly.
 func (r *router) quoteOnchainInputs(ctx context.Context, inputs []*waverpc.VTXO,
-	height uint32) (int64, bool) {
+	height uint32) (int64, bool, error) {
 
 	if height == 0 || len(inputs) == 0 {
-		return 0, false
+		return 0, false, nil
 	}
 
 	quotes := make(map[onchainQuoteKey]int64)
 	var total int64
 	for _, input := range inputs {
 		if input.GetBatchExpiry() <= 0 || input.GetAmountSat() <= 0 {
-			return 0, false
+			return 0, false, nil
 		}
 
 		// Zero means "use the full default lifetime" to the operator.
@@ -158,7 +165,19 @@ func (r *router) quoteOnchainInputs(ctx context.Context, inputs []*waverpc.VTXO,
 				},
 			)
 			if err != nil || resp == nil {
-				return 0, false
+
+				//nolint:nilerr // Use the local floor.
+				return 0, false, nil
+			}
+			if resp.GetBelowDustWarning() {
+				const reason = "uneconomic input %s: " +
+					"amount=%d sat, fee=%d sat"
+
+				return 0, false, status.Errorf(
+					codes.FailedPrecondition, reason,
+					input.GetOutpoint(),
+					input.GetAmountSat(),
+					resp.GetTotalFeeSat())
 			}
 
 			fee = resp.GetTotalFeeSat()
@@ -167,12 +186,12 @@ func (r *router) quoteOnchainInputs(ctx context.Context, inputs []*waverpc.VTXO,
 
 		// Bound the addition before accumulating untrusted totals.
 		if fee < 0 || fee > int64(btcutil.MaxSatoshi)-total {
-			return 0, false
+			return 0, false, nil
 		}
 		total += fee
 	}
 
-	return total, true
+	return total, true, nil
 }
 
 // localOnchainFeeFloor computes a batch-size-1 fee lower bound from the

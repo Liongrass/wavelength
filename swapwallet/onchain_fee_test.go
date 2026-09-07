@@ -11,6 +11,8 @@ import (
 	"github.com/lightninglabs/wavelength/rpc/wavewalletrpc"
 	"github.com/lightninglabs/wavelength/waverpc"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestRouterOnchainSweepQuotesEveryInput prevents a multi-input sweep from
@@ -304,12 +306,13 @@ func TestOnchainFeeQuoteCompleteness(t *testing.T) {
 				}, nil
 			}
 
-			quote := r.estimateOnchainFee(
+			quote, err := r.estimateOnchainFee(
 				t.Context(), inputs, true, onchainTerms{
 					blockHeight: tt.height,
 					feeRate:     1,
 				},
 			)
+			require.NoError(t, err)
 			require.Equal(t, tt.wantFee, quote.feeSat)
 			require.Equal(t, tt.wantKnown, quote.feeKnown)
 			require.Equal(t, tt.wantCalls, rpc.estimateFeeCalls)
@@ -331,6 +334,211 @@ func TestOnchainFeeQuoteCompleteness(t *testing.T) {
 			require.Contains(
 				t, quote.warning, "per-input operator quote",
 			)
+		})
+	}
+}
+
+// TestRouterOnchainRejectsUneconomicInput prevents an explicit operator
+// warning from being replaced by the cheaper local fallback estimate.
+func TestRouterOnchainRejectsUneconomicInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		sweepAll bool
+		fee      int64
+	}{
+		{
+			sweepAll: false,
+			fee:      600,
+		},
+		{
+			sweepAll: false,
+			fee:      1200,
+		},
+		{
+			sweepAll: true,
+			fee:      600,
+		},
+		{
+			sweepAll: true,
+			fee:      1200,
+		},
+	}
+	for _, tt := range tests {
+		name := fmt.Sprintf("sweep=%t/fee=%d", tt.sweepAll, tt.fee)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r, _, rpc := newRouterFixture(t)
+			rpc.getInfoResp = &waverpc.GetInfoResponse{
+				BlockHeight: 1000,
+				ServerInfo: &waverpc.ServerInfo{
+					FeeRate: 1,
+				},
+			}
+			rpc.listVTXOsResp = &waverpc.ListVTXOsResponse{
+				Vtxos: []*waverpc.VTXO{
+					{
+						Outpoint:    "large:0",
+						AmountSat:   10000,
+						BatchExpiry: 1200,
+					},
+					{
+						Outpoint:    "small:0",
+						AmountSat:   1000,
+						BatchExpiry: 1200,
+					},
+				},
+			}
+			rpc.estimateFeeFn = func(
+				req *waverpc.EstimateFeeRequest) (
+				*waverpc.EstimateFeeResponse, error) {
+
+				if req.GetAmountSat() == 10000 {
+					return &waverpc.EstimateFeeResponse{
+						TotalFeeSat: 100,
+					}, nil
+				}
+
+				return &waverpc.EstimateFeeResponse{
+					TotalFeeSat:      tt.fee,
+					BelowDustWarning: true,
+				}, nil
+			}
+			req := &wavewalletrpc.PrepareSendRequest{
+				Destination: &wavewalletrpc.
+					PrepareSendRequest_OnchainAddress{
+					OnchainAddress: "bcrt1qaddr",
+				},
+				SweepAll: tt.sweepAll,
+			}
+			if !tt.sweepAll {
+				req.AmtSat = 10001
+			}
+
+			resp, err := r.PrepareSend(t.Context(), req)
+			require.Equal(
+				t, codes.FailedPrecondition, status.Code(err),
+			)
+			require.ErrorContains(t, err, "small:0")
+			require.ErrorContains(t, err, "uneconomic")
+			require.Nil(t, resp)
+			require.Empty(t, r.intents.intents)
+			require.Equal(t, 2, rpc.estimateFeeCalls)
+		})
+	}
+}
+
+// TestRouterOnchainSweepOutputFloor checks the destination amount after all
+// fees, even when the operator does not flag individual inputs as uneconomic.
+func TestRouterOnchainSweepOutputFloor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		amount     int64
+		fee        int64
+		dust       uint64
+		local      bool
+		wantReject bool
+	}{
+		{
+			name:       "fee exceeds balance",
+			amount:     1000,
+			fee:        1200,
+			wantReject: true,
+		},
+		{
+			name:       "fee consumes balance",
+			amount:     1000,
+			fee:        1000,
+			wantReject: true,
+		},
+		{
+			name:       "below advertised floor",
+			amount:     1000,
+			fee:        671,
+			dust:       330,
+			wantReject: true,
+		},
+		{
+			name:   "at advertised floor",
+			amount: 1000,
+			fee:    670,
+			dust:   330,
+		},
+		{
+			name:   "zero fee",
+			amount: 330,
+			dust:   330,
+		},
+		{
+			name:       "local below floor",
+			amount:     490,
+			dust:       330,
+			local:      true,
+			wantReject: true,
+		},
+		{
+			name:   "local at floor",
+			amount: 491,
+			dust:   330,
+			local:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r, _, rpc := newRouterFixture(t)
+			rpc.getInfoResp = &waverpc.GetInfoResponse{
+				BlockHeight: 1000,
+				ServerInfo: &waverpc.ServerInfo{
+					FeeRate:   1,
+					DustLimit: tt.dust,
+				},
+			}
+			rpc.listVTXOsResp = &waverpc.ListVTXOsResponse{
+				Vtxos: []*waverpc.VTXO{
+					{
+						Outpoint:    "tx1:0",
+						AmountSat:   tt.amount,
+						BatchExpiry: 1200,
+					},
+				},
+			}
+			rpc.estimateFeeResp = &waverpc.EstimateFeeResponse{
+				TotalFeeSat: tt.fee,
+			}
+			if tt.local {
+				rpc.estimateFeeErr = errors.New("operator " +
+					"unavailable")
+			}
+
+			dst := &wavewalletrpc.PrepareSendRequest_OnchainAddress{
+				OnchainAddress: "bcrt1qaddr",
+			}
+			resp, err := r.PrepareSend(
+				t.Context(), &wavewalletrpc.PrepareSendRequest{
+					Destination: dst,
+					SweepAll:    true,
+				},
+			)
+			if tt.wantReject {
+				require.Equal(
+					t, codes.FailedPrecondition,
+					status.Code(err),
+				)
+				require.ErrorContains(t, err, "after fees")
+				require.Nil(t, resp)
+				require.Empty(t, r.intents.intents)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotEmpty(t, resp.GetSendIntentId())
+			require.Equal(t, !tt.local, resp.GetFeeKnown())
 		})
 	}
 }
