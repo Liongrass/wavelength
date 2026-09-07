@@ -500,7 +500,7 @@ func (r *router) prepareOnchain(ctx context.Context, addr string,
 	}
 
 	feeQuote := r.estimateOnchainFee(
-		ctx, previewAmount, len(res.Selected), sweepAll, terms,
+		ctx, res.Selected, sweepAll, terms,
 	)
 
 	// Guard the preview's coherence: a bounded send must not report an
