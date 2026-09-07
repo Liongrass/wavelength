@@ -1426,9 +1426,14 @@ func (r *RPCServer) listStoredVTXOs(ctx context.Context,
 				ctx, packageStore, v, protoVTXO,
 			)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal,
-					"populate package checkpoint psbts: %v",
-					err)
+				// An unreadable package only costs this entry
+				// its PSBTs.
+				r.server.log.DebugS(ctx, "Skipping checkpoint "+
+					"PSBTs for VTXO",
+					slog.String(
+						"outpoint", v.Outpoint.String(),
+					),
+					btclog.Fmt("err", "%v", err))
 			}
 		}
 
