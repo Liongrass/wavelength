@@ -1477,6 +1477,9 @@ func protoStatusToDomain(s waverpc.VTXOStatus) (vtxo.VTXOStatus, error) {
 	case waverpc.VTXOStatus_VTXO_STATUS_FAILED:
 		return vtxo.VTXOStatusFailed, nil
 
+	case waverpc.VTXOStatus_VTXO_STATUS_SPENDING:
+		return vtxo.VTXOStatusSpending, nil
+
 	case waverpc.VTXOStatus_VTXO_STATUS_EXPIRED:
 		return vtxo.VTXOStatusExpired, nil
 
