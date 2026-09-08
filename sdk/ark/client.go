@@ -645,7 +645,8 @@ func (c *Client) GetBalance(ctx context.Context) (*waverpc.GetBalanceResponse,
 }
 
 // ListVTXOs returns the daemon's known VTXOs using the supplied filter
-// request. Passing nil uses the daemon defaults with no extra filters.
+// request. Passing nil lists the inventory set: every VTXO except forfeited
+// and spent ones, newest first, of which only live entries are spendable.
 func (c *Client) ListVTXOs(ctx context.Context, req *waverpc.ListVTXOsRequest) (
 	*waverpc.ListVTXOsResponse, error) {
 

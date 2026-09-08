@@ -1739,3 +1739,30 @@ func TestAutomaticExitDecisionReason(t *testing.T) {
 		})
 	}
 }
+
+// TestVTXOStatusProtoRoundTrip verifies that every persisted status maps
+// between the proto and domain enums in both directions.
+func TestVTXOStatusProtoRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	unmapped := map[waverpc.VTXOStatus]bool{
+		waverpc.VTXOStatus_VTXO_STATUS_UNSPECIFIED:   true,
+		waverpc.VTXOStatus_VTXO_STATUS_PENDING_ROUND: true,
+	}
+
+	for val, name := range waverpc.VTXOStatus_name {
+		protoStatus := waverpc.VTXOStatus(val)
+		if unmapped[protoStatus] {
+			_, err := protoStatusToDomain(protoStatus)
+			require.Error(t, err, name)
+
+			continue
+		}
+
+		domainStatus, err := protoStatusToDomain(protoStatus)
+		require.NoError(t, err, name)
+		require.Equal(
+			t, protoStatus, vtxoStatusToProto(domainStatus), name,
+		)
+	}
+}
