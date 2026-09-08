@@ -145,3 +145,11 @@ background ingress polling with event routing.
 - [docs/durable_actor_architecture.md](../docs/durable_actor_architecture.md) — Durable actor internals.
 - [p-models/durableactor/README.md](../p-models/durableactor/README.md) — P models of the ingress cursor fold and of the dispatch deferral/redrive against bounded in-memory mailboxes.
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — System-wide package map.
+
+## Ingress evidence
+
+See [mailbox ingress safety](../docs/mailbox_ingress_safety.md) for the
+occurrence-ID, 30-day receipt and bounded poison-quarantine contracts. Receipts
+are consumed at durable inbox insertion, not at an in-memory Tell. Quarantine
+uses per-lane reservations inside a global bound and is never aged out;
+recovery removes it only with a durable handoff.
