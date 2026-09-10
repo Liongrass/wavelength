@@ -2185,6 +2185,18 @@ func TestProofNodeHeightHintLogsBoundedFallbackAtInfo(t *testing.T) {
 	)
 	require.Contains(t, buf.String(), "[INF]")
 	require.NotContains(t, buf.String(), "[WRN]")
+
+	// Source watches must also use the configured deployment floor. On a
+	// fresh exit, registering before Start stages its height would select
+	// genesis even though the configured floor is valid.
+	chainRef, ok := behavior.cfg.ChainSource.(*fakeChainSourceRef)
+	require.True(t, ok)
+	for _, source := range proof.RootExternalInputs() {
+		require.Equal(
+			t, uint32(800_000),
+			chainRef.spendRequest(t, source).HeightHint,
+		)
+	}
 }
 
 // TestFraudTriggerDefersReadyCheckpoint verifies fraud-triggered recovery

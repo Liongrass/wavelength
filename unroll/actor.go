@@ -518,6 +518,10 @@ func (b *behavior) driveEvent(ctx context.Context, ax actor.Exec[unrollTx],
 		return err
 	}
 
+	// Fresh starts need the staged height before choosing a historical scan
+	// hint. Restored exits also register while loading their checkpoint.
+	b.ensureSourceSpendWatches(ctx)
+
 	if err := b.routeOutbox(ctx, ax, outbox); err != nil {
 		b.routeRetryPending = true
 
@@ -1838,7 +1842,7 @@ func (b *behavior) proofSpendCallerID(outpoint wire.OutPoint) string {
 // logged and skipped rather than failing the whole load, since the exit still
 // functions (just without swept-source detection for that outpoint).
 func (b *behavior) ensureSourceSpendWatches(ctx context.Context) {
-	if b.proof == nil {
+	if b.proof == nil || b.currentHeightHint() == 0 {
 		return
 	}
 
@@ -2642,13 +2646,50 @@ func (b *behavior) removeAbandonedBroadcasts(ctx context.Context,
 	// the goroutine's lifetime, and cancellation is detached from the
 	// request ctx so a caller disconnect cannot suppress the cleanup.
 	chainSource := b.cfg.ChainSource
+	txConfirmRef := b.cfg.TxConfirmRef
+	subscriberID := b.notificationRef().ID()
+	conflicted := job.Conflicted
 	log := b.log
 	go func() {
 		for _, txid := range txids {
 			opCtx, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx),
+				actor.WithoutTx(
+					context.WithoutCancel(ctx),
+				),
 				removeAbandonedBroadcastTimeout,
 			)
+
+			// A source conflict terminates unroll independently of
+			// txconfirm. Removing wallet transactions alone leaves
+			// its CPFP retries and fee-input leases alive. Cancel
+			// only this exit's interest before wallet removal:
+			// another exit may still need an unswept root shared by
+			// both proof graphs.
+			if conflicted {
+				resp, err := txConfirmRef.Ask(
+					opCtx, &txconfirm.CancelInterestReq{
+						Txid:         txid,
+						SubscriberID: subscriberID,
+					},
+				).Await(opCtx).Unpack()
+				if err != nil {
+					cancel()
+					log.WarnS(opCtx, "Failed to cancel conflicted "+
+						"exit broadcast interest", err,
+						slog.String(
+							"txid", txid.String(),
+						),
+					)
+
+					continue
+				}
+				res, ok := resp.(*txconfirm.CancelInterestResp)
+				if !ok || res.RemainingSubscribers != 0 {
+					cancel()
+
+					continue
+				}
+			}
 			_, err := chainSource.Ask(
 				opCtx, &chainsource.RemoveTxRequest{Txid: txid},
 			).Await(opCtx).Unpack()
