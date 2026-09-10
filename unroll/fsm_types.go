@@ -104,8 +104,8 @@ type JobState struct {
 	// spend conflicting with the recovery tree — the operator swept a
 	// source batch commitment output the exit depends on (wavelength#1050).
 	// It is persisted so the terminal handoff to the VTXO manager stays
-	// classified as a conflict (retire the coin out of pending, do not
-	// relive it) even if the child crashes after the failure checkpoint but
+	// classified as a conflict (expired reclaim, not live recovery) even
+	// if the child crashes after the failure checkpoint but
 	// before the registry records it.
 	Conflicted bool
 
@@ -231,9 +231,8 @@ type FailEvent struct {
 	// Conflict marks the failure as a source-batch conflict: a confirmed
 	// foreign spend consumed a commitment output the recovery tree depends
 	// on, so the exit is provably impossible (wavelength#1050). It is
-	// carried into JobState.Conflicted so the terminal handoff retires the
-	// VTXO out of pending rather than leaving it exit-pending or reliving
-	// it.
+	// carried into JobState.Conflicted so the terminal handoff routes the
+	// VTXO to expired reclaim rather than reliving its old lineage.
 	Conflict bool
 }
 

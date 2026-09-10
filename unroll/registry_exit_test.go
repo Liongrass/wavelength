@@ -545,9 +545,12 @@ func TestRegistryReadmitsTargetAfterRecoverableFailureAcrossRestart(
 	// FailedRecoverable terminal record on disk, with no in-memory registry
 	// state (the process restarted). Boot reconciliation has already rolled
 	// the VTXO back to live; this stale record is the only artifact left.
-	err := store.MarkTerminal(
-		t.Context(), target, PhaseFailed, true, "min relay fee", nil,
-	)
+	err := store.MarkTerminal(t.Context(), RegistryRecord{
+		TargetOutpoint:     target,
+		Phase:              PhaseFailed,
+		RecoverableFailure: true,
+		FailReason:         "min relay fee",
+	})
 	require.NoError(t, err)
 
 	seeded, err := store.GetRecord(t.Context(), target)

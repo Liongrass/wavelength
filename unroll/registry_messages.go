@@ -174,8 +174,8 @@ type UnrollTerminatedMsg struct {
 	// conflict — a confirmed foreign spend consumed a commitment output the
 	// recovery tree depends on, so the exit is provably impossible
 	// (wavelength#1050). The registry maps it to ExitOutcomeConflicted so
-	// the VTXO manager retires the coin out of pending (FAILED) rather than
-	// leaving it exit-pending forever or reliving it as live.
+	// the VTXO manager routes standard-policy coins to expired reclaim,
+	// keeping the actor alive without making the old lineage spendable.
 	Conflicted bool
 }
 

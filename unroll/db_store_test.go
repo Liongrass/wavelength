@@ -3,9 +3,83 @@ package unroll
 import (
 	"testing"
 
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/wavelength/db"
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/stretchr/testify/require"
 )
+
+// TestMarkTerminalPreservesOutcome exercises the production SQL update path,
+// including conflict precedence and the metadata a terminal update must retain.
+func TestMarkTerminalPreservesOutcome(t *testing.T) {
+	sqlDB := db.NewTestDB(t)
+	stores := db.NewStore(
+		sqlDB.DB, sqlDB.Queries, sqlDB.Backend(), btclog.Disabled,
+	)
+	exitStore := stores.NewUnilateralExitStore(clock.NewDefaultClock())
+	store := &DBRegistryStore{UEStore: exitStore}
+	cases := []struct {
+		name        string
+		phase       Phase
+		recoverable bool
+		conflicted  bool
+		want        db.UnilateralExitJobStatus
+	}{
+		{"completed", PhaseCompleted, false, false,
+			db.UnilateralExitJobStatusCompleted},
+		{"failed", PhaseFailed, false, false,
+			db.UnilateralExitJobStatusFailed},
+		{"recoverable", PhaseFailed, true, false,
+			db.UnilateralExitJobStatusFailedRecoverable},
+		{"conflicted", PhaseFailed, false, true,
+			db.UnilateralExitJobStatusFailedConflicted},
+		{"conflictWins", PhaseFailed, true, true,
+			db.UnilateralExitJobStatusFailedConflicted},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := wire.OutPoint{
+				Hash: chainhash.Hash{
+					byte(i + 1),
+				},
+			}
+			err := store.UpsertRecord(t.Context(), RegistryRecord{
+				TargetOutpoint: target,
+				ActorID:        "persisted-child",
+				Phase:          PhaseMaterializing,
+				Trigger:        TriggerCriticalExpiry,
+			})
+			require.NoError(t, err)
+			sweep := chainhash.Hash{0x55}
+			err = store.MarkTerminal(t.Context(), RegistryRecord{
+				TargetOutpoint:     target,
+				Phase:              tc.phase,
+				RecoverableFailure: tc.recoverable,
+				ConflictedFailure:  tc.conflicted,
+				FailReason:         "terminal reason",
+				SweepTxid:          &sweep,
+			})
+			require.NoError(t, err)
+			// A fresh adapter reads only the durable result.
+			restarted := &DBRegistryStore{UEStore: exitStore}
+			got, err := restarted.GetRecord(t.Context(), target)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, tc.want, statusForRecord(*got))
+			require.Equal(t, "persisted-child", got.ActorID)
+			require.Equal(t, TriggerCriticalExpiry, got.Trigger)
+			require.Equal(t, "terminal reason", got.FailReason)
+			require.Equal(t, &sweep, got.SweepTxid)
+			records, err := restarted.ListNonTerminalRecords(
+				t.Context(),
+			)
+			require.NoError(t, err)
+			require.Empty(t, records)
+		})
+	}
+}
 
 // TestPhaseDBRoundTrip pins the Phase<->UnilateralExitJobStatus mapping so
 // schema drift or table-entry reshuffles fail loudly rather than silently

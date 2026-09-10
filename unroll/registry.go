@@ -86,10 +86,9 @@ type RegistryRecord struct {
 	// ConflictedFailure is set on a terminal failure caused by a confirmed
 	// spend conflicting with the recovery tree (the operator swept a source
 	// batch commitment output the exit depends on). It is persisted as a
-	// distinct DB status so boot-time reconciliation retires the target
-	// VTXO out of unilateral-exit (FAILED) — clearing it from pending
-	// balance — rather than leaving it pending forever or reliving it
-	// (wavelength#1050).
+	// distinct DB status so boot-time reconciliation routes standard-policy
+	// VTXOs to expired reclaim, rather than leaving them in exit forever or
+	// making their old lineage spendable again (wavelength#1050).
 	ConflictedFailure bool
 }
 
@@ -111,12 +110,10 @@ type RegistryStore interface {
 	// ListNonTerminalRecords returns all targets that still need restore.
 	ListNonTerminalRecords(ctx context.Context) ([]RegistryRecord, error)
 
-	// MarkTerminal persists one terminal target state. recoverable marks a
-	// no-footprint failure that boot-time reconciliation may roll back to
-	// live.
-	MarkTerminal(ctx context.Context, target wire.OutPoint, phase Phase,
-		recoverable bool, failReason string,
-		sweepTxid *chainhash.Hash) error
+	// MarkTerminal updates only the terminal outcome fields of an existing
+	// target. The record carries both failure classifications so boot-time
+	// reconciliation can distinguish live recovery from expired reclaim.
+	MarkTerminal(ctx context.Context, record RegistryRecord) error
 }
 
 // RegistryConfig configures the thin unroll registry actor.
@@ -827,8 +824,7 @@ func (r *registryBehavior) failAdmittedChild(ctx context.Context,
 	}, record.ExitPolicyKind)
 
 	markErr := r.cfg.Store.MarkTerminal(
-		context.WithoutCancel(ctx), target, PhaseFailed, true,
-		err.Error(), nil,
+		context.WithoutCancel(ctx), record,
 	)
 	if markErr != nil {
 		r.log.WarnS(ctx, "Failed to mark admitted unroll child "+
@@ -987,11 +983,9 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 
 	// A terminal failure with no on-chain footprint is recoverable: the
 	// VTXO never left off-chain custody, so it can be rolled back to live.
-	// A source-batch conflict is a distinct, non-recoverable terminal: the
-	// coin is provably gone, so it must be retired out of pending rather
-	// than relived (wavelength#1050). The child never sets both at once,
-	// but a conflict is not a no-footprint failure, so it is never
-	// recoverable.
+	// A source-batch conflict instead requires expired reclaim: the old
+	// lineage cannot be spent, even if none of our exit transactions
+	// confirmed. Conflict therefore takes precedence over live recovery.
 	conflicted := req.Phase == PhaseFailed && req.Conflicted
 	recoverable := req.Phase == PhaseFailed && !req.HadOnChainFootprint &&
 		!conflicted
@@ -1063,8 +1057,8 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 //     so the VTXO is still live from the operator's perspective. Ask the
 //     manager to roll it back to live (ExitOutcomeRecoverable).
 //   - PhaseFailed from a source-batch conflict: a confirmed spend consumed a
-//     commitment output the exit depends on, so the coin is provably gone.
-//     Ask the manager to retire it out of pending (ExitOutcomeConflicted).
+//     commitment output the exit depends on. Ask the manager to route a
+//     standard-policy coin to expired reclaim (ExitOutcomeConflicted).
 //   - PhaseCompleted: the exit was swept and confirmed on-chain, so ask the
 //     manager to retire the VTXO to spent (ExitOutcomeConfirmed).
 //   - PhaseFailed with an on-chain footprint but no conflict: the exit has
@@ -1091,8 +1085,9 @@ func (r *registryBehavior) notifyVTXOExit(ctx context.Context,
 
 	case req.Phase == PhaseFailed && req.Conflicted:
 		// A confirmed conflicting spend defeated the exit (the operator
-		// swept a source batch commitment output). Retire the coin out
-		// of pending rather than relive it (wavelength#1050).
+		// swept a source batch commitment output). Reclaim through a
+		// refresh rather than reliving the old lineage
+		// (wavelength#1050).
 		outcome = vtxo.ExitOutcomeConflicted
 
 	case req.Phase == PhaseFailed && !req.HadOnChainFootprint:

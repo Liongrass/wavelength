@@ -65,12 +65,11 @@ const (
 	// terminally because a confirmed foreign spend conflicts with the
 	// recovery tree — the operator swept a source batch commitment output
 	// the exit depends on, so the exit can never complete. Unlike a plain
-	// Failed job, boot-time reconciliation must retire the target VTXO out
-	// of unilateral-exit (clearing it from pending balance) rather than
-	// leaving it pending forever, and unlike a recoverable failure it must
-	// NOT roll the VTXO back to live: the coin is provably gone
-	// (wavelength#1050). Appended after the original enum so existing rows'
-	// numeric meaning never shifts.
+	// Failed job, boot-time reconciliation routes a standard-policy VTXO
+	// to expired reclaim. Its old lineage cannot be spent, but its value
+	// remains recoverable through a refresh, not a direct rollback to live.
+	// Recovery-only targets stay in exit under their owning subsystem.
+	// Appended after the original enum so existing rows keep their meaning.
 	UnilateralExitJobStatusFailedConflicted
 )
 
