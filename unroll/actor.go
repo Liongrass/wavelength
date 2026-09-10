@@ -181,10 +181,21 @@ type behavior struct {
 	// if an older durable notification reaches the actor first.
 	restoredCheckpointPending bool
 
-	blockSubActive             bool
-	spendWatchActive           bool
-	proofSpendWatches          map[wire.OutPoint]struct{}
-	proofNodeFloorWarned       bool
+	blockSubActive       bool
+	spendWatchActive     bool
+	proofSpendWatches    map[wire.OutPoint]struct{}
+	proofNodeFloorWarned bool
+
+	// sourceSpendWatches tracks the external (non-proof) funding outpoints
+	// the recovery roots hang off of — the round batch/commitment outputs.
+	// A confirmed foreign spend of one of these (an operator sweeping an
+	// expired batch) makes the whole proof unbroadcastable, so we watch
+	// them to fail the exit terminally instead of materializing forever
+	// (wavelength#1050). Membership also lets handleSpendObserved recognise
+	// a source conflict and report it distinctly from a generic external
+	// spend.
+	sourceSpendWatches map[wire.OutPoint]struct{}
+
 	terminalNotified           bool
 	exitCostNotified           bool
 	abandonedBroadcastsRemoved bool
@@ -407,6 +418,7 @@ func (b *behavior) OnStop(ctx context.Context) error {
 	b.unsubscribeBlocks(ctx)
 	b.unregisterSpendWatch(ctx)
 	b.unregisterProofSpendWatches(ctx)
+	b.unregisterSourceSpendWatches(ctx)
 
 	if b.session != nil && b.session.FSM != nil {
 		b.session.FSM.Stop()
@@ -505,6 +517,10 @@ func (b *behavior) driveEvent(ctx context.Context, ax actor.Exec[unrollTx],
 	if err := b.persistCheckpoint(ctx, ax); err != nil {
 		return err
 	}
+
+	// Fresh starts need the staged height before choosing a historical scan
+	// hint. Restored exits also register while loading their checkpoint.
+	b.ensureSourceSpendWatches(ctx)
 
 	if err := b.routeOutbox(ctx, ax, outbox); err != nil {
 		b.routeRetryPending = true
@@ -1418,6 +1434,12 @@ func (b *behavior) ensureLoaded(ctx context.Context) error {
 		return err
 	}
 
+	// Arming the source-commitment watches is best-effort and never blocks
+	// loading: the exit still materializes without them, they only add the
+	// swept-source conflict detection on top, so a registration failure is
+	// logged inside rather than surfaced here.
+	b.ensureSourceSpendWatches(ctx)
+
 	state, err := b.currentState()
 	if err != nil {
 		return err
@@ -1803,6 +1825,176 @@ func (b *behavior) proofSpendCallerID(outpoint wire.OutPoint) string {
 		b.cfg.TargetOutpoint.String(), outpoint.String())
 }
 
+// sourceSpendHeightHint bounds source-input spend scans independently of the
+// proof-node fallback alert. These watches also detect our own root confirming,
+// which may happen before batch expiry; using expiry would miss that evidence.
+// The commitment floor, or the supported network's deployment floor, covers
+// both spends without attributing a proof-node alert to a commitment txid.
+func (b *behavior) sourceSpendHeightHint() uint32 {
+	if floor := b.commitmentHeightFloor(); floor > 0 {
+		return uint32(floor)
+	}
+
+	return b.legacyProofScanFloor(b.currentHeightHint())
+}
+
+// ensureSourceSpendWatches registers spend watches on the external funding
+// inputs of the recovery roots — the round batch/commitment outputs the whole
+// proof hangs off of. Unlike the proof-node watches (which watch outputs
+// consumed by in-proof children to catch a parent confirmation), these watch
+// the outpoints an adversary can consume out from under us: once the operator
+// sweeps an expired batch commitment output, every recovery transaction that
+// spends it is permanently invalid, so the exit can never complete. Without a
+// watch the job would sit in materialization forever because txconfirm never
+// gives up on a no-mempool transaction (wavelength#1050).
+//
+// A foreign spend of one of these routes through handleSpendObserved case 4
+// and fails the job; a spend by our own root routes through case 2 as a
+// benign parent-confirmation signal, so watching them is safe in both
+// outcomes. Arming is best-effort: a per-outpoint registration failure is
+// logged and skipped rather than failing the whole load, since the exit still
+// functions (just without swept-source detection for that outpoint).
+func (b *behavior) ensureSourceSpendWatches(ctx context.Context) {
+	if b.proof == nil || b.currentHeightHint() == 0 {
+		return
+	}
+
+	external := b.proof.RootExternalInputs()
+	if len(external) == 0 {
+		return
+	}
+
+	if b.sourceSpendWatches == nil {
+		b.sourceSpendWatches = make(map[wire.OutPoint]struct{})
+	}
+
+	// The batch outputs carry the pkScript that neutrino needs to match a
+	// spend in the BIP-158 block filter (lwwallet detects by outpoint
+	// alone). It rides along on the descriptor ancestry when known; an
+	// unknown script still arms an outpoint-only watch, which covers the
+	// Esplora backend.
+	scripts := b.sourcePkScripts()
+
+	for _, outpoint := range external {
+		if outpoint == b.cfg.TargetOutpoint {
+			continue
+		}
+		if _, ok := b.sourceSpendWatches[outpoint]; ok {
+			continue
+		}
+
+		notifyRef := chainsource.MapSpendEvent(
+			b.selfRef,
+			func(event chainsource.SpendEvent) Msg {
+				return &SpendObservedMsg{
+					Outpoint:       event.Outpoint,
+					SpendingTxid:   event.SpendingTxid,
+					SpendingHeight: event.SpendingHeight,
+				}
+			},
+		)
+
+		// Use the source-specific floor without consuming a proof-node
+		// fallback alert or mislabeling this commitment as a proof tx.
+		req := &chainsource.RegisterSpendRequest{
+			CallerID:    b.sourceSpendCallerID(outpoint),
+			Outpoint:    &outpoint,
+			HeightHint:  b.sourceSpendHeightHint(),
+			NotifyActor: fn.Some(notifyRef),
+		}
+		if script := scripts[outpoint]; len(script) > 0 {
+			req.PkScript = script
+		} else {
+			// No batch output script resolved for this source
+			// outpoint, so the watch is outpoint-only. That is fine
+			// for Esplora/lwwallet (they match a spend by
+			// outpoint), but a neutrino backend matches spends via
+			// the prevout script in the BIP-158 block filter, so it
+			// cannot detect this sweep -- the swept-source conflict
+			// would go undetected on neutrino. Leave a breadcrumb
+			// so a stuck exit is diagnosable rather than silently
+			// degraded.
+			b.log.DebugS(ctx, "Source spend watch armed without a "+
+				"pkScript; swept-source detection is "+
+				"outpoint-only and will not match on a "+
+				"neutrino backend",
+				slog.String(
+					"source_outpoint", outpoint.String(),
+				),
+			)
+		}
+
+		_, err := b.cfg.ChainSource.Ask(ctx, req).Await(ctx).Unpack()
+		if err != nil {
+			b.log.WarnS(ctx, "Failed to arm source-commitment "+
+				"spend watch; swept-source conflict may go "+
+				"undetected", err,
+				slog.String(
+					"source_outpoint", outpoint.String(),
+				),
+			)
+
+			continue
+		}
+
+		b.sourceSpendWatches[outpoint] = struct{}{}
+	}
+}
+
+// sourcePkScripts maps each known batch/commitment outpoint to its output
+// script, drawn from the target descriptor's ancestry. The batch output is the
+// tree root's external input, so its script is exactly what a source spend
+// watch needs. Fragments without a resolved tree path (e.g. an empty-ancestry
+// legacy descriptor) simply contribute no entry, leaving those watches
+// outpoint-only.
+func (b *behavior) sourcePkScripts() map[wire.OutPoint][]byte {
+	if b.desc == nil {
+		return nil
+	}
+
+	scripts := make(map[wire.OutPoint][]byte)
+	for i := range b.desc.Ancestry {
+		tp := b.desc.Ancestry[i].TreePath
+		if tp == nil || tp.BatchOutput == nil {
+			continue
+		}
+
+		scripts[tp.BatchOutpoint] = tp.BatchOutput.PkScript
+	}
+
+	return scripts
+}
+
+// unregisterSourceSpendWatches cancels all source-commitment spend watches on
+// stop.
+func (b *behavior) unregisterSourceSpendWatches(ctx context.Context) {
+	for outpoint := range b.sourceSpendWatches {
+		err := b.cfg.ChainSource.Tell(
+			ctx, &chainsource.UnregisterSpendRequest{
+				CallerID: b.sourceSpendCallerID(outpoint),
+				Outpoint: &outpoint,
+			},
+		)
+		if err != nil {
+			b.log.WarnS(ctx, "Failed to unregister source spend "+
+				"watch", err,
+				slog.String("outpoint", outpoint.String()),
+			)
+
+			continue
+		}
+
+		delete(b.sourceSpendWatches, outpoint)
+	}
+}
+
+// sourceSpendCallerID returns the stable source-commitment spend-watch
+// registration ID.
+func (b *behavior) sourceSpendCallerID(outpoint wire.OutPoint) string {
+	return fmt.Sprintf("unroll-source-spend.%s.%s",
+		b.cfg.TargetOutpoint.String(), outpoint.String())
+}
+
 // handleSpendObserved processes a chainsource spend notification on the
 // target or proof-node outpoint. Spend watches are a safety net — they fire
 // when a proof output is consumed on chain, and we have to classify what we
@@ -1885,6 +2077,24 @@ func (b *behavior) handleSpendObserved(ctx context.Context,
 	if msg.Outpoint != (wire.OutPoint{}) {
 		spentOutpoint = msg.Outpoint
 	}
+
+	// A spend of one of the roots' external funding inputs is a
+	// source-batch conflict: the operator swept the commitment output our
+	// recovery tree depends on, so the exit is provably impossible rather
+	// than merely slow. Report it with a message the user can act on
+	// (wavelength#1050).
+	if _, isSource := b.sourceSpendWatches[spentOutpoint]; isSource {
+		reason := fmt.Sprintf("source batch %s was swept by the "+
+			"operator (tx %s at height %d); unilateral exit is no "+
+			"longer possible", spentOutpoint, msg.SpendingTxid,
+			msg.SpendingHeight)
+
+		return b.handleEvent(ctx, ax, &FailEvent{
+			Reason:   reason,
+			Conflict: true,
+		})
+	}
+
 	reason := fmt.Sprintf("watched outpoint %s spent externally by tx %s "+
 		"at height %d", spentOutpoint, msg.SpendingTxid,
 		msg.SpendingHeight)
@@ -2322,6 +2532,7 @@ func (b *behavior) notifyRegistryIfTerminal(ctx context.Context) {
 		FailReason:          job.FailReason,
 		HadOnChainFootprint: jobHadOnChainFootprint(job),
 		ExitPolicyKind:      b.exitPolicyKind(),
+		Conflicted:          job.Conflicted,
 	}
 
 	if sweepTxid := effectiveSweepTxid(
@@ -2445,13 +2656,50 @@ func (b *behavior) removeAbandonedBroadcasts(ctx context.Context,
 	// the goroutine's lifetime, and cancellation is detached from the
 	// request ctx so a caller disconnect cannot suppress the cleanup.
 	chainSource := b.cfg.ChainSource
+	txConfirmRef := b.cfg.TxConfirmRef
+	subscriberID := b.notificationRef().ID()
+	conflicted := job.Conflicted
 	log := b.log
 	go func() {
 		for _, txid := range txids {
 			opCtx, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx),
+				actor.WithoutTx(
+					context.WithoutCancel(ctx),
+				),
 				removeAbandonedBroadcastTimeout,
 			)
+
+			// A source conflict terminates unroll independently of
+			// txconfirm. Removing wallet transactions alone leaves
+			// its CPFP retries and fee-input leases alive. Cancel
+			// only this exit's interest before wallet removal:
+			// another exit may still need an unswept root shared by
+			// both proof graphs.
+			if conflicted {
+				resp, err := txConfirmRef.Ask(
+					opCtx, &txconfirm.CancelInterestReq{
+						Txid:         txid,
+						SubscriberID: subscriberID,
+					},
+				).Await(opCtx).Unpack()
+				if err != nil {
+					cancel()
+					log.WarnS(opCtx, "Failed to cancel conflicted "+
+						"exit broadcast interest", err,
+						slog.String(
+							"txid", txid.String(),
+						),
+					)
+
+					continue
+				}
+				res, ok := resp.(*txconfirm.CancelInterestResp)
+				if !ok || res.RemainingSubscribers != 0 {
+					cancel()
+
+					continue
+				}
+			}
 			_, err := chainSource.Ask(
 				opCtx, &chainsource.RemoveTxRequest{Txid: txid},
 			).Await(opCtx).Unpack()

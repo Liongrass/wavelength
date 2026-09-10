@@ -3,9 +3,83 @@ package unroll
 import (
 	"testing"
 
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/wavelength/db"
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/stretchr/testify/require"
 )
+
+// TestMarkTerminalPreservesOutcome exercises the production SQL update path,
+// including conflict precedence and the metadata a terminal update must retain.
+func TestMarkTerminalPreservesOutcome(t *testing.T) {
+	sqlDB := db.NewTestDB(t)
+	stores := db.NewStore(
+		sqlDB.DB, sqlDB.Queries, sqlDB.Backend(), btclog.Disabled,
+	)
+	exitStore := stores.NewUnilateralExitStore(clock.NewDefaultClock())
+	store := &DBRegistryStore{UEStore: exitStore}
+	cases := []struct {
+		name        string
+		phase       Phase
+		recoverable bool
+		conflicted  bool
+		want        db.UnilateralExitJobStatus
+	}{
+		{"completed", PhaseCompleted, false, false,
+			db.UnilateralExitJobStatusCompleted},
+		{"failed", PhaseFailed, false, false,
+			db.UnilateralExitJobStatusFailed},
+		{"recoverable", PhaseFailed, true, false,
+			db.UnilateralExitJobStatusFailedRecoverable},
+		{"conflicted", PhaseFailed, false, true,
+			db.UnilateralExitJobStatusFailedConflicted},
+		{"conflictWins", PhaseFailed, true, true,
+			db.UnilateralExitJobStatusFailedConflicted},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := wire.OutPoint{
+				Hash: chainhash.Hash{
+					byte(i + 1),
+				},
+			}
+			err := store.UpsertRecord(t.Context(), RegistryRecord{
+				TargetOutpoint: target,
+				ActorID:        "persisted-child",
+				Phase:          PhaseMaterializing,
+				Trigger:        TriggerCriticalExpiry,
+			})
+			require.NoError(t, err)
+			sweep := chainhash.Hash{0x55}
+			err = store.MarkTerminal(t.Context(), RegistryRecord{
+				TargetOutpoint:     target,
+				Phase:              tc.phase,
+				RecoverableFailure: tc.recoverable,
+				ConflictedFailure:  tc.conflicted,
+				FailReason:         "terminal reason",
+				SweepTxid:          &sweep,
+			})
+			require.NoError(t, err)
+			// A fresh adapter reads only the durable result.
+			restarted := &DBRegistryStore{UEStore: exitStore}
+			got, err := restarted.GetRecord(t.Context(), target)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, tc.want, statusForRecord(*got))
+			require.Equal(t, "persisted-child", got.ActorID)
+			require.Equal(t, TriggerCriticalExpiry, got.Trigger)
+			require.Equal(t, "terminal reason", got.FailReason)
+			require.Equal(t, &sweep, got.SweepTxid)
+			records, err := restarted.ListNonTerminalRecords(
+				t.Context(),
+			)
+			require.NoError(t, err)
+			require.Empty(t, records)
+		})
+	}
+}
 
 // TestPhaseDBRoundTrip pins the Phase<->UnilateralExitJobStatus mapping so
 // schema drift or table-entry reshuffles fail loudly rather than silently
@@ -111,6 +185,49 @@ func TestRecoverableFailureDBRoundTrip(t *testing.T) {
 		require.Equal(t, PhaseFailed, got.Phase)
 		require.False(t, got.RecoverableFailure)
 	})
+}
+
+// TestConflictedFailureDBRoundTrip pins the mapping for a source-batch
+// conflict: it persists as the dedicated FailedConflicted status, decodes back
+// to ConflictedFailure=true (and NOT RecoverableFailure), and stays terminal.
+// Boot-time reconciliation relies on this to retire the coin out of pending
+// rather than relive it (wavelength#1050).
+func TestConflictedFailureDBRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	rec := RegistryRecord{
+		Phase:             PhaseFailed,
+		ConflictedFailure: true,
+	}
+	status := statusForRecord(rec)
+	require.Equal(
+		t, db.UnilateralExitJobStatusFailedConflicted, status,
+	)
+	require.True(t, status.IsTerminal())
+
+	got := recordFromDB(db.UnilateralExitJobRecord{Status: status})
+	require.Equal(t, PhaseFailed, got.Phase)
+	require.True(t, got.ConflictedFailure)
+	require.False(t, got.RecoverableFailure)
+}
+
+// TestConflictTakesPrecedenceOverRecoverable guards the classification order:
+// a record flagged both conflicted and recoverable (the child never sets both,
+// but the store must fail safe) maps to FailedConflicted so the coin is retired
+// rather than relived.
+func TestConflictTakesPrecedenceOverRecoverable(t *testing.T) {
+	t.Parallel()
+
+	rec := RegistryRecord{
+		Phase:              PhaseFailed,
+		ConflictedFailure:  true,
+		RecoverableFailure: true,
+	}
+
+	require.Equal(
+		t, db.UnilateralExitJobStatusFailedConflicted,
+		statusForRecord(rec),
+	)
 }
 
 // TestTriggerDBRoundTrip pins the StartTrigger↔UnilateralExitJobTrigger

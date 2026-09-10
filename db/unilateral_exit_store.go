@@ -60,13 +60,25 @@ const (
 	// the exit has begun on-chain) so boot-time reconciliation can decide
 	// whether to recover the VTXO (wavelength#602).
 	UnilateralExitJobStatusFailedRecoverable
+
+	// UnilateralExitJobStatusFailedConflicted means the job failed
+	// terminally because a confirmed foreign spend conflicts with the
+	// recovery tree — the operator swept a source batch commitment output
+	// the exit depends on, so the exit can never complete. Unlike a plain
+	// Failed job, boot-time reconciliation routes a standard-policy VTXO
+	// to expired reclaim. Its old lineage cannot be spent, but its value
+	// remains recoverable through a refresh, not a direct rollback to live.
+	// Recovery-only targets stay in exit under their owning subsystem.
+	// Appended after the original enum so existing rows keep their meaning.
+	UnilateralExitJobStatusFailedConflicted
 )
 
 // IsTerminal reports whether the control-plane job status is terminal.
 func (s UnilateralExitJobStatus) IsTerminal() bool {
 	return s == UnilateralExitJobStatusCompleted ||
 		s == UnilateralExitJobStatusFailed ||
-		s == UnilateralExitJobStatusFailedRecoverable
+		s == UnilateralExitJobStatusFailedRecoverable ||
+		s == UnilateralExitJobStatusFailedConflicted
 }
 
 // UnilateralExitJobTrigger records what started an exit job.

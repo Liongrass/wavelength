@@ -106,27 +106,23 @@ func (s *DBRegistryStore) ListNonTerminalRecords(ctx context.Context) (
 }
 
 // MarkTerminal marks one target terminal in the unilateral-exit job table.
-// recoverable selects UnilateralExitJobStatusFailedRecoverable over the
-// plain Failed status for a no-footprint failure so boot-time reconciliation
-// can roll the VTXO back to live (wavelength#602).
+// Both failure classifications use the same mapping as UpsertRecord, so a
+// terminal update cannot lose the distinction between recovery and reclaim.
 func (s *DBRegistryStore) MarkTerminal(ctx context.Context,
-	target wire.OutPoint, phase Phase, recoverable bool, failReason string,
-	sweepTxid *chainhash.Hash) error {
+	record RegistryRecord) error {
 
 	if s == nil || s.UEStore == nil {
 		return fmt.Errorf("unilateral-exit store must be provided")
 	}
 
-	status := statusForRecord(RegistryRecord{
-		Phase:              phase,
-		RecoverableFailure: recoverable,
-	})
+	status := statusForRecord(record)
 	if !status.IsTerminal() {
-		return fmt.Errorf("phase %s is not terminal", phase)
+		return fmt.Errorf("phase %s is not terminal", record.Phase)
 	}
 
 	return s.UEStore.MarkJobTerminal(
-		ctx, target, status, failReason, sweepTxidBytes(sweepTxid),
+		ctx, record.TargetOutpoint, status, record.FailReason,
+		sweepTxidBytes(record.SweepTxid),
 	)
 }
 
@@ -145,6 +141,8 @@ func recordFromDB(job db.UnilateralExitJobRecord) RegistryRecord {
 		SweepTxid:     sweepTxidFromBytes(job.SweepTxid),
 		RecoverableFailure: job.Status ==
 			db.UnilateralExitJobStatusFailedRecoverable,
+		ConflictedFailure: job.Status ==
+			db.UnilateralExitJobStatusFailedConflicted,
 	}
 }
 
@@ -196,8 +194,16 @@ func registryExitPolicy(record RegistryRecord,
 
 // statusForRecord maps a registry record into the DB status enum, routing a
 // recoverable (no-footprint) failure to the distinct FailedRecoverable status
-// so it round-trips back to RecoverableFailure=true on the next read.
+// and a source-batch conflict to the distinct FailedConflicted status, so each
+// round-trips back to the matching flag on the next read. A conflict takes
+// precedence: it is never a recoverable no-footprint failure, and boot-time
+// reconciliation must reclaim through refresh rather than relive the old
+// lineage (wavelength#1050).
 func statusForRecord(record RegistryRecord) db.UnilateralExitJobStatus {
+	if record.Phase == PhaseFailed && record.ConflictedFailure {
+		return db.UnilateralExitJobStatusFailedConflicted
+	}
+
 	if record.Phase == PhaseFailed && record.RecoverableFailure {
 		return db.UnilateralExitJobStatusFailedRecoverable
 	}
@@ -254,7 +260,8 @@ func phaseFromDB(status db.UnilateralExitJobStatus) Phase {
 		return PhaseCompleted
 
 	case db.UnilateralExitJobStatusFailed,
-		db.UnilateralExitJobStatusFailedRecoverable:
+		db.UnilateralExitJobStatusFailedRecoverable,
+		db.UnilateralExitJobStatusFailedConflicted:
 		return PhaseFailed
 
 	default:

@@ -169,6 +169,14 @@ type UnrollTerminatedMsg struct {
 	// recovery-only target is held in exit rather than relived as a live
 	// coin on a recoverable failure (wavelength#602).
 	ExitPolicyKind ExitPolicyKind
+
+	// Conflicted reports that the terminal failure was a source-batch
+	// conflict — a confirmed foreign spend consumed a commitment output the
+	// recovery tree depends on, so the exit is provably impossible
+	// (wavelength#1050). The registry maps it to ExitOutcomeConflicted so
+	// the VTXO manager routes standard-policy coins to expired reclaim,
+	// keeping the actor alive without making the old lineage spendable.
+	Conflicted bool
 }
 
 // MessageType returns the stable message type identifier.

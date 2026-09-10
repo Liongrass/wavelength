@@ -82,6 +82,14 @@ type RegistryRecord struct {
 	// reconciliation can recover a VTXO whose recovery notification was
 	// lost before the manager applied it (wavelength#602).
 	RecoverableFailure bool
+
+	// ConflictedFailure is set on a terminal failure caused by a confirmed
+	// spend conflicting with the recovery tree (the operator swept a source
+	// batch commitment output the exit depends on). It is persisted as a
+	// distinct DB status so boot-time reconciliation routes standard-policy
+	// VTXOs to expired reclaim, rather than leaving them in exit forever or
+	// making their old lineage spendable again (wavelength#1050).
+	ConflictedFailure bool
 }
 
 // IsTerminal reports whether the record reached a terminal phase.
@@ -102,12 +110,10 @@ type RegistryStore interface {
 	// ListNonTerminalRecords returns all targets that still need restore.
 	ListNonTerminalRecords(ctx context.Context) ([]RegistryRecord, error)
 
-	// MarkTerminal persists one terminal target state. recoverable marks a
-	// no-footprint failure that boot-time reconciliation may roll back to
-	// live.
-	MarkTerminal(ctx context.Context, target wire.OutPoint, phase Phase,
-		recoverable bool, failReason string,
-		sweepTxid *chainhash.Hash) error
+	// MarkTerminal updates only the terminal outcome fields of an existing
+	// target. The record carries both failure classifications so boot-time
+	// reconciliation can distinguish live recovery from expired reclaim.
+	MarkTerminal(ctx context.Context, record RegistryRecord) error
 }
 
 // RegistryConfig configures the thin unroll registry actor.
@@ -818,8 +824,7 @@ func (r *registryBehavior) failAdmittedChild(ctx context.Context,
 	}, record.ExitPolicyKind)
 
 	markErr := r.cfg.Store.MarkTerminal(
-		context.WithoutCancel(ctx), target, PhaseFailed, true,
-		err.Error(), nil,
+		context.WithoutCancel(ctx), record,
 	)
 	if markErr != nil {
 		r.log.WarnS(ctx, "Failed to mark admitted unroll child "+
@@ -978,7 +983,12 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 
 	// A terminal failure with no on-chain footprint is recoverable: the
 	// VTXO never left off-chain custody, so it can be rolled back to live.
-	recoverable := req.Phase == PhaseFailed && !req.HadOnChainFootprint
+	// A source-batch conflict instead requires expired reclaim: the old
+	// lineage cannot be spent, even if none of our exit transactions
+	// confirmed. Conflict therefore takes precedence over live recovery.
+	conflicted := req.Phase == PhaseFailed && req.Conflicted
+	recoverable := req.Phase == PhaseFailed && !req.HadOnChainFootprint &&
+		!conflicted
 
 	record := RegistryRecord{
 		TargetOutpoint:     req.Outpoint,
@@ -987,6 +997,7 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 		FailReason:         req.FailReason,
 		SweepTxid:          copyHash(req.SweepTxid),
 		RecoverableFailure: recoverable,
+		ConflictedFailure:  conflicted,
 	}
 
 	if cached, ok := r.pending[req.Outpoint]; ok {
@@ -995,6 +1006,7 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 		record.FailReason = req.FailReason
 		record.SweepTxid = copyHash(req.SweepTxid)
 		record.RecoverableFailure = recoverable
+		record.ConflictedFailure = conflicted
 		if record.ActorID == "" {
 			record.ActorID = req.ActorID
 		}
@@ -1044,10 +1056,13 @@ func (r *registryBehavior) handleTerminated(ctx context.Context,
 //   - PhaseFailed with no on-chain footprint: the unroll never broadcast,
 //     so the VTXO is still live from the operator's perspective. Ask the
 //     manager to roll it back to live (ExitOutcomeRecoverable).
+//   - PhaseFailed from a source-batch conflict: a confirmed spend consumed a
+//     commitment output the exit depends on. Ask the manager to route a
+//     standard-policy coin to expired reclaim (ExitOutcomeConflicted).
 //   - PhaseCompleted: the exit was swept and confirmed on-chain, so ask the
 //     manager to retire the VTXO to spent (ExitOutcomeConfirmed).
-//   - PhaseFailed with an on-chain footprint: the exit has begun on-chain;
-//     leave the VTXO in unilateral-exit (no notification).
+//   - PhaseFailed with an on-chain footprint but no conflict: the exit has
+//     begun on-chain; leave the VTXO in unilateral-exit (no notification).
 //
 // Delivery is best-effort: a failed Tell is logged, not retried. This is the
 // fast runtime path; the durable backstop is the VTXO manager's startup
@@ -1067,6 +1082,13 @@ func (r *registryBehavior) notifyVTXOExit(ctx context.Context,
 	switch {
 	case req.Phase == PhaseCompleted:
 		outcome = vtxo.ExitOutcomeConfirmed
+
+	case req.Phase == PhaseFailed && req.Conflicted:
+		// A confirmed conflicting spend defeated the exit (the operator
+		// swept a source batch commitment output). Reclaim through a
+		// refresh rather than reliving the old lineage
+		// (wavelength#1050).
+		outcome = vtxo.ExitOutcomeConflicted
 
 	case req.Phase == PhaseFailed && !req.HadOnChainFootprint:
 		outcome = vtxo.ExitOutcomeRecoverable
@@ -1753,7 +1775,8 @@ func sameRegistryRecord(a, b RegistryRecord) bool {
 		a.ExitPolicyRef != b.ExitPolicyRef ||
 		a.Phase != b.Phase ||
 		a.FailReason != b.FailReason ||
-		a.RecoverableFailure != b.RecoverableFailure {
+		a.RecoverableFailure != b.RecoverableFailure ||
+		a.ConflictedFailure != b.ConflictedFailure {
 		return false
 	}
 

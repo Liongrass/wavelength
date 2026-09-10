@@ -209,3 +209,25 @@ func (e *ExitConfirmedEvent) VTXOActorMsg() {}
 func (e *ExitConfirmedEvent) MessageType() string {
 	return "ExitConfirmedEvent"
 }
+
+// ExitConflictedEvent is delivered to a VTXO actor in UnilateralExitState when
+// the downstream unroll job terminated because a confirmed foreign spend
+// conflicts with the recovery tree — the operator swept a source batch
+// commitment output the exit depends on (wavelength#1050). The VTXO moves to
+// the non-terminal ExpiredState: its old lineage is unusable, but the actor
+// stays alive to recover the value through an ordinary refresh. It must not
+// return directly to LiveState as a clean, no-footprint exit failure would.
+type ExitConflictedEvent struct {
+	actor.BaseMessage
+
+	// Reason explains why the exit failed and the VTXO needs reclaim.
+	Reason string
+}
+
+// VTXOActorMsg implements actormsg.VTXOActorMsg marker interface.
+func (e *ExitConflictedEvent) VTXOActorMsg() {}
+
+// MessageType returns the message type for logging.
+func (e *ExitConflictedEvent) MessageType() string {
+	return "ExitConflictedEvent"
+}
