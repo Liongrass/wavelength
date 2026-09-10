@@ -2156,6 +2156,80 @@ func TestProofNodeHeightHintWarnsOncePerActor(t *testing.T) {
 	require.Contains(t, buf.String(), "[WRN]")
 }
 
+// TestSourceSpendHeightHintKeepsProofAlerts checks that source scans retain
+// pre-expiry confirmation evidence without consuming proof-node alerts.
+func TestSourceSpendHeightHintKeepsProofAlerts(t *testing.T) {
+	cases := []struct {
+		name       string
+		heights    []int32
+		deployment uint32
+		want       uint32
+	}{
+		{
+			"known",
+			[]int32{
+				80,
+				90,
+			},
+			50,
+			80,
+		},
+		{
+			"partial",
+			[]int32{
+				80,
+				0,
+			},
+			50,
+			50,
+		},
+		{
+			"legacy",
+			nil,
+			50,
+			50,
+		},
+		{
+			"futureFloor",
+			nil,
+			300,
+			1,
+		},
+		{
+			"unknown",
+			nil,
+			0,
+			1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := &vtxo.Descriptor{BatchExpiry: 150}
+			for _, height := range tc.heights {
+				desc.Ancestry = append(
+					desc.Ancestry, vtxo.Ancestry{
+						CommitmentHeight: height,
+					},
+				)
+			}
+			b := &behavior{
+				cfg: Config{
+					LegacyProofScanFloor: tc.deployment,
+				},
+				desc: desc, pending: &actorCheckpoint{
+					Height: 200,
+				},
+			}
+			require.Equal(t, tc.want, b.sourceSpendHeightHint())
+			require.False(t, b.proofNodeFloorWarned)
+			require.Less(
+				t, b.sourceSpendHeightHint(), uint32(150),
+				"our own root may have confirmed before expiry",
+			)
+		})
+	}
+}
+
 // TestProofNodeHeightHintLogsBoundedFallbackAtInfo verifies a configured,
 // network deployment floor is routine compatibility handling, not an operator
 // warning.
@@ -2185,6 +2259,10 @@ func TestProofNodeHeightHintLogsBoundedFallbackAtInfo(t *testing.T) {
 	)
 	require.Contains(t, buf.String(), "[INF]")
 	require.NotContains(t, buf.String(), "[WRN]")
+	require.Contains(
+		t, buf.String(), proof.RootTxids()[0].String(),
+		"fallback alert must identify a proof node, not a source",
+	)
 
 	// Source watches must also use the configured deployment floor. On a
 	// fresh exit, registering before Start stages its height would select

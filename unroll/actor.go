@@ -1825,6 +1825,19 @@ func (b *behavior) proofSpendCallerID(outpoint wire.OutPoint) string {
 		b.cfg.TargetOutpoint.String(), outpoint.String())
 }
 
+// sourceSpendHeightHint bounds source-input spend scans independently of the
+// proof-node fallback alert. These watches also detect our own root confirming,
+// which may happen before batch expiry; using expiry would miss that evidence.
+// The commitment floor, or the supported network's deployment floor, covers
+// both spends without attributing a proof-node alert to a commitment txid.
+func (b *behavior) sourceSpendHeightHint() uint32 {
+	if floor := b.commitmentHeightFloor(); floor > 0 {
+		return uint32(floor)
+	}
+
+	return b.legacyProofScanFloor(b.currentHeightHint())
+}
+
 // ensureSourceSpendWatches registers spend watches on the external funding
 // inputs of the recovery roots — the round batch/commitment outputs the whole
 // proof hangs off of. Unlike the proof-node watches (which watch outputs
@@ -1881,15 +1894,12 @@ func (b *behavior) ensureSourceSpendWatches(ctx context.Context) {
 			},
 		)
 
-		// The batch output cannot be spent before its own commitment tx
-		// confirms, so the min-commitment-height floor (or the bounded
-		// lookback fallback) is a sound, tight rescan hint.
+		// Use the source-specific floor without consuming a proof-node
+		// fallback alert or mislabeling this commitment as a proof tx.
 		req := &chainsource.RegisterSpendRequest{
-			CallerID: b.sourceSpendCallerID(outpoint),
-			Outpoint: &outpoint,
-			HeightHint: b.proofNodeConfHeightHint(
-				ctx, outpoint.Hash,
-			),
+			CallerID:    b.sourceSpendCallerID(outpoint),
+			Outpoint:    &outpoint,
+			HeightHint:  b.sourceSpendHeightHint(),
 			NotifyActor: fn.Some(notifyRef),
 		}
 		if script := scripts[outpoint]; len(script) > 0 {
