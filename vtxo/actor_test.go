@@ -1034,6 +1034,26 @@ func TestStatusToStateSpent(t *testing.T) {
 	require.True(t, spentState.IsTerminal())
 }
 
+// TestStatusToStateExpiredKeepsHeightUnknown prevents a restart from claiming
+// that expiry was observed at the VTXO's much earlier creation height.
+func TestStatusToStateExpiredKeepsHeightUnknown(t *testing.T) {
+	h := newVTXOTestHarness(t)
+	desc := h.newTestDescriptor()
+	desc.Status = VTXOStatusExpired
+	state := statusToState(h.ctx, desc, h.store, btclog.Disabled)
+	expired, ok := state.(*ExpiredState)
+	require.True(t, ok)
+	require.Zero(t, expired.ObservedHeight)
+
+	// Replayed conflict delivery is harmless before the first epoch.
+	transition, err := expired.ProcessEvent(
+		h.ctx, &ExitConflictedEvent{}, nil,
+	)
+	require.NoError(t, err)
+	require.Same(t, expired, transition.NextState)
+	require.True(t, transition.NewEvents.IsNone())
+}
+
 // TestStatusToStatePendingForfeit verifies statusToState returns
 // PendingForfeitState for VTXOs persisted as VTXOStatusPendingForfeit.
 // This validates that cooperative-claim reservations survive restarts.

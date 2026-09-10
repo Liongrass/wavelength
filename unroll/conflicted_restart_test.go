@@ -371,6 +371,16 @@ func testSweptSourceRestart(t *testing.T, shared bool) {
 
 		return err == nil && coin.Status == vtxo.VTXOStatusExpired
 	}, 5*time.Second, 10*time.Millisecond)
+	// Replay through the real manager and its now-expired child, as when
+	// terminal handoff is re-driven after a crash. No error or fresh status
+	// transition should prevent the following epoch from reclaiming.
+	_, err = managerRef.Ask(t.Context(), &vtxo.ExitOutcomeNotification{
+		Outpoint: target,
+		Outcome:  vtxo.ExitOutcomeConflicted,
+		Reason:   "replayed source conflict",
+	}).Await(t.Context()).Unpack()
+	require.NoError(t, err)
+
 	// The expired actor is not spendable but must survive to request
 	// refresh.
 	live, err := vtxos.ListLiveVTXOs(t.Context())

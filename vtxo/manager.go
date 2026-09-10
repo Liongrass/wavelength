@@ -1440,7 +1440,7 @@ func (m *Manager) confirmExitedVTXO(ctx context.Context,
 	return fn.Ok[ManagerResp](&ExitOutcomeResp{})
 }
 
-// conflictExitedVTXO retires a VTXO to the terminal FailedState after its
+// conflictExitedVTXO routes a VTXO to expired reclaim after its
 // unilateral exit was defeated by a confirmed conflicting spend — the operator
 // swept a source batch commitment output the recovery tree depends on, so the
 // unilateral exit is provably impossible (wavelength#1050). The operator can

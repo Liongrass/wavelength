@@ -532,7 +532,10 @@ func TestUnilateralExitConflicts(t *testing.T) {
 	require.NoError(t, err)
 
 	expired := assertState[*ExpiredState](h)
-	require.Equal(t, int32(200), expired.ObservedHeight)
+	require.Zero(
+		t, expired.ObservedHeight,
+		"exit admission is not an observation of expiry",
+	)
 	update := assertOutboxContains[*VTXOStatusUpdate](h)
 	require.Equal(t, VTXOStatusExpired, update.NewStatus)
 	// No terminated notification: ExpiredState is non-terminal so the actor
@@ -572,7 +575,16 @@ func TestUnilateralExitConflictReclaimsWhenExpired(t *testing.T) {
 		Reason: "source batch swept by the operator",
 	})
 	require.NoError(t, err)
-	require.IsType(t, &ExpiredState{}, h.currentState)
+	expired := assertState[*ExpiredState](h)
+	require.Zero(t, expired.ObservedHeight)
+
+	// A replay after the status write must neither error nor repeat the
+	// outbox effects. This also models an Expired actor restored at boot.
+	effects := len(h.outboxMessages)
+	_, err = h.sendEvent(&ExitConflictedEvent{Reason: "replayed conflict"})
+	require.NoError(t, err)
+	require.Same(t, expired, h.currentState)
+	require.Len(t, h.outboxMessages, effects)
 
 	// The next block epoch, still past BatchExpiry, must drive the
 	// cooperative reclaim (ForfeitRequest -> PendingForfeit) rather than
@@ -583,7 +595,8 @@ func TestUnilateralExitConflictReclaimsWhenExpired(t *testing.T) {
 	// PendingForfeitState (not LiveState) proves the coin was reclaimed,
 	// not relived, and a ForfeitRequest was dispatched to start the
 	// refresh.
-	assertState[*PendingForfeitState](h)
+	pending := assertState[*PendingForfeitState](h)
+	require.Equal(t, int32(conflictHeight), pending.RequestedAtHeight)
 	assertOutboxContains[*ForfeitRequest](h)
 
 	// Belt-and-suspenders: no Live status update was ever emitted, so the

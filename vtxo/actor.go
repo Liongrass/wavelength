@@ -1126,11 +1126,9 @@ func statusToState(ctx context.Context, vtxo *Descriptor, store VTXOStore,
 
 	case VTXOStatusExpired:
 		// Non-terminal: the actor is restored so the VTXO can still be
-		// forfeited into a round to recover its value.
-		return &ExpiredState{
-			VTXO:           vtxo,
-			ObservedHeight: vtxo.CreatedHeight,
-		}
+		// forfeited into a round to recover its value. The observation
+		// height is not persisted; creation height cannot substitute.
+		return &ExpiredState{VTXO: vtxo}
 
 	case VTXOStatusPendingForfeit:
 		return &PendingForfeitState{VTXO: vtxo, RequestedAtHeight: 0}

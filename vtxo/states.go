@@ -276,6 +276,8 @@ type ExpiredState struct {
 	VTXO *Descriptor
 
 	// ObservedHeight is the chain height at which expiry was established.
+	// Zero means unknown until the next block epoch, as after restart or
+	// a conflict outcome that carries no observation height.
 	ObservedHeight int32
 }
 

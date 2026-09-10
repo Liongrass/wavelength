@@ -213,16 +213,14 @@ func (e *ExitConfirmedEvent) MessageType() string {
 // ExitConflictedEvent is delivered to a VTXO actor in UnilateralExitState when
 // the downstream unroll job terminated because a confirmed foreign spend
 // conflicts with the recovery tree — the operator swept a source batch
-// commitment output the exit depends on (wavelength#1050). The VTXO is retired
-// to the terminal FailedState and the actor is reaped: the exit is provably
-// impossible, so the coin must leave pending balance and read as FAILED, but it
-// must NOT roll back to live (as a clean recoverable failure would) because the
-// operator has taken the underlying output.
+// commitment output the exit depends on (wavelength#1050). The VTXO moves to
+// the non-terminal ExpiredState: its old lineage is unusable, but the actor
+// stays alive to recover the value through an ordinary refresh. It must not
+// return directly to LiveState as a clean, no-footprint exit failure would.
 type ExitConflictedEvent struct {
 	actor.BaseMessage
 
-	// Reason explains the conflict, for logging and the failed VTXO's audit
-	// trail.
+	// Reason explains why the exit failed and the VTXO needs reclaim.
 	Reason string
 }
 

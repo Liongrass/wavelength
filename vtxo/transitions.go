@@ -1619,10 +1619,12 @@ func (s *UnilateralExitState) ProcessEvent(ctx context.Context, event VTXOEvent,
 			slog.String("reason", evt.Reason),
 		)
 
+		// The outcome carries no observation height. Leave it unknown
+		// until a block epoch arrives instead of reusing exit
+		// admission.
 		return &VTXOStateTransition{
 			NextState: &ExpiredState{
-				VTXO:           s.VTXO,
-				ObservedHeight: s.LastCheckedHeight,
+				VTXO: s.VTXO,
 			},
 			NewEvents: fn.Some(VTXOEmittedEvent{
 				Outbox: []VTXOOutMsg{
@@ -1799,7 +1801,7 @@ func (s *ExpiredState) ProcessEvent(ctx context.Context, event VTXOEvent,
 		}, nil
 
 	case *SpendReleasedEvent, *SpendCompletedEvent, *ForfeitReleasedEvent,
-		*ExitFailedEvent, *ExitConfirmedEvent:
+		*ExitFailedEvent, *ExitConfirmedEvent, *ExitConflictedEvent:
 		// Stale events from a path that ran before this VTXO expired.
 		// An expired VTXO is long-lived, so these can arrive well
 		// after the fact; absorbing them keeps the actor alive without
