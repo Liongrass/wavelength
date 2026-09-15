@@ -110,9 +110,16 @@ func (w *Wallet) NewAddress(ctx context.Context) (btcaddr.Address, error) {
 
 var _ proofkeys.Backend = (*Wallet)(nil)
 
-// Balance returns the confirmed and unconfirmed balance across all
-// wallet-managed addresses. Confirmed balance requires at least 1
-// confirmation.
+// Balance returns the confirmed and unconfirmed balance of the default
+// account, which is the only account this wallet spends from. Confirmed
+// balance requires at least 1 confirmation.
+//
+// Imported taproot scripts (boarding and exit outputs tracked via
+// ImportTaprootScript) live in btcwallet's imported account and are
+// excluded. They are unspendable by the wallet's own key ring, and the
+// daemon already reports them under the separate boarding balance
+// fields, so counting them here would overstate what the wallet can
+// fund an exit or sweep with.
 func (w *Wallet) Balance(ctx context.Context) (btcutil.Amount, btcutil.Amount,
 	error) {
 
@@ -124,13 +131,17 @@ func (w *Wallet) Balance(ctx context.Context) (btcutil.Amount, btcutil.Amount,
 		slog.Bool("chain_synced", chainSynced),
 	)
 
-	confirmed, err := w.BtcWallet.ConfirmedBalance(1, "")
+	confirmed, err := w.BtcWallet.ConfirmedBalance(
+		1, lnwallet.DefaultAccountName,
+	)
 	if err != nil {
 		return 0, 0, fmt.Errorf("get confirmed balance: %w", err)
 	}
 
 	// Total includes unconfirmed (0-conf) outputs.
-	total, err := w.BtcWallet.ConfirmedBalance(0, "")
+	total, err := w.BtcWallet.ConfirmedBalance(
+		0, lnwallet.DefaultAccountName,
+	)
 	if err != nil {
 		return 0, 0, fmt.Errorf("get total balance: %w", err)
 	}
