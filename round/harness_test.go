@@ -744,7 +744,11 @@ func (h *boardingTestHarness) newTestVTXOTree(numLeaves int) (*tree.Tree,
 		PkScript: batchPkScript,
 	}
 
-	sweepRoot := sha256.Sum256([]byte("test-sweep-root"))
+	sweepLeaf, err := arkscript.UnilateralCSVTimeoutTapLeaf(
+		h.operatorPubKey, 1008,
+	)
+	require.NoError(h.t, err)
+	sweepRoot := sweepLeaf.TapHash()
 
 	vtxtTree, err := tree.NewTree(
 		batchOutpoint, batchOutput, leaves, h.operatorPubKey,
@@ -786,7 +790,11 @@ func (h *boardingTestHarness) newTestVTXOTreeForIntents(
 		PkScript: batchPkScript,
 	}
 
-	sweepRoot := sha256.Sum256([]byte("test-sweep-root"))
+	sweepLeaf, err := arkscript.UnilateralCSVTimeoutTapLeaf(
+		h.operatorPubKey, 1008,
+	)
+	require.NoError(h.t, err)
+	sweepRoot := sweepLeaf.TapHash()
 
 	vtxtTree, err := tree.NewTree(
 		batchOutpoint, batchOutput, leaves, h.operatorPubKey,
@@ -1053,6 +1061,8 @@ func (h *boardingTestHarness) newCommitmentTxReceivedState(roundID RoundID,
 			VTXOs:    vtxoReqs,
 		},
 		ClientTrees: make(map[SignerKey]*tree.Tree),
+		SweepKey:    h.operatorPubKey,
+		SweepDelay:  1008,
 	}
 }
 
@@ -2274,7 +2284,11 @@ func (h *boardingTestHarness) newMinimalVTXOTree() *tree.Tree {
 		PkScript: batchPkScript,
 	}
 
-	sweepRoot := sha256.Sum256([]byte("test-sweep-root"))
+	sweepLeaf, err := arkscript.UnilateralCSVTimeoutTapLeaf(
+		h.operatorPubKey, 1008,
+	)
+	require.NoError(h.t, err)
+	sweepRoot := sweepLeaf.TapHash()
 
 	vtxtTree, err := tree.NewTree(
 		batchOutpoint, batchOutput, leaves, h.operatorPubKey,
