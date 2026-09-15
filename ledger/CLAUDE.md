@@ -51,7 +51,9 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/ledger.<
   falls back to `clock.NewDefaultClock()`.
 - `Sink` — alias for `actor.TellOnlyRef[LedgerMsg]`, via
   `NewSink(system)`. Producers (round / OOR / VTXO / wallet) hold
-  `fn.Option[ledger.Sink]` and fire-and-forget.
+  `fn.Option[ledger.Sink]`. Round and OOR producers Tell with a context
+  that carries their own write transaction so the enqueue commits with
+  the state change; VTXO and wallet producers are fire-and-forget.
 - `LedgerStore` — single `InsertLedgerEntry` method. Multi-leg
   handlers rely on the durable actor's outer tx for atomicity, not a
   batch API. Implemented by `db.LedgerStoreDB`.

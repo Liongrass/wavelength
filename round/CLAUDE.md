@@ -118,7 +118,10 @@ state transitions and validation rules live under [Invariants](#invariants).
   (compile-time-asserted).
 - `RoundClientConfig.LedgerSink` — optional `fn.Option[ledger.Sink]`
   plumbed onto the round actor; `emitVTXOsReceived` and `emitRoundFee`
-  fire-and-forget messages when `fn.Some`.
+  stage messages per round when `fn.Some`, and `onRoundComplete` hands
+  them to the sink inside `RoundStore.FinalizeRound`'s transaction so
+  the round row and its accounting commit together (a refused enqueue
+  fails finalization and the next start re-drives confirmation).
 - `RoundClientConfig.RegistrationTimeout` — max wall-clock duration to wait in
   `IntentSentState` for the server's `RoundJoined` admission watermark. Zero
   selects `defaultRegistrationTimeout` (60 s); negative disables the timeout
@@ -263,6 +266,22 @@ state transitions and validation rules live under [Invariants](#invariants).
   then reported the transaction as no longer indexed. Restart recovery still
   re-registers active rounds from durable state in `Start`, so crash recovery
   is unaffected.
+- **The finalize callback is pure with respect to the staged ledger set,
+  and teardown trails a successful finalize.** `db.ExecTxCtx` re-runs the
+  whole callback body when the commit trips a serialization or busy error,
+  so `flushStagedLedger` only Tells — it never deletes `stagedLedger[roundID]`.
+  `onRoundComplete` drops the staged set, stops the FSM, and removes the
+  round from `rounds` / `commitmentTxIndex` only after `FinalizeRound`
+  returns nil. Finalization is fallible, and the FSM cannot retry it: by
+  then it sits in `ConfirmedState`, where a redelivered confirmation is a
+  self-loop that emits no second `RoundCompletedNotification`. So the
+  actor owns the retry: a failed finalize records a `pendingFinalize`
+  entry and arms a `finalize-retry` timeout (`maxFinalizeRetries`
+  doubling attempts from `finalizeRetryBaseDelay`) that re-drives
+  `onRoundComplete` directly. Past the bound the entry is dropped and the
+  next start rebuilds the round from its `input_sig_sent` row and
+  re-drives the confirmation. Either way the round must stay routable and
+  its staged accounting reclaimable until a finalize succeeds.
 - The round actor does **not** mark VTXOs as `PendingForfeit` — the
   wallet/manager admits VTXOs before sending `RegisterIntentMsg`.
 - A round that settles in the terminal `ClientFailedState` (admission

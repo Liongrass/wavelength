@@ -317,6 +317,16 @@ item.
 | oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR}` |
 | unroll | `unroll/actor.go` | `emitExitCostIfCompleted` | `ExitCostMsg` after final sweep confirmation |
 
+The round actor does not Tell on emission. `emitVTXOsReceived` and
+`emitRoundFee` stage every message under the round, and
+`onRoundComplete` flushes the set from inside
+`RoundStore.FinalizeRound`'s transaction with a context that carries
+it, so the durable mailbox rows commit with the round row. A refused
+enqueue fails finalization, the round stays active, and the next start
+re-drives the confirmation; the idempotency keys then make the replay
+a no-op. OOR sessions already follow the same rule through their
+durable actor's commit transaction.
+
 The round actor's emission path carries the most complexity
 because a single round can mix boarding inputs, refresh inputs,
 and remote directed-send recipients. The `VTXOOrigin` classifier

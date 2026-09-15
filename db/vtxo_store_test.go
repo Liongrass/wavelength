@@ -1475,6 +1475,7 @@ func TestVTXOPersistenceStoreListVTXOsByStatusSettlement(t *testing.T) {
 					[]byte("settlement-block"),
 				),
 			},
+			nil,
 		),
 	)
 
@@ -2383,6 +2384,7 @@ func TestVTXOPersistenceStoreListVTXOsByStatusesLight(t *testing.T) {
 					[]byte("by-statuses-block"),
 				),
 			},
+			nil,
 		),
 	)
 

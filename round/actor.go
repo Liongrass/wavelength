@@ -274,6 +274,28 @@ func parseTimeoutID(id timeout.ID) (RoundKeyStr, TimeoutPhase, error) {
 	return RoundKeyStr(s[:idx]), TimeoutPhase(s[idx+1:]), nil
 }
 
+// pendingFinalize is the finalization a confirmed round still owes after a
+// failed FinalizeRound, together with how many attempts it has consumed.
+type pendingFinalize struct {
+	roundID  RoundID
+	txid     chainhash.Hash
+	confInfo ConfInfo
+	attempts int
+}
+
+const (
+	// maxFinalizeRetries bounds how many times a failed finalization is
+	// re-driven in process before the actor leaves recovery to the next
+	// start. Five doubling attempts from finalizeRetryBaseDelay cover
+	// roughly a minute, long enough to outlast a busy writer without
+	// masking a database that is genuinely broken.
+	maxFinalizeRetries = 5
+
+	// finalizeRetryBaseDelay is the first retry delay; each further
+	// attempt doubles it.
+	finalizeRetryBaseDelay = 2 * time.Second
+)
+
 // RoundFSM wraps a state machine instance for a specific round.
 type RoundFSM struct {
 	// FSM is the state machine for this round. The baselib protofsm uses 3
@@ -326,6 +348,21 @@ type RoundClientActor struct {
 	// when received via RoundJoined. This enables concurrent round
 	// assembly.
 	rounds map[RoundKeyStr]*RoundFSM
+
+	// stagedLedger holds the ledger messages a confirmed round produced,
+	// keyed by RoundID string, until FinalizeRound commits them in its
+	// transaction. Staging rather than sending on emission is what makes
+	// "round finalized" and "accounting enqueued" one durable fact.
+	stagedLedger map[string][]ledger.LedgerMsg
+
+	// pendingFinalize holds the finalization a confirmed round still
+	// owes after FinalizeRound failed, keyed by the round's map key. The
+	// FSM has already advanced to ConfirmedState by then and never
+	// re-emits the completion, so the retry timeout re-drives
+	// onRoundComplete from here. Bounded by maxFinalizeRetries; past
+	// that the entry is dropped and the next start rebuilds the round
+	// from its input_sig_sent row and re-drives the confirmation.
+	pendingFinalize map[RoundKeyStr]*pendingFinalize
 
 	// commitmentTxIndex maps commitment transaction IDs to their round
 	// keys for routing confirmation events.
@@ -582,6 +619,7 @@ func NewRoundClientActor(cfg *RoundClientConfig) fn.Result[*RoundClientActor] {
 		cfg:               cfg,
 		log:               actorLog,
 		rounds:            make(map[RoundKeyStr]*RoundFSM),
+		stagedLedger:      make(map[string][]ledger.LedgerMsg),
 		commitmentTxIndex: make(map[chainhash.Hash]RoundKeyStr),
 		pendingQuotes:     make(map[RoundID]*JoinRoundQuoteReceived),
 		env:               env,
@@ -626,41 +664,41 @@ func NewRoundClientActor(cfg *RoundClientConfig) fn.Result[*RoundClientActor] {
 //     accounts, so "do nothing" is strictly safer than picking a
 //     default.
 //
-// Emission is best-effort: Tell failures are logged but not
-// propagated, so a momentary ledger outage never breaks the
-// round actor's downstream dispatch loop.
+// Emission is staged, not sent: every message is queued under the
+// round and handed to the ledger inside FinalizeRound's transaction
+// (see onRoundComplete), so a round is never archived without its
+// accounting and the accounting is never enqueued for a round whose
+// finalization rolled back.
 func (a *RoundClientActor) emitVTXOsReceived(ctx context.Context,
 	n *VTXOCreatedNotification) {
 
-	a.cfg.LedgerSink.WhenSome(func(sink ledger.Sink) {
-		if n == nil {
-			return
+	if a.cfg.LedgerSink.IsNone() || n == nil {
+		return
+	}
+
+	roundID := roundIDBytes(n.RoundID)
+
+	for _, outflow := range n.Outflows {
+		if outflow.AmountSat <= 0 {
+			continue
 		}
 
-		roundID := roundIDBytes(n.RoundID)
+		a.stageLedger(&ledger.VTXOSentMsg{
+			AmountSat:      outflow.AmountSat,
+			RoundID:        roundID,
+			IdempotencyKey: outflow.IdempotencyKey,
+		}, n.RoundID)
+	}
 
-		for _, outflow := range n.Outflows {
-			if outflow.AmountSat <= 0 {
-				continue
-			}
-
-			a.tellLedger(ctx, sink, &ledger.VTXOSentMsg{
-				AmountSat:      outflow.AmountSat,
-				RoundID:        roundID,
-				IdempotencyKey: outflow.IdempotencyKey,
-			}, "", n.RoundID)
+	for _, v := range n.VTXOs {
+		if v == nil || v.Amount <= 0 {
+			continue
 		}
 
-		for _, v := range n.VTXOs {
-			if v == nil || v.Amount <= 0 {
-				continue
-			}
+		a.emitOwnedVTXOLedgerEntry(ctx, roundID, v, n)
+	}
 
-			a.emitOwnedVTXOLedgerEntry(ctx, sink, roundID, v, n)
-		}
-
-		a.emitRoundFee(ctx, sink, roundID, n)
-	})
+	a.emitRoundFee(roundID, n)
 }
 
 // emitRoundCompleted reports a terminal round outcome to the metrics
@@ -762,10 +800,10 @@ func (a *RoundClientActor) emitRoundJoined(ctx context.Context,
 // transition helper clamps to zero when outputs exceed inputs so
 // a malformed intent never produces a negative ledger row.
 //
-// Emission is best-effort: a Tell failure does not fail the
-// enclosing notification dispatch.
-func (a *RoundClientActor) emitRoundFee(ctx context.Context, sink ledger.Sink,
-	roundID [16]byte, n *VTXOCreatedNotification) {
+// Emission is staged and committed with FinalizeRound, like every
+// other round ledger message.
+func (a *RoundClientActor) emitRoundFee(roundID [16]byte,
+	n *VTXOCreatedNotification) {
 
 	if n.OperatorFeeSat <= 0 {
 		return
@@ -776,12 +814,12 @@ func (a *RoundClientActor) emitRoundFee(ctx context.Context, sink ledger.Sink,
 		feeType = ledger.FeeTypeRefresh
 	}
 
-	a.tellLedger(ctx, sink, &ledger.FeePaidMsg{
+	a.stageLedger(&ledger.FeePaidMsg{
 		RoundID:     roundID,
 		AmountSat:   n.OperatorFeeSat,
 		FeeType:     feeType,
 		BlockHeight: uint32(n.CreatedHeight),
-	}, "", n.RoundID)
+	}, n.RoundID)
 }
 
 // emitOwnedVTXOLedgerEntry sends the per-VTXO ledger traffic for
@@ -791,21 +829,20 @@ func (a *RoundClientActor) emitRoundFee(ctx context.Context, sink ledger.Sink,
 // refresh-origin stays co-located with the receive-only emissions
 // for the other cases.
 func (a *RoundClientActor) emitOwnedVTXOLedgerEntry(ctx context.Context,
-	sink ledger.Sink, roundID [16]byte, v *ClientVTXO,
-	n *VTXOCreatedNotification) {
+	roundID [16]byte, v *ClientVTXO, n *VTXOCreatedNotification) {
 
 	outpoint := v.Outpoint.String()
 
 	switch v.Origin {
 	case types.VTXOOriginRoundBoarding:
 		// Genuine boarding: wallet \u2192 VTXO.
-		a.tellLedger(ctx, sink, &ledger.VTXOReceivedMsg{
+		a.stageLedger(&ledger.VTXOReceivedMsg{
 			OutpointHash:  v.Outpoint.Hash,
 			OutpointIndex: v.Outpoint.Index,
 			AmountSat:     int64(v.Amount),
 			Source:        ledger.SourceRoundBoarding,
 			RoundID:       roundID,
-		}, outpoint, n.RoundID)
+		}, n.RoundID)
 
 	case types.VTXOOriginRoundRefresh, types.VTXOOriginAutoRefresh:
 		// Paired emission so transfers_out nets to zero and
@@ -816,29 +853,29 @@ func (a *RoundClientActor) emitOwnedVTXOLedgerEntry(ctx context.Context,
 		// a per-VTXO idempotency key so two refreshes in one
 		// round don't collide on the round-scoped partial
 		// unique index.
-		a.tellLedger(ctx, sink, &ledger.VTXOSentMsg{
+		a.stageLedger(&ledger.VTXOSentMsg{
 			Outpoint:  v.Outpoint,
 			AmountSat: int64(v.Amount),
 			RoundID:   roundID,
-		}, outpoint, n.RoundID)
+		}, n.RoundID)
 
-		a.tellLedger(ctx, sink, &ledger.VTXOReceivedMsg{
+		a.stageLedger(&ledger.VTXOReceivedMsg{
 			OutpointHash:  v.Outpoint.Hash,
 			OutpointIndex: v.Outpoint.Index,
 			AmountSat:     int64(v.Amount),
 			Source:        ledger.SourceRoundRefresh,
 			RoundID:       roundID,
-		}, outpoint, n.RoundID)
+		}, n.RoundID)
 
 	case types.VTXOOriginRoundTransfer:
 		// Actual in-round receive from another participant.
-		a.tellLedger(ctx, sink, &ledger.VTXOReceivedMsg{
+		a.stageLedger(&ledger.VTXOReceivedMsg{
 			OutpointHash:  v.Outpoint.Hash,
 			OutpointIndex: v.Outpoint.Index,
 			AmountSat:     int64(v.Amount),
 			Source:        ledger.SourceRoundTransfer,
 			RoundID:       roundID,
-		}, outpoint, n.RoundID)
+		}, n.RoundID)
 
 	default:
 		// Unknown origin: the composition path forgot to
@@ -854,21 +891,50 @@ func (a *RoundClientActor) emitOwnedVTXOLedgerEntry(ctx context.Context,
 	}
 }
 
-// tellLedger is a small helper wrapping sink.Tell with the
-// per-outpoint warning path, so the per-origin branches above
-// stay short. Tell failures log-and-return rather than aborting
-// the enclosing loop.
-func (a *RoundClientActor) tellLedger(ctx context.Context, sink ledger.Sink,
-	msg ledger.LedgerMsg, outpoint, roundID string) {
-
-	if err := sink.Tell(ctx, msg); err != nil {
-		a.log.WarnS(ctx,
-			"Failed to emit ledger message", err,
-			slog.String("msg_type",
-				fmt.Sprintf("%T", msg)),
-			slog.String("outpoint", outpoint),
-			slog.String("round_id", roundID))
+// stageLedger queues a ledger message for the round so flushStagedLedger
+// can hand the whole set to the ledger inside FinalizeRound's transaction.
+func (a *RoundClientActor) stageLedger(msg ledger.LedgerMsg, roundID string) {
+	if a.stagedLedger == nil {
+		a.stagedLedger = make(map[string][]ledger.LedgerMsg)
 	}
+	a.stagedLedger[roundID] = append(a.stagedLedger[roundID], msg)
+}
+
+// flushStagedLedger sends every message staged for the round through the
+// ledger sink with the supplied context. Called from FinalizeRound's
+// transaction callback, the context carries that transaction, so a durable
+// sink enqueues the messages in it: they commit with the round row or roll
+// back with it, and a failed enqueue fails finalization so a restart
+// re-drives the confirmation.
+//
+// The callback is pure with respect to in-memory state: db.ExecTxCtx re-runs
+// the whole callback body when the commit trips a serialization or busy
+// error, so dropping the staged set here would finalize the retry with no
+// accounting at all. The caller drops it only once FinalizeRound has
+// returned nil.
+func (a *RoundClientActor) flushStagedLedger(ctx context.Context,
+	roundID string) error {
+
+	staged := a.stagedLedger[roundID]
+	if len(staged) == 0 || a.cfg.LedgerSink.IsNone() {
+		return nil
+	}
+
+	sink := a.cfg.LedgerSink.UnsafeFromSome()
+	for _, msg := range staged {
+		if err := sink.Tell(ctx, msg); err != nil {
+			return fmt.Errorf("enqueue %T for round %s: %w", msg,
+				roundID, err)
+		}
+	}
+
+	return nil
+}
+
+// dropStagedLedger discards staged accounting for a round that will never
+// finalize, so a cancelled or failed round leaves nothing behind.
+func (a *RoundClientActor) dropStagedLedger(roundID RoundID) {
+	delete(a.stagedLedger, roundID.String())
 }
 
 // roundIDBytes parses the canonical UUID string form of a RoundID
@@ -2522,6 +2588,7 @@ func (a *RoundClientActor) handleCancelRound(ctx context.Context,
 		targetFSM.FSM.Stop()
 		delete(a.rounds, keyStr)
 	}
+	a.dropStagedLedger(targetFSM.RoundID)
 
 	a.log.InfoS(ctx, "Round participation cancelled successfully")
 
@@ -2578,14 +2645,132 @@ func (a *RoundClientActor) onRoundComplete(ctx context.Context, roundID RoundID,
 		slog.Int("conf_height", int(confInfo.Height)),
 	)
 
+	// The ledger messages staged by the VTXOCreatedNotification that
+	// precedes this one in the outbox are enqueued inside the finalize
+	// transaction. If the enqueue fails the round row is not written and
+	// the error propagates: the caller schedules a bounded in-process
+	// retry, and past that bound the next start rebuilds the round from
+	// its input_sig_sent row and re-drives the confirmation, with the
+	// ledger deduplicating any replay.
+	err := a.cfg.RoundStore.FinalizeRound(
+		ctx, roundID, txid, confInfo, func(txCtx context.Context) error {
+			return a.flushStagedLedger(txCtx, roundID.String())
+		},
+	)
+	if err != nil {
+
+		// Finalization is fallible, so the round keeps its FSM and its
+		// entries in the routing maps: the retry must still find the
+		// round, and its staged accounting must still be reclaimable.
+		return err
+	}
+
 	keyStr := RoundKeyStr(roundID.KeyString())
 	if roundFSM, exists := a.rounds[keyStr]; exists {
 		roundFSM.FSM.Stop()
 		delete(a.rounds, keyStr)
 	}
 	delete(a.commitmentTxIndex, txid)
+	delete(a.pendingFinalize, keyStr)
+	a.dropStagedLedger(roundID)
 
-	return a.cfg.RoundStore.FinalizeRound(ctx, roundID, txid, confInfo)
+	return nil
+}
+
+// scheduleFinalizeRetry records the finalization a confirmed round still
+// owes and arms the retry timeout for it. The FSM cannot help here: it is
+// already in ConfirmedState, where a redelivered confirmation is a self-loop
+// that emits nothing, so the actor owns the retry. Attempts are bounded;
+// once exhausted the entry is dropped and recovery is left to the next
+// start, which rebuilds the round from its input_sig_sent row.
+func (a *RoundClientActor) scheduleFinalizeRetry(ctx context.Context,
+	roundID RoundID, txid chainhash.Hash, confInfo ConfInfo, cause error) {
+
+	if a.pendingFinalize == nil {
+		a.pendingFinalize = make(map[RoundKeyStr]*pendingFinalize)
+	}
+
+	keyStr := RoundKeyStr(roundID.KeyString())
+	pending, ok := a.pendingFinalize[keyStr]
+	if !ok {
+		pending = &pendingFinalize{
+			roundID:  roundID,
+			txid:     txid,
+			confInfo: confInfo,
+		}
+		a.pendingFinalize[keyStr] = pending
+	}
+	pending.attempts++
+
+	if pending.attempts > maxFinalizeRetries {
+		a.log.ErrorS(ctx, "Round finalization retries exhausted; "+
+			"the next start re-drives the confirmation",
+			cause,
+			slog.String("round_id", roundID.String()),
+			slog.Int("attempts", pending.attempts-1),
+		)
+		delete(a.pendingFinalize, keyStr)
+
+		return
+	}
+
+	delay := finalizeRetryBaseDelay << (pending.attempts - 1)
+	a.log.WarnS(ctx, "Round finalization failed; retrying",
+		cause,
+		slog.String("round_id", roundID.String()),
+		slog.Int("attempt", pending.attempts),
+		slog.Duration("delay", delay),
+	)
+
+	callbackRef := timeout.MapTimeoutExpired(
+		a.cfg.SelfRef,
+		func(expired timeout.ExpiredMsg) actormsg.RoundReceivable {
+			return &TimeoutMsg{
+				TimeoutID: expired.ID,
+			}
+		},
+	)
+	req := &timeout.ScheduleTimeoutRequest{
+		ID:       makeTimeoutID(keyStr, TimeoutPhaseFinalizeRetry),
+		Duration: delay,
+		Callback: callbackRef,
+	}
+	if err := a.cfg.TimeoutActor.Tell(ctx, req); err != nil {
+		a.log.WarnS(ctx, "Failed to arm round finalization retry",
+			err,
+			slog.String("round_id", roundID.String()),
+		)
+	}
+}
+
+// retryFinalize re-drives the finalization recorded for a round when its
+// retry timeout fires. A missing entry means the round already finalized
+// through another path, so the expiry is ignored.
+func (a *RoundClientActor) retryFinalize(ctx context.Context,
+	keyStr RoundKeyStr) {
+
+	pending, ok := a.pendingFinalize[keyStr]
+	if !ok {
+		a.log.DebugS(ctx, "Ignoring finalize retry for settled round",
+			slog.String("round_key", string(keyStr)),
+		)
+
+		return
+	}
+
+	err := a.onRoundComplete(
+		ctx, pending.roundID, pending.txid, pending.confInfo,
+	)
+	if err != nil {
+		a.scheduleFinalizeRetry(
+			ctx, pending.roundID, pending.txid, pending.confInfo,
+			err,
+		)
+
+		return
+	}
+
+	a.emitRoundCompleted(ctx, pending.roundID.String(), "confirmed")
 }
 
 // reapFailedRounds drops every round FSM that has settled in the terminal
@@ -2636,6 +2821,7 @@ func (a *RoundClientActor) reapFailedRounds(ctx context.Context) {
 		roundFSM.FSM.Stop()
 		delete(a.rounds, keyStr)
 		delete(a.commitmentTxIndex, roundFSM.TxID)
+		a.dropStagedLedger(roundFSM.RoundID)
 	}
 }
 
@@ -2726,6 +2912,13 @@ func (a *RoundClientActor) handleTimeout(ctx context.Context,
 
 	var timeoutEvt ClientEvent
 	switch phase {
+	case TimeoutPhaseFinalizeRetry:
+		// Not an FSM event: the round is already confirmed and only
+		// its durable finalization is outstanding.
+		a.retryFinalize(ctx, keyStr)
+
+		return fn.Ok[actormsg.RoundActorResp](nil)
+
 	case TimeoutPhaseRefreshRegistration:
 		state, stateErr := fsmState(ctx, roundFSM.FSM)
 		if stateErr != nil {
@@ -2997,11 +3190,16 @@ func (a *RoundClientActor) processOutbox(ctx context.Context,
 			)
 
 			// Round FSM reached ConfirmedState. Perform actor
-			// cleanup.
+			// cleanup. The FSM never re-emits this notification,
+			// so a failed finalization is retried by the actor.
 			err := a.onRoundComplete(
 				ctx, m.RoundID, m.TxID, m.ConfInfo,
 			)
 			if err != nil {
+				a.scheduleFinalizeRetry(
+					ctx, m.RoundID, m.TxID, m.ConfInfo, err,
+				)
+
 				return fmt.Errorf("failed to complete round "+
 					"%s: %w", m.RoundID, err)
 			}

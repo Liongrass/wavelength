@@ -92,11 +92,20 @@ func (m *MockRoundStore) ListActiveRounds(ctx context.Context) ([]*Round,
 }
 
 func (m *MockRoundStore) FinalizeRound(ctx context.Context, roundID RoundID,
-	txid chainhash.Hash, confInfo ConfInfo) error {
+	txid chainhash.Hash, confInfo ConfInfo,
+	then func(context.Context) error) error {
 
 	args := m.Called(ctx, roundID, txid, confInfo)
+	if err := args.Error(0); err != nil {
+		return err
+	}
+	if then == nil {
+		return nil
+	}
 
-	return args.Error(0)
+	// The mock has no transaction; run the callback with the caller's
+	// context so staged ledger work is still delivered in tests.
+	return then(ctx)
 }
 
 func (m *MockRoundStore) FailRound(ctx context.Context, roundID RoundID) error {
