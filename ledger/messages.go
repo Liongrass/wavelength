@@ -157,6 +157,7 @@ const (
 	vtxoRecvAmountSatType     tlv.Type = 5
 	vtxoRecvSourceType        tlv.Type = 7
 	vtxoRecvRoundIDType       tlv.Type = 9
+	vtxoRecvSessionIDType     tlv.Type = 11
 
 	// VTXOSentMsg field types. The codec accepts either
 	// session_id (OOR sends) or round_id (in-round sends), not
@@ -408,6 +409,15 @@ type VTXOReceivedMsg struct {
 	// RoundID is the 16-byte round UUID associated with this
 	// VTXO.
 	RoundID [16]byte
+
+	// SessionID is the 32-byte OOR session identifier the VTXO was
+	// materialized under. Zero for round receipts. The handler uses it
+	// to recognise the sender's own change coming back: an outgoing
+	// VTXOSentMsg already booked under the same session id means the
+	// value never left. Optional on the wire, so a payload written
+	// before the field existed decodes to zero and books as a plain
+	// receive.
+	SessionID [32]byte
 }
 
 // MessageType returns the message type name for routing.
@@ -427,6 +437,7 @@ func (m *VTXOReceivedMsg) Encode(w io.Writer) error {
 	amountSat := uint64(m.AmountSat)
 	source := []byte(m.Source)
 	roundID := m.RoundID[:]
+	sessionID := m.SessionID[:]
 
 	stream, err := tlv.NewStream(
 		tlv.MakePrimitiveRecord(
@@ -443,6 +454,9 @@ func (m *VTXOReceivedMsg) Encode(w io.Writer) error {
 		),
 		tlv.MakePrimitiveRecord(
 			vtxoRecvRoundIDType, &roundID,
+		),
+		tlv.MakePrimitiveRecord(
+			vtxoRecvSessionIDType, &sessionID,
 		),
 	)
 	if err != nil {
@@ -460,6 +474,7 @@ func (m *VTXOReceivedMsg) Decode(r io.Reader) error {
 		amountSat     uint64
 		source        []byte
 		roundID       []byte
+		sessionID     []byte
 	)
 
 	stream, err := tlv.NewStream(
@@ -478,6 +493,9 @@ func (m *VTXOReceivedMsg) Decode(r io.Reader) error {
 		tlv.MakePrimitiveRecord(
 			vtxoRecvRoundIDType, &roundID,
 		),
+		tlv.MakePrimitiveRecord(
+			vtxoRecvSessionIDType, &sessionID,
+		),
 	)
 	if err != nil {
 		return err
@@ -485,6 +503,12 @@ func (m *VTXOReceivedMsg) Decode(r io.Reader) error {
 
 	if _, err := stream.DecodeWithParsedTypes(r); err != nil {
 		return fmt.Errorf("decode VTXOReceivedMsg: %w", err)
+	}
+
+	if err := decodeFixedBytes(
+		"VTXOReceivedMsg.SessionID", sessionID, len(m.SessionID),
+	); err != nil {
+		return err
 	}
 
 	if err := decodeFixedBytes(
@@ -512,6 +536,7 @@ func (m *VTXOReceivedMsg) Decode(r io.Reader) error {
 	m.AmountSat = amt
 	m.Source = string(source)
 	copy(m.RoundID[:], roundID)
+	copy(m.SessionID[:], sessionID)
 
 	return nil
 }

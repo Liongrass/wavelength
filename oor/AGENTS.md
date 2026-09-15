@@ -50,6 +50,12 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/oor.<Sym
   requests (`QueryIncomingTransferRequest`, `QueryIncomingMetadataRequest`)
   -> `serverconn`; `MaterializeIncomingVTXOsRequest` -> wallet/VTXO store;
   `VTXOSentMsg`/`VTXOReceivedMsg` -> `ledger` (when `LedgerSink` is set).
+  Every incoming materialization is sourced `SourceOOR` with the session
+  id stamped on the message; the ledger recognises the sender's own
+  change coming back (a session it already booked an outgoing send for)
+  from its own rows and cancels it on `transfers_out` instead of
+  inflating gross receives, so the classification needs neither a caller
+  idempotency key nor the session row's pre-flip direction.
   Receives `SubmitAcceptedEvent` / `FinalizeAcceptedEvent` /
   `ResolveIncomingTransferRequest` <- `serverconn` event router;
   `StartTransferRequest` / `DriveEventRequest` / `ListSessionsRequest` <-

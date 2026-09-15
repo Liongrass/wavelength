@@ -156,9 +156,12 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/ledger.<
     `VTXOSentMsg` outflows; one `FeePaidMsg` per positive
     `OperatorFeeSat`, typed as boarding or refresh by the round
     composition.
-  - ← `oor`: `VTXOSentMsg` after `FinalizeAcceptedEvent`;
-    `VTXOReceivedMsg{SourceOOR}` per descriptor in
-    `notifyMaterializedVTXOs`.
+  - ← `oor`: `VTXOSentMsg` after `FinalizeAcceptedEvent`; one
+    `VTXOReceivedMsg{SourceOOR}` per materialized descriptor carrying
+    the session id. `handleVTXOReceived` books it as
+    `SourceOORSelfChange` when the ledger already holds an outgoing
+    `vtxo_sent` leg under that session id (the sender's own change
+    coming back), and as a `transfers_in` receive otherwise.
   - ← `unroll`: `ExitCostMsg` after the final sweep confirms, with
     gross value from the proof target output and fee derived from the
     persisted sweep transaction. `DestinationOwnWallet` is always true
@@ -180,6 +183,7 @@ or balance reconciliation. Required emission pairs:
 | Refresh / directed-send self-change | Paired `VTXOSentMsg{Outpoint,RoundID,gross}` + `VTXOReceivedMsg{SourceRoundRefresh,RoundID,gross}`; real vtxo_balance change comes from the round-emitted `FeePaidMsg{FeeTypeRefresh}` when `OperatorFeeSat > 0`. |
 | In-round participant receive | `VTXOReceivedMsg{SourceRoundTransfer}` net. No `FeePaidMsg`. |
 | OOR receive | `VTXOReceivedMsg{SourceOOR}` net. No `FeePaidMsg`. |
+| OOR self-change | `VTXOReceivedMsg{SourceOOR, SessionID}` for the sender's own change coming back as an incoming session; the handler sees the session's earlier `vtxo_sent` leg and credits `transfers_out` so it cancels the part of the companion `VTXOSentMsg` that never left. |
 | OOR send | `VTXOSentMsg{SessionID}` net. No `FeePaidMsg`. |
 | In-round send | `VTXOSentMsg{RoundID}` net. Recipient/leave sends without outpoints must set `IdempotencyKey`. `SessionID`/`RoundID` are mutually exclusive. |
 | Unilateral exit | `ExitCostMsg{AmountSat=gross, ExitCostSat=fee, DestinationOwnWallet}`. Handler expands to send-leg + fee-leg internally; the flag adds a separately keyed proceeds leg that moves the net value from `transfers_out` onto `wallet_balance`. |

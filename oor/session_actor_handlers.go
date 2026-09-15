@@ -716,7 +716,9 @@ func (b *sessionBehavior) materializeIncoming(ctx context.Context,
 	}
 
 	for _, event := range followUps {
-		b.notifyMaterialized(ctx, event)
+		if err := b.notifyMaterialized(ctx, event); err != nil {
+			return err
+		}
 
 		next, err := b.apply(ctx, event)
 		if err != nil {
@@ -752,14 +754,18 @@ func (b *sessionBehavior) materializeIncoming(ctx context.Context,
 // it fails with "no actor for outpoint" until the operator restarts. The
 // daemon-owned context keeps delivery independent of this child's lifetime,
 // and the goroutine keeps a busy VTXO manager mailbox from wedging the turn.
-func (b *sessionBehavior) notifyMaterialized(ctx context.Context, event Event) {
+func (b *sessionBehavior) notifyMaterialized(ctx context.Context,
+	event Event) error {
+
 	handled, ok := event.(*IncomingHandledEvent)
 	if !ok || len(handled.MaterializedVTXOs) == 0 {
-		return
+		return nil
 	}
 
 	descs := handled.MaterializedVTXOs
-	b.queueVTXOsReceived(ctx, descs)
+	if err := b.queueVTXOsReceived(ctx, descs); err != nil {
+		return err
+	}
 
 	vtxoManager := b.cfg.VTXOManager
 	observer := b.cfg.IncomingVTXOObserver
@@ -797,15 +803,17 @@ func (b *sessionBehavior) notifyMaterialized(ctx context.Context, event Event) {
 			}
 		}()
 	})
+
+	return nil
 }
 
 // queueVTXOsReceived stages one VTXOReceivedMsg per materialized incoming
 // VTXO for the durable outbox enqueue in commitAck.
 func (b *sessionBehavior) queueVTXOsReceived(ctx context.Context,
-	descs []*vtxo.Descriptor) {
+	descs []*vtxo.Descriptor) error {
 
 	if !b.cfg.LedgerSink.IsSome() {
-		return
+		return nil
 	}
 
 	b.logger(ctx).DebugS(
@@ -815,6 +823,12 @@ func (b *sessionBehavior) queueVTXOsReceived(ctx context.Context,
 		slog.Int("num_vtxos", len(descs)),
 	)
 
+	// The session id rides along so the ledger can tell the sender's own
+	// change (an incoming session under an id this daemon already booked
+	// an outgoing send for) from a receive. The ledger decides from its
+	// own rows, so the classification holds for sends made without a
+	// caller idempotency key and survives the session row's flip to the
+	// incoming direction.
 	for _, desc := range descs {
 		if desc == nil {
 			continue
@@ -826,7 +840,10 @@ func (b *sessionBehavior) queueVTXOsReceived(ctx context.Context,
 				OutpointIndex: desc.Outpoint.Index,
 				AmountSat:     int64(desc.Amount),
 				Source:        ledger.SourceOOR,
+				SessionID:     b.sessionID,
 			},
 		)
 	}
+
+	return nil
 }

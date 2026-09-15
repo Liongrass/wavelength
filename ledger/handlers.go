@@ -195,12 +195,46 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 	var (
 		debitAccount  string
 		creditAccount string
+		source        = msg.Source
 	)
+
+	// An OOR receive under a session this ledger already booked an
+	// outgoing send for is the sender's own change coming back. The
+	// ledger's own rows are the oracle: the outgoing VTXOSentMsg was
+	// enqueued in the outgoing session's commit, the operator only
+	// admits the incoming self-transfer hint once that session is
+	// terminal, and the durable mailbox delivers in enqueue order, so
+	// the send leg is always booked before this message is handled.
+	// Nothing here depends on a caller-supplied idempotency key or on
+	// a session row that later flips direction.
+	classify := func(ctx context.Context, q ledgerTx) error {
+		if source != SourceOOR || msg.SessionID == zeroSessionID {
+			return nil
+		}
+
+		sent, err := q.ledger.HasSessionEntry(
+			ctx, msg.SessionID, EventVTXOSent, AccountTransfersOut,
+			AccountVTXOBalance,
+		)
+		if err != nil {
+			return fmt.Errorf("classify OOR receive for session "+
+				"%x: %w", msg.SessionID, err)
+		}
+		if sent {
+			source = SourceOORSelfChange
+			debitAccount = AccountVTXOBalance
+			creditAccount = AccountTransfersOut
+		}
+
+		return nil
+	}
 
 	switch msg.Source {
 	case SourceOOR:
 		// OOR receive from another participant: counterparty
-		// side is transfers_in.
+		// side is transfers_in. classify upgrades this to the
+		// self-change booking inside the commit when the session
+		// already carries an outgoing send.
 		debitAccount = AccountVTXOBalance
 		creditAccount = AccountTransfersIn
 
@@ -218,6 +252,16 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 		// drift on a flow that never touched the wallet.
 		debitAccount = AccountVTXOBalance
 		creditAccount = AccountWalletBalance
+
+	case SourceOORSelfChange:
+		// The sender's own change from an outgoing OOR transfer. The
+		// outgoing session already debited transfers_out for the full
+		// input sum, so crediting transfers_out here cancels the part
+		// that never left and leaves the gross send figure equal to
+		// what the recipient actually got. Booking it as transfers_in
+		// would inflate both gross directions by the change amount.
+		debitAccount = AccountVTXOBalance
+		creditAccount = AccountTransfersOut
 
 	case SourceRoundRefresh:
 		// Refresh output (including directed-send self-change):
@@ -255,25 +299,29 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 	// issue #504.
 	chainVout := int32(msg.OutpointIndex)
 
-	entry := LedgerEntry{
-		DebitAccount:  debitAccount,
-		CreditAccount: creditAccount,
-		AmountSat:     msg.AmountSat,
-		RoundID:       roundID,
-		EventType:     EventVTXOReceived,
-		Description: fmt.Sprintf(
-			"VTXO received via %s: %x:%d",
-			msg.Source, msg.OutpointHash,
-			msg.OutpointIndex,
-		),
-		CreatedAt:      a.clk.Now().Unix(),
-		IdempotencyKey: idempotencyKey,
-		ChainTxid:      msg.OutpointHash[:],
-		ChainVout:      &chainVout,
-	}
-
 	return a.commit(ctx, ax, errMsg, func(ctx context.Context,
 		q ledgerTx) error {
+
+		if err := classify(ctx, q); err != nil {
+			return err
+		}
+
+		entry := LedgerEntry{
+			DebitAccount:  debitAccount,
+			CreditAccount: creditAccount,
+			AmountSat:     msg.AmountSat,
+			RoundID:       roundID,
+			EventType:     EventVTXOReceived,
+			Description: fmt.Sprintf(
+				"VTXO received via %s: %x:%d",
+				source, msg.OutpointHash,
+				msg.OutpointIndex,
+			),
+			CreatedAt:      a.clk.Now().Unix(),
+			IdempotencyKey: idempotencyKey,
+			ChainTxid:      msg.OutpointHash[:],
+			ChainVout:      &chainVout,
+		}
 
 		return q.ledger.InsertLedgerEntry(ctx, entry)
 	})

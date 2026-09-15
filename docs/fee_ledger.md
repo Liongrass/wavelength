@@ -95,6 +95,7 @@ replay dedup — see the [Replay safety](#replay-safety) section.
 | `VTXOReceivedMsg` | `SourceRoundRefresh` | `vtxo_balance` | `transfers_out` | Refresh or directed-send self-change output. Paired with `VTXOSentMsg` for the gross forfeit; the two cancel on `transfers_out` so only the fee moves `vtxo_balance`. |
 | `VTXOReceivedMsg` | `SourceRoundTransfer` | `vtxo_balance` | `transfers_in` | In-round receive from another participant's directed send. |
 | `VTXOReceivedMsg` | `SourceOOR` | `vtxo_balance` | `transfers_in` | Out-of-round receive from another participant. |
+| `VTXOReceivedMsg` | `SourceOOR` under a session with a booked `vtxo_sent` leg | `vtxo_balance` | `transfers_out` | The sender's own change from an outgoing OOR transfer, pushed back as a separate incoming session. The handler derives this from the ledger's own rows and books it as `SourceOORSelfChange`; it cancels the part of the companion `VTXOSentMsg` debit that never left. |
 | `VTXOSentMsg` | (any) | `transfers_out` | `vtxo_balance` | One message per sent VTXO. Outpoint stamps an idempotency key so multi-VTXO rounds don't collapse. |
 | `FeePaidMsg` | `FeeTypeBoarding` or `FeeTypeRefresh` | `fees_paid` | `vtxo_balance` | Operator fee for the round. |
 | `FeePaidMsg` | `FeeTypeOnchainSweep` | `onchain_fees` | `wallet_clearing` | Boarding sweep chain cost, keyed by sweep txid. Retained for direct callers; the boarding sweep producer now folds this leg into `BoardingSweepConfirmedMsg`. |
@@ -263,8 +264,8 @@ emitter (recipient side): oor.sessionBehavior.queueVTXOsReceived
                           (in notifyMaterialized)
 
 Sender event (vtxo_sent):
-  debit  transfers_out     += amount
-  credit vtxo_balance      += amount  (asset down)
+  debit  transfers_out     += Σ inputs
+  credit vtxo_balance      += Σ inputs  (asset down)
 
 Recipient event (vtxo_received, SourceOOR):
   debit  vtxo_balance      += amount
@@ -274,6 +275,33 @@ Recipient event (vtxo_received, SourceOOR):
 OOR rounds are currently fee-less on the wire (no `FeePaidMsg`
 is emitted). If that changes, a new emission site would add a
 third leg analogous to the refresh case.
+
+A payment with change produces a third event. The sender books the
+full input sum as `vtxo_sent`, and the operator pushes the sender's
+own change output back as a separate incoming session under the same
+session id:
+
+```
+Self-change event (vtxo_received, SourceOORSelfChange):
+  debit  vtxo_balance      += change
+  credit transfers_out     += change  (expense down)
+```
+
+This cancels the part of the sender's gross debit that never left, so
+`transfers_out` ends at what the recipient actually got — the same
+three-leg cancellation the refresh path uses, keyed by session instead
+of round. `queueVTXOsReceived` sends every materialization as a plain
+`SourceOOR` receive stamped with the session id, and
+`handleVTXOReceived` tells the two cases apart from the ledger's own
+rows: a `vtxo_sent` leg already booked under that session id means
+this daemon dispatched the outgoing transfer, so the receive is its
+change. The oracle is ordered by construction: the outgoing send leg
+is enqueued in the outgoing session's commit, the operator only admits
+the incoming self-transfer hint once that session is terminal, and the
+durable mailbox delivers in enqueue order. It needs no caller
+idempotency key and does not depend on the session row, which flips to
+the incoming direction, so it holds for unkeyed sends and survives a
+restart that re-drives materialization.
 
 ### Unilateral exit
 
@@ -349,7 +377,7 @@ item.
 | wallet | `wallet/boarding_sweep_actor.go` | `commitFinalizedSweep` → `sweepConfirmedLedgerMsg` | one `BoardingSweepConfirmedMsg` per finalized boarding sweep |
 | round | `round/actor.go` | `emitVTXOsReceived` → `emitOwnedVTXOLedgerEntry` | `VTXOReceivedMsg` (all sources), `VTXOSentMsg` (refresh pair) |
 | round | `round/actor.go` | `emitRoundFee` | `FeePaidMsg` (`boarding` or `refresh`) |
-| oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR}` |
+| oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR, SessionID}` |
 | unroll | `unroll/actor.go` | `emitExitCostIfCompleted` | `ExitCostMsg` after final sweep confirmation |
 
 The boarding sweep actor follows the same rule.
@@ -467,13 +495,6 @@ test runs.
   operator's policy says otherwise. It does mean `vtxo_balance`
   can include value that a long-offline client may never
   recover.
-- **OOR self-change.** An outgoing OOR session books the full
-  input value as `vtxo_sent`, and the sender's own change comes
-  back through a separate incoming session as `transfers_in`.
-  `vtxo_balance` nets correctly, but gross `transfers_out` and
-  `transfers_in` are both inflated by the change amount. The
-  round path already cancels self-change on `transfers_out`;
-  OOR change materialization needs an equivalent source.
 
 ## Related documents
 
