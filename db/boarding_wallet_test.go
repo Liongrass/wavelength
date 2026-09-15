@@ -1,7 +1,9 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	btcaddr "github.com/btcsuite/btcd/address/v2"
@@ -12,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightninglabs/wavelength/baselib/actor"
 	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/lib/arkscript"
 	"github.com/lightninglabs/wavelength/lib/types"
@@ -1506,4 +1509,102 @@ func TestIntentTxProofCorruptDecodesAsNone(t *testing.T) {
 		t, retrieved.ChainInfo.TxProof.IsNone(),
 		"corrupt blob must decode as None, not error",
 	)
+}
+
+// TestFinalizeBoardingSweepInputsCallbackSharesTransaction proves the
+// finalize callback runs inside the input transition's transaction: it sees
+// the open transaction on its context, and its failure leaves the sweep
+// unresolved so the next start can re-drive it.
+func TestFinalizeBoardingSweepInputsCallbackSharesTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, _ := newBoardingStoreForTest(t)
+
+	intent := createSweepStoreIntent(t, store)
+	sweepTx := wire.NewMsgTx(2)
+	sweepTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: intent.Outpoint,
+	})
+	sweepTx.AddTxOut(&wire.TxOut{
+		Value:    int64(intent.ChainInfo.Amount - 500),
+		PkScript: []byte{txscript.OP_TRUE},
+	})
+	sweepTxid := sweepTx.TxHash()
+
+	require.NoError(
+		t,
+		store.CreatePendingBoardingSweep(
+			ctx, wallet.NewBoardingSweep{
+				Tx:                 sweepTx,
+				DestinationAddress: "bcrt1test",
+				TotalAmount:        intent.ChainInfo.Amount,
+				FeeAmount:          500,
+				FeeRateSatPerVByte: 2,
+				VBytes:             250,
+				CreatedHeight:      200,
+				Inputs: []wallet.NewBoardingSweepInput{{
+					Outpoint:       intent.Outpoint,
+					Amount:         intent.ChainInfo.Amount,
+					PreviousStatus: intent.Status,
+				}},
+			},
+		),
+	)
+	require.NoError(t, store.MarkBoardingSweepPublished(ctx, sweepTxid))
+
+	// A refused enqueue must roll the input transition back with it.
+	enqueueErr := errors.New("mailbox insert refused")
+	outpoints := []wire.OutPoint{intent.Outpoint}
+	err := store.FinalizeBoardingSweepInputs(
+		ctx, outpoints, sweepTxid, 222,
+		func(context.Context) error { return enqueueErr },
+	)
+	require.ErrorIs(t, err, enqueueErr)
+
+	pending, err := store.ListPendingBoardingSweeps(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "refused enqueue must not resolve sweep")
+	require.Equal(
+		t, wallet.BoardingSweepInputStatusPublished,
+		dbSweepInputStatus(t, pending[0].Inputs),
+	)
+
+	// A succeeding callback observes the transaction on its context and
+	// the sweep resolves with it.
+	var sawTx bool
+	require.NoError(
+		t, store.FinalizeBoardingSweepInputs(
+			ctx, outpoints, sweepTxid, 222,
+			func(txCtx context.Context) error {
+				_, sawTx = actor.TxFromContext(txCtx)
+
+				return nil
+			},
+		),
+	)
+	require.True(t, sawTx, "callback must run with the open transaction")
+
+	pending, err = store.ListPendingBoardingSweeps(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
+	updated, err := store.GetIntent(ctx, intent.Outpoint)
+	require.NoError(t, err)
+	require.Equal(t, wallet.BoardingStatusSwept, updated.Status)
+
+	// A redelivery finds every input already resolved and is a no-op that
+	// still runs the callback, so replayed accounting reaches the ledger.
+	var replayed bool
+	require.NoError(
+		t, store.FinalizeBoardingSweepInputs(
+			ctx, outpoints, sweepTxid, 222,
+			func(context.Context) error {
+				replayed = true
+
+				return nil
+			},
+		),
+	)
+	require.True(t, replayed)
 }

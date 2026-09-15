@@ -326,110 +326,162 @@ func (b *BoardingWalletStore) MarkBoardingSweepInputSpent(ctx context.Context,
 	var resolved bool
 
 	err := b.db.ExecTx(ctx, WriteTxOption(), func(q BoardingStore) error {
-		sweepRow, err := q.GetBoardingSweepByInput(
-			ctx, sqlc.GetBoardingSweepByInputParams{
-				OutpointHash:  outpoint.Hash[:],
-				OutpointIndex: int32(outpoint.Index),
-			},
+		var err error
+		resolved, err = markSweepInputSpent(
+			ctx, q, outpoint, spendingTxid, spendingHeight, now,
 		)
-		if err != nil {
-			return fmt.Errorf("get sweep by input: %w", err)
+
+		return err
+	})
+
+	return resolved, err
+}
+
+// FinalizeBoardingSweepInputs marks every supplied input of a finalized sweep
+// spent and runs then inside the same write transaction. The callback sees the
+// open transaction on its context, so a durable enqueue made with it commits
+// with the input rows or rolls back with them: the sweep's accounting and the
+// store's record of it are one durable fact. A refused enqueue therefore
+// leaves the sweep unresolved, and the next start re-drives it.
+//
+// An input already past pending/published is a benign no-op (the
+// spend-notification path or an earlier delivery resolved it), so the
+// per-input sql.ErrNoRows guard does not abort the batch.
+func (b *BoardingWalletStore) FinalizeBoardingSweepInputs(ctx context.Context,
+	outpoints []wire.OutPoint, spendingTxid chainhash.Hash,
+	spendingHeight int32, then func(context.Context) error) error {
+
+	now := b.clock.Now().Unix()
+
+	return b.db.ExecTxCtx(ctx, WriteTxOption(), func(txCtx context.Context,
+		q BoardingStore) error {
+
+		for _, outpoint := range outpoints {
+			_, err := markSweepInputSpent(
+				ctx, q, outpoint, spendingTxid, spendingHeight,
+				now,
+			)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("mark input %v spent: %w",
+					outpoint, err)
+			}
 		}
 
-		sweepTxid, err := hashFromBytes(sweepRow.Txid)
-		if err != nil {
-			return fmt.Errorf("decode sweep txid: %w", err)
+		if then == nil {
+			return nil
 		}
 
-		inputStatus := inputStatusExternalSpent
-		if sweepTxid == spendingTxid {
-			inputStatus = inputStatusSpent
-		}
+		return then(txCtx)
+	})
+}
 
-		rowsAffected, err := q.MarkBoardingSweepInputSpentByOutpoint(
-			ctx, sqlc.MarkBoardingSweepInputSpentByOutpointParams{
-				OutpointHash:   outpoint.Hash[:],
-				OutpointIndex:  int32(outpoint.Index),
-				Status:         inputStatus,
-				SpentByTxid:    spendingTxid[:],
-				SpentHeight:    sqlInt32(spendingHeight),
+// markSweepInputSpent applies one input's spend transition within an existing
+// transaction, resolving the aggregate sweep once every input is spent. It
+// returns sql.ErrNoRows when the input row is already past pending/published,
+// which callers treat as a benign no-op.
+func markSweepInputSpent(ctx context.Context, q BoardingStore,
+	outpoint wire.OutPoint, spendingTxid chainhash.Hash,
+	spendingHeight int32, now int64) (bool, error) {
+
+	sweepRow, err := q.GetBoardingSweepByInput(
+		ctx, sqlc.GetBoardingSweepByInputParams{
+			OutpointHash:  outpoint.Hash[:],
+			OutpointIndex: int32(outpoint.Index),
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("get sweep by input: %w", err)
+	}
+
+	sweepTxid, err := hashFromBytes(sweepRow.Txid)
+	if err != nil {
+		return false, fmt.Errorf("decode sweep txid: %w", err)
+	}
+
+	inputStatus := inputStatusExternalSpent
+	if sweepTxid == spendingTxid {
+		inputStatus = inputStatusSpent
+	}
+
+	rowsAffected, err := q.MarkBoardingSweepInputSpentByOutpoint(
+		ctx, sqlc.MarkBoardingSweepInputSpentByOutpointParams{
+			OutpointHash:   outpoint.Hash[:],
+			OutpointIndex:  int32(outpoint.Index),
+			Status:         inputStatus,
+			SpentByTxid:    spendingTxid[:],
+			SpentHeight:    sqlInt32(spendingHeight),
+			LastUpdateTime: now,
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark sweep input spent: %w", err)
+	}
+
+	// The SQL guards on status IN ('pending', 'published'). A
+	// no-op update means this input row is already in a terminal
+	// state — either we already processed this exact spend, or
+	// the sweep was failed by txconfirm and a buffered chainsource
+	// spend event arrived after MarkBoardingSweepFailed restored
+	// the row to 'failed'. In both cases the resolution cascade
+	// must be skipped so we do not overwrite intent rows ('swept'
+	// over a restored Confirmed/Failed/Expired) and do not flip
+	// the parent sweep row from 'failed' to 'confirmed'. The
+	// caller's M-3 ErrNoRows debug branch handles this benignly.
+	if rowsAffected == 0 {
+		return false, sql.ErrNoRows
+	}
+
+	count, err := q.CountUnresolvedBoardingSweepInputs(
+		ctx, sweepTxid[:],
+	)
+	if err != nil {
+		return false, fmt.Errorf("count unresolved sweep inputs: %w",
+			err)
+	}
+	if count != 0 {
+		return false, nil
+	}
+
+	inputs, err := q.ListBoardingSweepInputs(ctx, sweepTxid[:])
+	if err != nil {
+		return false, fmt.Errorf("list sweep inputs: %w", err)
+	}
+	for _, input := range inputs {
+		err = q.UpdateBoardingIntentStatus(
+			ctx, sqlc.UpdateBoardingIntentStatusParams{
+				OutpointHash:   input.OutpointHash,
+				OutpointIndex:  input.OutpointIndex,
+				Status:         "swept",
 				LastUpdateTime: now,
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("mark sweep input spent: %w", err)
+			return false, fmt.Errorf("mark intent swept: %w", err)
 		}
+	}
 
-		// The SQL guards on status IN ('pending', 'published'). A
-		// no-op update means this input row is already in a terminal
-		// state — either we already processed this exact spend, or
-		// the sweep was failed by txconfirm and a buffered chainsource
-		// spend event arrived after MarkBoardingSweepFailed restored
-		// the row to 'failed'. In both cases the resolution cascade
-		// must be skipped so we do not overwrite intent rows ('swept'
-		// over a restored Confirmed/Failed/Expired) and do not flip
-		// the parent sweep row from 'failed' to 'confirmed'. The
-		// caller's M-3 ErrNoRows debug branch handles this benignly.
-		if rowsAffected == 0 {
-			return sql.ErrNoRows
+	sweepStatus := sweepStatusExternalResolved
+	for _, input := range inputs {
+		if input.Status == inputStatusSpent {
+			sweepStatus = sweepStatusConfirmed
+			break
 		}
+	}
 
-		count, err := q.CountUnresolvedBoardingSweepInputs(
-			ctx, sweepTxid[:],
-		)
-		if err != nil {
-			return fmt.Errorf("count unresolved sweep inputs: %w",
-				err)
-		}
-		if count != 0 {
-			return nil
-		}
+	err = q.MarkBoardingSweepStatus(
+		ctx, sqlc.MarkBoardingSweepStatusParams{
+			Txid:            sweepTxid[:],
+			Status:          sweepStatus,
+			PublishedTime:   sql.NullInt64{},
+			ConfirmedHeight: sqlInt32(spendingHeight),
+			LastError:       sql.NullString{},
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark sweep confirmed: %w", err)
+	}
 
-		inputs, err := q.ListBoardingSweepInputs(ctx, sweepTxid[:])
-		if err != nil {
-			return fmt.Errorf("list sweep inputs: %w", err)
-		}
-		for _, input := range inputs {
-			err = q.UpdateBoardingIntentStatus(
-				ctx, sqlc.UpdateBoardingIntentStatusParams{
-					OutpointHash:   input.OutpointHash,
-					OutpointIndex:  input.OutpointIndex,
-					Status:         "swept",
-					LastUpdateTime: now,
-				},
-			)
-			if err != nil {
-				return fmt.Errorf("mark intent swept: %w", err)
-			}
-		}
-
-		sweepStatus := sweepStatusExternalResolved
-		for _, input := range inputs {
-			if input.Status == inputStatusSpent {
-				sweepStatus = sweepStatusConfirmed
-				break
-			}
-		}
-
-		err = q.MarkBoardingSweepStatus(
-			ctx, sqlc.MarkBoardingSweepStatusParams{
-				Txid:            sweepTxid[:],
-				Status:          sweepStatus,
-				PublishedTime:   sql.NullInt64{},
-				ConfirmedHeight: sqlInt32(spendingHeight),
-				LastError:       sql.NullString{},
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("mark sweep confirmed: %w", err)
-		}
-
-		resolved = true
-
-		return nil
-	})
-
-	return resolved, err
+	return true, nil
 }
 
 // boardingSweepRecordFromRow converts one sqlc sweep row into the daemon-facing

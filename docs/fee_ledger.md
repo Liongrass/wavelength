@@ -311,11 +311,20 @@ item.
 | Subsystem | File | Function | Messages emitted |
 |---|---|---|---|
 | wallet | `wallet/wallet.go` | `emitUTXOCreated` | `UTXOCreatedMsg` on every confirmed wallet UTXO |
-| wallet | `wallet/boarding_sweep_actor.go` | `emitSweepConfirmedLedger` | one `BoardingSweepConfirmedMsg` per confirmed boarding sweep |
+| wallet | `wallet/boarding_sweep_actor.go` | `commitFinalizedSweep` → `sweepConfirmedLedgerMsg` | one `BoardingSweepConfirmedMsg` per finalized boarding sweep |
 | round | `round/actor.go` | `emitVTXOsReceived` → `emitOwnedVTXOLedgerEntry` | `VTXOReceivedMsg` (all sources), `VTXOSentMsg` (refresh pair) |
 | round | `round/actor.go` | `emitRoundFee` | `FeePaidMsg` (`boarding` or `refresh`) |
 | oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR}` |
 | unroll | `unroll/actor.go` | `emitExitCostIfCompleted` | `ExitCostMsg` after final sweep confirmation |
+
+The boarding sweep actor follows the same rule.
+`commitFinalizedSweep` builds the sweep's message, then marks every
+still-pending input spent and enqueues that message from inside
+`BoardingSweepStore.FinalizeBoardingSweepInputs`'s write transaction
+with the context that carries it. A refused enqueue rolls the
+reconcile back, the sweep row stays unresolved, and the next start
+re-drives its finalization, where the per-leg idempotency keys make
+the replay a no-op.
 
 The round actor does not Tell on emission. `emitVTXOsReceived` and
 `emitRoundFee` stage every message under the round, and
@@ -411,11 +420,6 @@ test runs.
   `transfers_in` are both inflated by the change amount. The
   round path already cancels self-change on `transfers_out`;
   OOR change materialization needs an equivalent source.
-- **Boarding sweep emission ordering.**
-  `reconcileSweepInputsOnFinalized` commits before
-  `emitSweepConfirmedLedger`; a Tell failure there is logged and
-  the finalized sweep is never re-driven, leaving
-  `wallet_balance` overstated by the swept inputs.
 
 ## Related documents
 

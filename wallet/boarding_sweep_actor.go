@@ -1234,8 +1234,23 @@ func (a *Ark) handleSweepTxNotification(ctx context.Context,
 			slog.String("txid", notif.Txid.String()),
 			slog.Int("block_height", int(notif.BlockHeight)),
 		)
-		a.reconcileSweepInputsOnFinalized(ctx, notif)
-		a.emitSweepConfirmedLedger(ctx, notif)
+		if err := a.commitFinalizedSweep(ctx, notif); err != nil {
+			a.logger(ctx).WarnS(
+				ctx,
+				"Boarding sweep finalization not committed",
+				err,
+				slog.String("txid", notif.Txid.String()),
+			)
+
+			// The sweep row stays unresolved, so leave the
+			// in-memory watches in place: the next start reloads
+			// the sweep from the store and re-drives its
+			// finalization, where the ledger keys make the replay
+			// a no-op.
+			return fn.Ok[WalletResp](
+				&BoardingSweepNotificationAck{},
+			)
+		}
 
 		pending := a.pendingSweeps[notif.Txid]
 		delete(a.pendingSweeps, notif.Txid)
@@ -1311,53 +1326,70 @@ func (a *Ark) handleSweepTxNotification(ctx context.Context,
 	return fn.Ok[WalletResp](&BoardingSweepNotificationAck{})
 }
 
-// reconcileSweepInputsOnFinalized marks every still-pending input of the
-// finalized sweep as spent in the store. It acts as a fallback for
-// chainsource spend notifications that may have been missed (registration
-// errors, gaps at startup). Because the sweep tx is what spent each input,
-// the spending txid is the sweep's own txid. MarkBoardingSweepInputSpent
-// is idempotent, so inputs already resolved via the spend-notification path
-// are left untouched.
-//
-// The store's status guard rejects a redundant transition with sql.ErrNoRows;
-// that signals "input row already advanced past pending/published" and is
-// treated as a benign no-op. Other errors still log at warn because they
-// indicate a real persistence problem.
-func (a *Ark) reconcileSweepInputsOnFinalized(ctx context.Context,
-	notif BoardingSweepTxNotification) {
+// sweepLedgerMsg is the consolidated accounting message a finalized boarding
+// sweep produces, absent when the persisted record cannot produce a balanced
+// set of clearing legs.
+type sweepLedgerMsg = fn.Option[*ledger.BoardingSweepConfirmedMsg]
 
-	pending, ok := a.pendingSweeps[notif.Txid]
-	if !ok || pending == nil {
-		return
+// commitFinalizedSweep makes the finalized sweep's store transition and its
+// accounting one durable fact. Every still-pending input is marked spent and
+// the sweep's BoardingSweepConfirmedMsg is enqueued from inside that same
+// write transaction, so a refused enqueue rolls the reconcile back instead of
+// leaving wallet_balance overstated by the swept inputs forever: the sweep row
+// stays unresolved and the next start re-drives its finalization, where the
+// per-leg idempotency keys make the replay a no-op.
+//
+// The per-input marking is a fallback for chainsource spend notifications that
+// may have been missed (registration errors, gaps at startup). Because the
+// sweep tx is what spent each input, the spending txid is the sweep's own
+// txid, and an input already resolved through the notification path is left
+// untouched by the store.
+func (a *Ark) commitFinalizedSweep(ctx context.Context,
+	notif BoardingSweepTxNotification) error {
+
+	if a.sweepStore == nil {
+		return nil
 	}
 
-	for op := range pending.inputs {
-		_, err := a.sweepStore.MarkBoardingSweepInputSpent(
-			ctx, op, notif.Txid, notif.BlockHeight,
-		)
-		switch {
-		case err == nil:
-			// Success.
-
-		case errors.Is(err, sql.ErrNoRows):
-			// Row already past pending/published — likely
-			// resolved via handleSweepSpendNotification or a
-			// duplicate Finalized delivery.
-			// Idempotent no-op.
-
-		default:
-			a.logger(ctx).WarnS(
-				ctx,
-				"Failed to mark sweep input spent on confirm",
-				err,
-				slog.String("outpoint", op.String()),
-				slog.String("txid", notif.Txid.String()),
-			)
+	// pendingSweeps is the only record of which inputs still need the
+	// fallback transition; it is routinely cleared as spends resolve and
+	// is absent after a restart, in which case there is nothing left to
+	// reconcile and only the accounting has to commit.
+	var outpoints []wire.OutPoint
+	if pending, ok := a.pendingSweeps[notif.Txid]; ok && pending != nil {
+		outpoints = make([]wire.OutPoint, 0, len(pending.inputs))
+		for op := range pending.inputs {
+			outpoints = append(outpoints, op)
 		}
 	}
+
+	msg := a.sweepConfirmedLedgerMsg(ctx, notif)
+
+	return a.sweepStore.FinalizeBoardingSweepInputs(
+		ctx, outpoints, notif.Txid, notif.BlockHeight,
+		func(txCtx context.Context) error {
+			return a.tellSweepConfirmed(txCtx, msg)
+		},
+	)
 }
 
-// emitSweepConfirmedLedger emits the double-entry ledger and UTXO audit
+// tellSweepConfirmed enqueues the sweep's consolidated ledger message with the
+// supplied context. Called from the reconcile transaction's callback, that
+// context carries the transaction, so a durable sink enqueues the message in
+// it.
+func (a *Ark) tellSweepConfirmed(ctx context.Context,
+	msg sweepLedgerMsg) error {
+
+	if a.ledgerSink.IsNone() || msg.IsNone() {
+		return nil
+	}
+
+	return a.ledgerSink.UnsafeFromSome().Tell(
+		ctx, msg.UnsafeFromSome(),
+	)
+}
+
+// sweepConfirmedLedgerMsg builds the double-entry ledger and UTXO audit
 // events corresponding to a boarding-sweep confirmation as a single
 // BoardingSweepConfirmedMsg. The ledger actor expands that one message into
 // every clearing leg inside one Commit:
@@ -1368,15 +1400,16 @@ func (a *Ark) reconcileSweepInputsOnFinalized(ctx context.Context,
 //     caller-supplied external address, a transfers_out settlement.
 //
 // Folding the legs into one message makes them atomic on the ledger side, so
-// a partial failure can never strand value in wallet_clearing. Emission is
-// still best-effort: a Tell error is logged but does not fail the
-// confirmation path, and a redelivery is idempotent via the per-leg keys the
-// handler derives.
-func (a *Ark) emitSweepConfirmedLedger(ctx context.Context,
-	notif BoardingSweepTxNotification) {
+// a partial failure can never strand value in wallet_clearing. Returns None
+// when the persisted record cannot produce a balanced set, which leaves the
+// reconcile free to commit without drifting the clearing account.
+func (a *Ark) sweepConfirmedLedgerMsg(ctx context.Context,
+	notif BoardingSweepTxNotification) sweepLedgerMsg {
+
+	none := fn.None[*ledger.BoardingSweepConfirmedMsg]()
 
 	if a.ledgerSink.IsNone() || a.sweepStore == nil {
-		return
+		return none
 	}
 
 	// The persisted sweep record is the sole source of truth for
@@ -1393,74 +1426,61 @@ func (a *Ark) emitSweepConfirmedLedger(ctx context.Context,
 			slog.String("txid", notif.Txid.String()),
 		)
 
-		return
+		return none
 	}
 
-	a.ledgerSink.WhenSome(func(sink ledger.Sink) {
-		// The clearing-account legs only net to zero when the sweep's
-		// destination output is readable from the persisted tx: chain
-		// cost is (total - destination) = miner fee + P2A anchor, and
-		// the destination leg credits wallet_clearing by that same
-		// destination value. A record missing its tx (corruption, or a
-		// legacy row predating tx persistence) cannot produce a
-		// balanced set, so skip emission rather than drift the clearing
-		// account. The store requires the tx at write time, so this
-		// only ever fires on a genuinely inconsistent record.
-		if record.Tx == nil || len(record.Tx.TxOut) == 0 {
-			a.logger(ctx).WarnS(ctx,
-				"emit ledger: sweep record missing tx, "+
-					"skipping clearing legs",
-				nil, slog.String("txid", notif.Txid.String()))
+	// The clearing-account legs only net to zero when the sweep's
+	// destination output is readable from the persisted tx: chain
+	// cost is (total - destination) = miner fee + P2A anchor, and
+	// the destination leg credits wallet_clearing by that same
+	// destination value. A record missing its tx (corruption, or a
+	// legacy row predating tx persistence) cannot produce a
+	// balanced set, so skip emission rather than drift the clearing
+	// account. The store requires the tx at write time, so this
+	// only ever fires on a genuinely inconsistent record.
+	if record.Tx == nil || len(record.Tx.TxOut) == 0 {
+		a.logger(ctx).WarnS(ctx,
+			"emit ledger: sweep record missing tx, "+
+				"skipping clearing legs",
+			nil, slog.String("txid", notif.Txid.String()))
 
-			return
-		}
+		return none
+	}
 
-		destSat := boardingSweepDestinationAmount(record)
-		if destSat <= 0 {
-			a.logger(ctx).WarnS(ctx,
-				"emit ledger: sweep destination non-positive, "+
-					"skipping clearing legs",
-				nil, slog.String("txid", notif.Txid.String()))
+	destSat := boardingSweepDestinationAmount(record)
+	if destSat <= 0 {
+		a.logger(ctx).WarnS(ctx,
+			"emit ledger: sweep destination non-positive, "+
+				"skipping clearing legs",
+			nil, slog.String("txid", notif.Txid.String()))
 
-			return
-		}
+		return none
+	}
 
-		// Every clearing leg ships in a single
-		// BoardingSweepConfirmedMsg so the ledger actor books the fee,
-		// per-input, and destination legs atomically inside one Commit.
-		// Splitting them into independent Tells previously risked a
-		// partial failure that stranded value in wallet_clearing; one
-		// message either lands in full or not at all.
-		// DestinationAddress is empty when the daemon allocated a fresh
-		// wallet output (a wallet-derived return) and non-empty when
-		// the caller supplied an external address (the persisted
-		// equivalent of destWalletDerived).
-		inputs := make([]ledger.SweepInput, 0, len(record.Inputs))
-		for _, in := range record.Inputs {
-			inputs = append(inputs, ledger.SweepInput{
-				Outpoint:  in.Outpoint,
-				AmountSat: int64(in.Amount),
-			})
-		}
+	// Every clearing leg ships in a single BoardingSweepConfirmedMsg so
+	// the ledger actor books the fee, per-input, and destination legs
+	// atomically inside one Commit. Splitting them into independent Tells
+	// previously risked a partial failure that stranded value in
+	// wallet_clearing; one message either lands in full or not at all.
+	// DestinationAddress is empty when the daemon allocated a fresh
+	// wallet output (a wallet-derived return) and non-empty when the
+	// caller supplied an external address (the persisted equivalent of
+	// destWalletDerived).
+	inputs := make([]ledger.SweepInput, 0, len(record.Inputs))
+	for _, in := range record.Inputs {
+		inputs = append(inputs, ledger.SweepInput{
+			Outpoint:  in.Outpoint,
+			AmountSat: int64(in.Amount),
+		})
+	}
 
-		msg := &ledger.BoardingSweepConfirmedMsg{
-			Txid:        notif.Txid,
-			BlockHeight: uint32(notif.BlockHeight),
-			ChainCostSat: boardingSweepLedgerChainCost(
-				record,
-			),
-			Inputs:              inputs,
-			DestinationSat:      destSat,
-			DestinationExternal: record.DestinationAddress != "",
-		}
-		if err := sink.Tell(ctx, msg); err != nil {
-			a.logger(ctx).WarnS(
-				ctx,
-				"emit ledger: BoardingSweepConfirmedMsg failed",
-				err,
-				slog.String("txid", notif.Txid.String()),
-			)
-		}
+	return fn.Some(&ledger.BoardingSweepConfirmedMsg{
+		Txid:                notif.Txid,
+		BlockHeight:         uint32(notif.BlockHeight),
+		ChainCostSat:        boardingSweepLedgerChainCost(record),
+		Inputs:              inputs,
+		DestinationSat:      destSat,
+		DestinationExternal: record.DestinationAddress != "",
 	})
 }
 

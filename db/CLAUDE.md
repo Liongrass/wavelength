@@ -16,7 +16,11 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/db.<Symb
 - `BoardingStore` / `BoardingWalletStore` — interface + concrete
   sqlc-backed store for boarding addresses, intents, and the aggregate
   sweep lifecycle (consumed by `wallet.BoardingStore`). Sweep ops:
-  `Create/MarkPublished/MarkFailed/List/ListPending/MarkInputSpent`.
+  `Create/MarkPublished/MarkFailed/List/ListPending/MarkInputSpent`,
+  plus `FinalizeBoardingSweepInputs`, which marks a finalized sweep's
+  inputs spent and runs a caller callback inside that same write
+  transaction (via `ExecTxCtx`), so the sweep's ledger enqueue commits
+  with the input rows or rolls back with them.
 - `NewBoardingSweep` / `BoardingSweepRecord` /
   `BoardingSweepInputRecord` — control-plane domain types. Sweep
   statuses: `pending`, `published`, `confirmed`, `external_resolved`,
