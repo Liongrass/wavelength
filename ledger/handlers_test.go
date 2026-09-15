@@ -952,6 +952,80 @@ func TestHandleExitCostNamespacesBothLegs(t *testing.T) {
 	}
 }
 
+// TestExitOfRefreshOriginVTXOKeepsSendLeg pins the operation namespacing end
+// to end: a VTXO minted by a refresh already carries a vtxo_sent row on
+// (transfers_out, vtxo_balance) under its own outpoint, and a later
+// unilateral exit of that same VTXO must still book its own value row
+// through the dedup store rather than be swallowed as a replay.
+func TestExitOfRefreshOriginVTXOKeepsSendLeg(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	var outpoint wire.OutPoint
+	outpoint.Hash[0] = 0xcd
+	outpoint.Index = 3
+
+	// Refresh pair: the forfeited claim is replaced by a 99,500 sat VTXO
+	// at the same outpoint. The pair nets to zero on vtxo_balance.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				Outpoint:  outpoint,
+				AmountSat: 99_500,
+				RoundID:   [16]byte{0x11},
+			},
+		),
+	)
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOReceivedMsg{
+				OutpointHash:  outpoint.Hash,
+				OutpointIndex: outpoint.Index,
+				AmountSat:     99_500,
+				RoundID:       [16]byte{0x11},
+				Source:        SourceRoundRefresh,
+			},
+		),
+	)
+	require.Len(t, store.getEntries(), 2)
+
+	// The refreshed VTXO is later exited on-chain with a 2,000 sat sweep
+	// fee. Both exit legs must land.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &ExitCostMsg{
+				OutpointHash:  outpoint.Hash,
+				OutpointIndex: outpoint.Index,
+				AmountSat:     99_500,
+				ExitCostSat:   2_000,
+				BlockHeight:   900_000,
+			},
+		),
+	)
+	entries := store.getEntries()
+	require.Len(t, entries, 4)
+
+	var balance int64
+	for _, entry := range entries {
+		if entry.DebitAccount == AccountVTXOBalance {
+			balance += entry.AmountSat
+		}
+		if entry.CreditAccount == AccountVTXOBalance {
+			balance -= entry.AmountSat
+		}
+	}
+	require.Equal(
+		t, int64(-99_500), balance,
+		"exit must retire the full VTXO value from vtxo_balance",
+	)
+}
+
 // TestHandleExitCostReplayIsIdempotent simulates an at-least-once
 // redelivery of the same ExitCostMsg and asserts that the store
 // still ends up with exactly the two original legs rather than
