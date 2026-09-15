@@ -42,8 +42,8 @@ label cardinality tracks live inventory.
 | `waved_vtxos` | gauge | `status` | scrape (VTXO store) | Number of VTXOs by status. |
 | `waved_vtxos_value_satoshis` | gauge | `status` | scrape (VTXO store) | Total VTXO value by status, in satoshis. |
 | `waved_spendable_balance_satoshis` | gauge | — | scrape (VTXO store) | Total value in satoshis of spendable (`live`) VTXOs. |
-| `waved_wallet_confirmed_satoshis` | gauge | — | scrape (wallet backend) | Confirmed on-chain wallet balance in satoshis (boarding deposits, change, swept outputs). |
-| `waved_wallet_unconfirmed_satoshis` | gauge | — | scrape (wallet backend) | Unconfirmed on-chain wallet balance in satoshis. |
+| `waved_wallet_confirmed_satoshis` | gauge | — | scrape (wallet backend) | Confirmed balance in satoshis of the wallet account the daemon spends from (change, swept outputs). Imported boarding scripts and, on a shared lnd node, other accounts are excluded. |
+| `waved_wallet_unconfirmed_satoshis` | gauge | — | scrape (wallet backend) | Unconfirmed balance in satoshis of the same spending account. |
 | `waved_block_height` | gauge | — | scrape (chain backend) | Best block height seen by the client's chain backend. |
 | `waved_oor_sessions_by_state` | gauge | `state` | scrape (OOR actor) | Currently-tracked (live) OOR sessions by state, e.g. `pending`. Lifetime totals live in `oor_transfers_*_total`. |
 | `waved_rounds_by_status` | gauge | `status` | scrape (round actor) | Currently-live rounds by status, e.g. `joined`, `confirmed`. Lifetime totals live in `rounds_*_total`. |

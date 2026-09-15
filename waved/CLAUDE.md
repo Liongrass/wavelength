@@ -58,14 +58,16 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/waved.<S
   does so even with no account configured, since lnd reads an empty account
   as *every* account but `"default"` as a real filter.
 - `GetBalance.onchain_wallet_confirmed_sat` and both wallet balance metrics
-  use `Server.lndWalletBalance`, with the same normalized account as spending.
-  Its raw LND call preserves lndclient authentication and RPC timeout. Empty
-  config selects `"default"`, never LND's all-accounts balance. Local-wallet
-  balance semantics and imported-script observation remain unchanged. The
-  LND account balance excludes imported boarding-script outputs as well as
-  co-tenant funds; those outputs retain their separate boarding balance
-  fields. Existing LND wallet gauges can therefore decrease on upgrade even
-  when `lnd.account` is empty.
+  report only the account the daemon spends from, on every backend. LND
+  goes through `Server.lndWalletBalance`, whose raw call preserves
+  lndclient authentication and RPC timeout and sends the same normalized
+  account as spending; empty config selects `"default"`, never LND's
+  all-accounts balance. The local backends go through `walletcore.Balance`,
+  which filters btcwallet to `"default"`. Imported boarding and exit
+  scripts sit in the imported account and are excluded everywhere, so the
+  wallet figure and `boarding_confirmed_sat` are disjoint; co-tenant
+  accounts on a shared lnd node are excluded too. Imported-script
+  observation itself stays unscoped.
 - `validateLndAccount` refuses to start on a configured account that is
   missing, not taproot-scoped, or watch-only. Without it each of those fails
   later and worse — a missing account silently filters every UTXO away, a
