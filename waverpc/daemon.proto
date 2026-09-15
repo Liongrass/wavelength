@@ -546,9 +546,12 @@ message GetBalanceResponse {
     // the resulting VTXOs are not yet live.
     int64 total_confirmed_sat = 4;
 
-    // onchain_wallet_confirmed_sat is the total confirmed on-chain
-    // balance of the backing wallet (all confirmed UTXOs, including
-    // sweep proceeds from unilateral exits).
+    // onchain_wallet_confirmed_sat is the confirmed on-chain balance
+    // of the wallet account this daemon spends from (change and sweep
+    // proceeds from unilateral exits). Imported boarding and exit
+    // scripts belong to no spending account, so their funds appear
+    // only under the boarding fields, and on a shared lnd node other
+    // accounts' coins are excluded.
     int64 onchain_wallet_confirmed_sat = 5;
 
     // boarding_pending_sweep_sat is the total amount of boarding UTXOs

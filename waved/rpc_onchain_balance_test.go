@@ -3,12 +3,15 @@ package waved
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/wavelength/btcwbackend"
 	"github.com/lightninglabs/wavelength/db"
@@ -312,7 +315,9 @@ func TestLNDAccountBalanceErrors(t *testing.T) {
 }
 
 // TestLocalWalletBalanceReporting preserves RPC/metrics parity for both local
-// backends using their shared real btcwallet balance implementation.
+// backends using their shared real btcwallet balance implementation, and
+// proves an imported boarding script's funds stay out of the wallet figure
+// just as they do for the account-scoped LND path.
 func TestLocalWalletBalanceReporting(t *testing.T) {
 	w := newFundedLwWallet(t)
 	addr, err := w.NewAddress(t.Context())
@@ -320,6 +325,29 @@ func TestLocalWalletBalanceReporting(t *testing.T) {
 	script, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
 	fundConfirmedUTXO(t, w, script)
+
+	// Fund a watch-only boarding output as well. It lives in btcwallet's
+	// imported account, so the default-account balance must not include
+	// it even though an unfiltered enumeration sees it.
+	privKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	importedAddr, err := w.BoardingBackend().ImportTaprootScript(
+		t.Context(), &waddrmgr.Tapscript{
+			Type:          waddrmgr.TaprootFullKeyOnly,
+			FullOutputKey: privKey.PubKey(),
+		},
+	)
+	require.NoError(t, err)
+	importedScript, err := txscript.PayToAddrScript(importedAddr)
+	require.NoError(t, err)
+	importedOp := fundConfirmedUTXO(t, w, importedScript)
+	allUtxos, err := w.BtcWallet.ListUnspentWitness(0, math.MaxInt32, "")
+	require.NoError(t, err)
+	require.True(
+		t, containsOutpoint(allUtxos, importedOp),
+		"harness must fund the imported boarding output",
+	)
+
 	for _, backend := range []string{"lwwallet", "btcwallet"} {
 		t.Run(backend, func(t *testing.T) {
 			rpc := newBalanceRPCServer(t)

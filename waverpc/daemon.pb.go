@@ -1650,9 +1650,12 @@ type GetBalanceResponse struct {
 	// because adopted funds are no longer confirmed boarding UTXOs and
 	// the resulting VTXOs are not yet live.
 	TotalConfirmedSat int64 `protobuf:"varint,4,opt,name=total_confirmed_sat,json=totalConfirmedSat,proto3" json:"total_confirmed_sat,omitempty"`
-	// onchain_wallet_confirmed_sat is the total confirmed on-chain
-	// balance of the backing wallet (all confirmed UTXOs, including
-	// sweep proceeds from unilateral exits).
+	// onchain_wallet_confirmed_sat is the confirmed on-chain balance
+	// of the wallet account this daemon spends from (change and sweep
+	// proceeds from unilateral exits). Imported boarding and exit
+	// scripts belong to no spending account, so their funds appear
+	// only under the boarding fields, and on a shared lnd node other
+	// accounts' coins are excluded.
 	OnchainWalletConfirmedSat int64 `protobuf:"varint,5,opt,name=onchain_wallet_confirmed_sat,json=onchainWalletConfirmedSat,proto3" json:"onchain_wallet_confirmed_sat,omitempty"`
 	// boarding_pending_sweep_sat is the total amount of boarding UTXOs
 	// included in a published-but-unconfirmed boarding-timeout sweep
