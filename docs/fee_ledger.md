@@ -390,6 +390,32 @@ test runs.
   write double-entry wallet-clearing legs, but other direct
   wallet spends still need a classification-specific ledger
   producer before they can affect `wallet_balance`.
+- **Exit and leave proceeds.** The unroll sweep and a
+  cooperative leave pay a wallet-owned output, but only outputs
+  paying a boarding address emit `UTXOCreatedMsg`, so the
+  proceeds leave `vtxo_balance` as `transfers_out` and never
+  reach `wallet_balance`. Per asset the client's total is
+  understated by the proceeds and the gross transfers-out figure
+  is inflated by funds the client still owns.
+- **Operator-swept VTXOs.** No producer books a VTXO whose batch
+  the operator swept after expiry. This is deliberate for now:
+  the server keeps honouring the claim, so the owner can still
+  reclaim it by refreshing, and the asset is real until the
+  operator's policy says otherwise. It does mean `vtxo_balance`
+  can include value that a long-offline client may never
+  recover.
+- **OOR self-change.** An outgoing OOR session books the full
+  input value as `vtxo_sent`, and the sender's own change comes
+  back through a separate incoming session as `transfers_in`.
+  `vtxo_balance` nets correctly, but gross `transfers_out` and
+  `transfers_in` are both inflated by the change amount. The
+  round path already cancels self-change on `transfers_out`;
+  OOR change materialization needs an equivalent source.
+- **Boarding sweep emission ordering.**
+  `reconcileSweepInputsOnFinalized` commits before
+  `emitSweepConfirmedLedger`; a Tell failure there is logged and
+  the finalized sweep is never re-driven, leaving
+  `wallet_balance` overstated by the swept inputs.
 
 ## Related documents
 
