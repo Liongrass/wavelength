@@ -85,6 +85,14 @@ type BatchedTx[Q any] interface {
 	ExecTx(ctx context.Context, txOptions TxOptions,
 		txBody func(Q) error) error
 
+	// ExecTxCtx is ExecTx for bodies that must hand the open transaction
+	// to code outside the store, such as a durable actor Tell that
+	// should commit with the store write. The context passed to txBody
+	// carries the transaction (actor.TxFromContext), so any ExecTx or
+	// durable mailbox enqueue made with it joins the same transaction.
+	ExecTxCtx(ctx context.Context, txOptions TxOptions,
+		txBody func(context.Context, Q) error) error
+
 	// Backend returns the type of the database backend used.
 	Backend() sqlc.BackendType
 }
@@ -257,6 +265,17 @@ func isExpectedTxShutdownErr(dbErr error) bool {
 func (t *TransactionExecutor[Q]) ExecTx(ctx context.Context,
 	txOptions TxOptions, txBody func(Q) error) error {
 
+	return t.ExecTxCtx(ctx, txOptions, func(_ context.Context, q Q) error {
+		return txBody(q)
+	})
+}
+
+// ExecTxCtx runs txBody inside a transaction and passes it a context that
+// carries that transaction, so writes made through other stores or durable
+// actor references with that context commit atomically with the body.
+func (t *TransactionExecutor[Q]) ExecTxCtx(ctx context.Context,
+	txOptions TxOptions, txBody func(context.Context, Q) error) error {
+
 	// If the context already carries a database transaction from the
 	// durable actor framework, join it instead of creating a new one.
 	// This ensures that all store operations within a single actor
@@ -264,7 +283,7 @@ func (t *TransactionExecutor[Q]) ExecTx(ctx context.Context,
 	// provided txOptions are ignored in this case; isolation level
 	// and read-only semantics are governed by the outer transaction.
 	if tx, ok := actor.TxFromContext(ctx); ok {
-		return txBody(t.createQuery(tx))
+		return txBody(ctx, t.createQuery(tx))
 	}
 
 	waitBeforeRetry := func(attemptNumber int) {
@@ -319,7 +338,8 @@ func (t *TransactionExecutor[Q]) ExecTx(ctx context.Context,
 			_ = tx.Rollback()
 		}()
 
-		if err := txBody(t.createQuery(tx)); err != nil {
+		txCtx := actor.WithTx(ctx, tx)
+		if err := txBody(txCtx, t.createQuery(tx)); err != nil {
 			dbErr := MapSQLError(err)
 			if IsSerializationOrDeadlockError(dbErr) {
 				// Roll back the transaction, then pop back up
