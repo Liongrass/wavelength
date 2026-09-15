@@ -573,41 +573,41 @@ func (a *Ark) emitBackgroundTaskError(ctx context.Context, task string) {
 // actor alone cannot always tell whether a UTXO is a deposit, a
 // change output from a round, or a sweep return -- that context
 // lives with whichever subsystem triggered the underlying tx.
-// Emission is guarded by the nil-safe fn.Option[ledger.Sink] and
-// Tell failures are logged but not propagated so a momentary
-// ledger outage never blocks the confirmation path.
+// Emission is guarded by the nil-safe fn.Option[ledger.Sink].
+//
+// A refused enqueue is returned rather than logged: the deposit leg is the
+// only producer of the UTXO's wallet_balance credit, and the later boarding
+// leg debits wallet_balance unconditionally, so dropping it would leave the
+// account permanently short. Callers run this inside the transaction that
+// records the UTXO, so the two either commit together or the detection is
+// retried on the next tip tick.
 func (a *Ark) emitUTXOCreated(ctx context.Context, utxo *Utxo,
-	blockHeight int32, classification string) {
+	blockHeight int32, classification string) error {
 
-	a.ledgerSink.WhenSome(func(sink ledger.Sink) {
-		if utxo == nil {
-			return
-		}
+	if a.ledgerSink.IsNone() || utxo == nil {
+		return nil
+	}
+	sink := a.ledgerSink.UnsafeFromSome()
 
-		var height uint32
-		if blockHeight > 0 {
-			height = uint32(blockHeight)
-		}
+	var height uint32
+	if blockHeight > 0 {
+		height = uint32(blockHeight)
+	}
 
-		msg := &ledger.UTXOCreatedMsg{
-			OutpointHash:   utxo.Outpoint.Hash,
-			OutpointIndex:  utxo.Outpoint.Index,
-			AmountSat:      int64(utxo.Amount),
-			BlockHeight:    height,
-			Classification: classification,
-		}
+	msg := &ledger.UTXOCreatedMsg{
+		OutpointHash:   utxo.Outpoint.Hash,
+		OutpointIndex:  utxo.Outpoint.Index,
+		AmountSat:      int64(utxo.Amount),
+		BlockHeight:    height,
+		Classification: classification,
+	}
 
-		if err := sink.Tell(ctx, msg); err != nil {
-			a.logger(ctx).WarnS(
-				ctx,
-				"Failed to emit UTXOCreatedMsg to ledger",
-				err,
-				btclog.Fmt("outpoint", "%v", utxo.Outpoint),
-				slog.Int64("amount_sat", int64(utxo.Amount)),
-				slog.String("classification", classification),
-			)
-		}
-	})
+	if err := sink.Tell(ctx, msg); err != nil {
+		return fmt.Errorf("enqueue UTXOCreatedMsg for %v: %w",
+			utxo.Outpoint, err)
+	}
+
+	return nil
 }
 
 // allTargetErrors builds a per-outpoint error map for operations that fail
@@ -1433,7 +1433,31 @@ func (a *Ark) processUtxo(ctx context.Context, epoch chainsource.BlockEpoch,
 	// Persist first - only mark seen and notify if DB succeeds. On failure
 	// we'll retry on the next block when ListUnspent returns this UTXO
 	// again.
-	err = a.store.InsertBoardingIntents(ctx, intent)
+	//
+	// The deposit's ledger leg is enqueued inside the same transaction:
+	// it is the only producer of this UTXO's wallet_balance credit, while
+	// the boarding leg that follows later debits wallet_balance
+	// unconditionally. Since seenUtxos below permanently suppresses
+	// re-detection, a leg dropped here could never be re-emitted, so a
+	// refused enqueue must roll the intent back and leave the UTXO unseen
+	// for the next tip tick.
+	err = a.store.InsertBoardingIntents(
+		ctx, func(txCtx context.Context) error {
+
+			// Mirror the confirmation into the client ledger so
+			// the UTXO audit log has a deposit row alongside the
+			// double-entry bookkeeping. Classification is
+			// ClassificationDeposit because the detection path
+			// above filtered for UTXOs paying to a known boarding
+			// address -- other classifications (change,
+			// sweep_return) belong to different emission sites
+			// and are not applicable here.
+			return a.emitUTXOCreated(
+				txCtx, utxo, blockHeight,
+				ledger.ClassificationDeposit,
+			)
+		}, intent,
+	)
 	if err != nil {
 		a.logger(ctx).WarnS(ctx, "Failed persisting boarding intent",
 			err,
@@ -1444,16 +1468,6 @@ func (a *Ark) processUtxo(ctx context.Context, epoch chainsource.BlockEpoch,
 	}
 
 	a.seenUtxos.Add(key)
-
-	// Mirror the confirmation into the client ledger so the UTXO
-	// audit log has a deposit row alongside the double-entry
-	// bookkeeping. Classification is ClassificationDeposit because
-	// the detection path above filtered for UTXOs paying to a
-	// known boarding address -- other classifications (change,
-	// sweep_return) belong to different emission sites and are
-	// not applicable here.
-	a.emitUTXOCreated(ctx, utxo, blockHeight,
-		ledger.ClassificationDeposit)
 
 	// Notify registered actors that meet the confirmation threshold.
 	event := BoardingUtxoConfirmedEvent{
@@ -1577,7 +1591,7 @@ func (a *Ark) maybeRebuildBoardingProof(ctx context.Context,
 	// Best-effort: a transient store error (e.g. shutdown mid-flight)
 	// is logged but does not fail the caller's event delivery, since
 	// the next backlog or board read will retry the rebuild.
-	if err := a.store.InsertBoardingIntents(ctx, *intent); err != nil {
+	if err := a.store.InsertBoardingIntents(ctx, nil, *intent); err != nil {
 		a.logger(ctx).WarnS(ctx, "Failed persisting rebuilt TxProof",
 			err,
 			btclog.Fmt("outpoint", "%v", intent.Outpoint),

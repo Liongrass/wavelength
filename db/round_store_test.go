@@ -1106,7 +1106,7 @@ func TestRoundStoreDecoupledVTXOStorage(t *testing.T) {
 		require.NoError(t, err)
 
 		err = boardingStore.InsertBoardingIntents(
-			ctx, fixtures[i].walletIntent,
+			ctx, nil, fixtures[i].walletIntent,
 		)
 		require.NoError(t, err)
 	}
@@ -1565,7 +1565,7 @@ func TestRoundStoreWithBoardingGroup(t *testing.T) {
 		require.NoError(t, err)
 
 		err = boardingStore.InsertBoardingIntents(
-			ctx, fixtures[i].walletIntent,
+			ctx, nil, fixtures[i].walletIntent,
 		)
 		require.NoError(t, err)
 	}

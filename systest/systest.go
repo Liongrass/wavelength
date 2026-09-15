@@ -19,10 +19,14 @@ import (
 	"github.com/lightninglabs/wavelength/chainbackends"
 	"github.com/lightninglabs/wavelength/chainsource"
 	"github.com/lightninglabs/wavelength/db"
+	"github.com/lightninglabs/wavelength/db/actordelivery"
+	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/harness"
+	"github.com/lightninglabs/wavelength/ledger"
 	"github.com/lightninglabs/wavelength/lndbackend"
 	"github.com/lightninglabs/wavelength/wallet"
 	"github.com/lightningnetwork/lnd/clock"
+	fn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,6 +46,12 @@ type SysTestHarness struct {
 	actorSystem *actor.ActorSystem
 	store       *db.BoardingWalletStore
 	chainParams *chaincfg.Params
+
+	// ledgerActor is the durable accounting actor the wallet's ledger sink
+	// resolves to. The wallet commits its deposit leg inside the boarding
+	// intent's transaction, so a sink with no actor behind it would roll
+	// every confirmed deposit back.
+	ledgerActor *ledger.LedgerActor
 
 	// logHandler is the shared log handler for creating subsystem loggers.
 	logHandler *btclog.DefaultHandler
@@ -118,6 +128,35 @@ func NewSysTestHarness(t *testing.T) *SysTestHarness {
 		clock.NewDefaultClock(),
 	)
 
+	// The ledger actor shares the wallet's database so the deposit leg
+	// the wallet enqueues joins the boarding intent's transaction exactly
+	// as it does in the daemon.
+	deliveryStore, err := actordelivery.NewTxAwareDeliveryStoreFromDB(
+		sqlDB.DB, sqlDB.Backend(), clock.NewDefaultClock(), rootLog,
+	)
+	require.NoError(t, err)
+
+	ledgerDB := db.NewTransactionExecutor(
+		sqlDB,
+		func(tx *sql.Tx) *sqlc.Queries {
+			return sqlDB.WithTx(tx)
+		},
+		rootLog,
+	)
+	ledgerActor := ledger.NewLedgerActor(ledger.ActorConfig{
+		Log:           fn.Some(rootLog),
+		DeliveryStore: deliveryStore,
+		LedgerStore:   &db.LedgerStoreDB{TransactionExecutor: ledgerDB},
+	})
+	require.NoError(t, ledgerActor.Start(ctx))
+	require.NoError(
+		t,
+		actor.RegisterWithReceptionist(
+			actorSystem.Receptionist(), ledger.NewServiceKey(),
+			ledgerActor.Ref(),
+		),
+	)
+
 	sth := &SysTestHarness{
 		Harness:     dockerHarness,
 		t:           t,
@@ -126,6 +165,7 @@ func NewSysTestHarness(t *testing.T) *SysTestHarness {
 		actorSystem: actorSystem,
 		store:       store,
 		chainParams: &chaincfg.RegressionNetParams,
+		ledgerActor: ledgerActor,
 		logHandler:  logHandler,
 		log:         rootLog,
 	}
@@ -251,6 +291,9 @@ func (h *SysTestHarness) Close() {
 	)
 	defer cancel()
 
+	// The ledger actor registered only its ref, so the system's shutdown
+	// does not stop it.
+	_ = h.ledgerActor.OnStop(shutdownCtx)
 	_ = h.actorSystem.Shutdown(shutdownCtx)
 }
 
