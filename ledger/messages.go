@@ -177,6 +177,7 @@ const (
 	exitCostAmountSatType     tlv.Type = 5
 	exitCostCostSatType       tlv.Type = 7
 	exitCostBlockHeightType   tlv.Type = 9
+	exitCostDestOwnType       tlv.Type = 11
 
 	// UTXOCreatedMsg / UTXOSpentMsg field types.
 	utxoOutpointHashType   tlv.Type = 1
@@ -674,6 +675,15 @@ type ExitCostMsg struct {
 	// BlockHeight is the height of the final sweep confirmation that
 	// completed the exit. It does not confirm OutpointHash itself.
 	BlockHeight uint32
+
+	// DestinationOwnWallet reports whether the exit paid an output this
+	// client's own wallet controls. When true the exited value moved
+	// between two accounts the client owns and the send leg books it as
+	// an internal transfer into wallet_balance; when false it left for a
+	// foreign destination and settles on transfers_out. A payload
+	// predating this field decodes to false, which is the behaviour it
+	// was written under.
+	DestinationOwnWallet bool
 }
 
 // MessageType returns the message type name for routing.
@@ -693,6 +703,10 @@ func (m *ExitCostMsg) Encode(w io.Writer) error {
 	amountSat := uint64(m.AmountSat)
 	exitCostSat := uint64(m.ExitCostSat)
 	blockHeight := m.BlockHeight
+	var destOwn uint8
+	if m.DestinationOwnWallet {
+		destOwn = 1
+	}
 
 	stream, err := tlv.NewStream(
 		tlv.MakePrimitiveRecord(
@@ -710,6 +724,7 @@ func (m *ExitCostMsg) Encode(w io.Writer) error {
 		tlv.MakePrimitiveRecord(
 			exitCostBlockHeightType, &blockHeight,
 		),
+		tlv.MakePrimitiveRecord(exitCostDestOwnType, &destOwn),
 	)
 	if err != nil {
 		return err
@@ -718,7 +733,9 @@ func (m *ExitCostMsg) Encode(w io.Writer) error {
 	return stream.Encode(w)
 }
 
-// Decode deserializes a TLV stream into the message.
+// Decode deserializes a TLV stream into the message. The destination flag is
+// optional: a payload written before it existed leaves destOwn zero, which
+// reproduces the foreign-destination booking those messages assumed.
 func (m *ExitCostMsg) Decode(r io.Reader) error {
 	var (
 		outpointHash  []byte
@@ -726,6 +743,7 @@ func (m *ExitCostMsg) Decode(r io.Reader) error {
 		amountSat     uint64
 		exitCostSat   uint64
 		blockHeight   uint32
+		destOwn       uint8
 	)
 
 	stream, err := tlv.NewStream(
@@ -744,6 +762,7 @@ func (m *ExitCostMsg) Decode(r io.Reader) error {
 		tlv.MakePrimitiveRecord(
 			exitCostBlockHeightType, &blockHeight,
 		),
+		tlv.MakePrimitiveRecord(exitCostDestOwnType, &destOwn),
 	)
 	if err != nil {
 		return err
@@ -776,6 +795,7 @@ func (m *ExitCostMsg) Decode(r io.Reader) error {
 	m.AmountSat = amt
 	m.ExitCostSat = cost
 	m.BlockHeight = blockHeight
+	m.DestinationOwnWallet = destOwn != 0
 
 	return nil
 }

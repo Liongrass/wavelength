@@ -4221,6 +4221,12 @@ func TestSweepConfirmationCompletesActor(t *testing.T) {
 	)
 	require.Equal(t, uint32(105), exitCostMsg.BlockHeight)
 
+	// The sweep paid a script the wallet handed out, so the exited value
+	// landed back in the client's own wallet: the ledger must be told so
+	// it books the proceeds into wallet_balance rather than as an
+	// outflow to a counterparty.
+	require.True(t, exitCostMsg.DestinationOwnWallet)
+
 	// Late chain notifications can be queued behind the terminal
 	// transition while the registry is draining the actor for cleanup.
 	// They should ack as idempotent no-ops instead of retrying forever

@@ -812,6 +812,180 @@ func TestHandleExitCost(t *testing.T) {
 	)
 }
 
+// TestHandleExitCostOwnWalletDestinationBooksWalletBalance proves an exit
+// that paid an output this client's own wallet controls books a third leg
+// that cancels the send leg on transfers_out and lands the net value on
+// wallet_balance, while the send and fee legs stay byte-for-byte what a
+// foreign-destination exit writes.
+func TestHandleExitCostOwnWalletDestinationBooksWalletBalance(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	msg := &ExitCostMsg{
+		OutpointHash: [32]byte{
+			0x3c,
+		},
+		OutpointIndex:        1,
+		AmountSat:            100_000,
+		ExitCostSat:          5_000,
+		BlockHeight:          800_600,
+		DestinationOwnWallet: true,
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 3)
+
+	// Send leg is unchanged by the flag: transfers_out <- vtxo_balance.
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(95_000), entries[0].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[0].EventType)
+
+	// Fee leg is unchanged: the miner still took the chain cost.
+	require.Equal(t, AccountOnchainFees, entries[1].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[1].CreditAccount)
+	require.Equal(t, int64(5_000), entries[1].AmountSat)
+
+	// Proceeds leg: wallet_balance <- transfers_out for the net amount,
+	// so the outflow nets to zero and the value reappears on-chain.
+	require.Equal(t, AccountWalletBalance, entries[2].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[2].CreditAccount)
+	require.Equal(t, int64(95_000), entries[2].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[2].EventType)
+
+	// The send and fee keys are the ones a foreign-destination exit
+	// writes; the proceeds leg has its own identity.
+	sendKey := exitSendIdempotencyKey(
+		msg.OutpointHash, msg.OutpointIndex,
+	)
+	feeKey := exitFeeIdempotencyKey(msg.OutpointHash, msg.OutpointIndex)
+	proceedsKey := exitProceedsIdempotencyKey(
+		msg.OutpointHash, msg.OutpointIndex,
+	)
+	require.Equal(t, sendKey, entries[0].IdempotencyKey)
+	require.Equal(t, feeKey, entries[1].IdempotencyKey)
+	require.Equal(t, proceedsKey, entries[2].IdempotencyKey)
+}
+
+// TestHandleExitCostReplayAcrossDestinationFlagDedups proves the reachable
+// upgrade replay: an exit booked before the destination flag existed is
+// re-emitted by a resumed unroll job with the flag set. The send leg must
+// dedup against the row it wrote first rather than book a second credit of
+// vtxo_balance, and the proceeds leg must appear exactly once.
+func TestHandleExitCostReplayAcrossDestinationFlagDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	msg := &ExitCostMsg{
+		OutpointHash: [32]byte{
+			0x4d,
+		},
+		OutpointIndex: 2,
+		AmountSat:     60_000,
+		ExitCostSat:   4_000,
+		BlockHeight:   800_650,
+	}
+
+	// Pre-flag delivery: send leg and fee leg only.
+	require.NoError(t, run(ctx, a, msg))
+	require.Len(t, store.getEntries(), 2)
+
+	// Post-upgrade re-emission of the same exit with the flag set.
+	flagged := *msg
+	flagged.DestinationOwnWallet = true
+	require.NoError(t, run(ctx, a, &flagged))
+	require.NoError(t, run(ctx, a, &flagged))
+
+	entries := store.getEntries()
+	require.Len(
+		t, entries, 3,
+		"replay across the flag must add only the proceeds leg",
+	)
+
+	// vtxo_balance is credited once for the net value and once for the
+	// fee; wallet_balance is debited once for the net value; and
+	// transfers_out nets to zero because the value never left.
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-60_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(56_000), balances[AccountWalletBalance])
+	require.Equal(t, int64(4_000), balances[AccountOnchainFees])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestExitCostMsgDestinationFlagRoundTrips proves the destination flag
+// survives the durable mailbox codec and that a payload written before the
+// flag existed decodes to the foreign-destination behaviour it was written
+// under, rather than silently re-booking old exits into wallet_balance.
+func TestExitCostMsgDestinationFlagRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for _, ownWallet := range []bool{false, true} {
+		msg := &ExitCostMsg{
+			OutpointHash: [32]byte{
+				0x5e,
+			},
+			OutpointIndex:        3,
+			AmountSat:            80_000,
+			ExitCostSat:          2_000,
+			BlockHeight:          800_700,
+			DestinationOwnWallet: ownWallet,
+		}
+
+		var buf bytes.Buffer
+		require.NoError(t, msg.Encode(&buf))
+
+		var decoded ExitCostMsg
+		require.NoError(t, decoded.Decode(bytes.NewReader(buf.Bytes())))
+		require.Equal(t, *msg, decoded)
+	}
+
+	// A payload written before the flag existed carries no destination
+	// record at all, so build the pre-flag stream by hand.
+	var (
+		outpointHash  = bytes.Repeat([]byte{0x6f}, 32)
+		outpointIndex = uint32(0)
+		amountSat     = uint64(40_000)
+		exitCostSat   = uint64(1_000)
+		blockHeight   = uint32(800_800)
+	)
+	legacyStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(
+			exitCostOutpointHashType, &outpointHash,
+		),
+		tlv.MakePrimitiveRecord(
+			exitCostOutpointIndexType, &outpointIndex,
+		),
+		tlv.MakePrimitiveRecord(exitCostAmountSatType, &amountSat),
+		tlv.MakePrimitiveRecord(exitCostCostSatType, &exitCostSat),
+		tlv.MakePrimitiveRecord(
+			exitCostBlockHeightType, &blockHeight,
+		),
+	)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	require.NoError(t, legacyStream.Encode(&legacyBuf))
+
+	var legacy ExitCostMsg
+	require.NoError(t, legacy.Decode(bytes.NewReader(legacyBuf.Bytes())))
+	require.Equal(t, int64(40_000), legacy.AmountSat)
+	require.False(
+		t, legacy.DestinationOwnWallet,
+		"a missing destination record must keep the old behaviour",
+	)
+}
+
 // TestHandleExitCostFeeExceedsValue verifies that an exit whose
 // fee meets or exceeds the VTXO amount is rejected rather than
 // silently producing a non-positive send leg.
@@ -1114,10 +1288,13 @@ func TestLedgerIdempotencyKeysSeparateOperations(t *testing.T) {
 	refresh := refreshSendIdempotencyKey(hash, 7)
 	exitSend := exitSendIdempotencyKey(hash, 7)
 	exitFee := exitFeeIdempotencyKey(hash, 7)
+	exitProceeds := exitProceedsIdempotencyKey(hash, 7)
 
 	require.NotEqual(t, refresh, exitSend)
 	require.NotEqual(t, refresh, exitFee)
 	require.NotEqual(t, exitSend, exitFee)
+	require.NotEqual(t, exitSend, exitProceeds)
+	require.NotEqual(t, exitFee, exitProceeds)
 }
 
 // TestHandleExitCostInvalidAmounts verifies non-positive inputs

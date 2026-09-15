@@ -379,9 +379,12 @@ var zeroHash chainhash.Hash
 // handleExitCost records a unilateral exit as two ledger entries
 // that together reduce vtxo_balance by the gross exited amount:
 //
-//  1. Send leg: debit transfers_out += (AmountSat - ExitCostSat)
-//     crediting vtxo_balance. The counterparty side captures
-//     the value that actually leaves the VTXO layer.
+//  1. Send leg: debit (AmountSat - ExitCostSat) crediting
+//     vtxo_balance. The debit side is wallet_balance when the exit
+//     paid an output this client's own wallet controls, since the
+//     value only crossed between two accounts it owns, and
+//     transfers_out when the destination is foreign and the value
+//     genuinely left.
 //  2. Fee leg:  debit onchain_fees  += ExitCostSat crediting
 //     vtxo_balance. The L1 miner fee portion.
 //
@@ -448,26 +451,61 @@ func (a *LedgerActor) handleExitCost(ctx context.Context, msg *ExitCostMsg,
 	)
 	feeKey := exitFeeIdempotencyKey(msg.OutpointHash, msg.OutpointIndex)
 
-	// The exited VTXO outpoint is the stable identity shared by both
+	// The exited VTXO outpoint is the stable identity shared by all
 	// accounting legs. ConfirmationHeight intentionally records the final
 	// sweep height that completed the exit, not a confirmation of that
 	// outpoint transaction.
+	//
+	// The send leg always settles on transfers_out. Its accounts are part
+	// of the dedup tuple in idx_client_ledger_idempotent_key, so a leg
+	// whose debit account followed the destination flag would land in a
+	// different tuple than its pre-flag twin and both would persist: a
+	// resumed unroll job that re-emits with the flag set would credit
+	// vtxo_balance a second time for the same exit. Keeping the accounts
+	// fixed makes every redelivery of this outpoint dedup against the row
+	// it wrote first, whichever flag it carried.
 	sendLeg := LedgerEntry{
 		DebitAccount:  AccountTransfersOut,
 		CreditAccount: AccountVTXOBalance,
 		AmountSat:     netAmount,
 		EventType:     EventVTXOSent,
 		Description: fmt.Sprintf(
-			"unilateral exit net value for %x:%d at "+
-				"height %d",
-			msg.OutpointHash, msg.OutpointIndex,
-			msg.BlockHeight,
+			"unilateral exit net value for %x:%d at height %d",
+			msg.OutpointHash, msg.OutpointIndex, msg.BlockHeight,
 		),
 		CreatedAt:          now,
 		IdempotencyKey:     sendKey,
 		ChainTxid:          msg.OutpointHash[:],
 		ChainVout:          &chainVout,
 		ConfirmationHeight: &confirmationHeight,
+	}
+
+	// Where the exited value landed decides whether that outflow stands.
+	// An exit paying an output this client's own wallet controls did not
+	// leave: the value crossed from the off-chain asset to the on-chain
+	// one. That movement is its own leg, keyed separately, so it cancels
+	// the send leg on transfers_out and lands the value on
+	// wallet_balance without touching the send leg's dedup identity.
+	var proceedsLeg fn.Option[LedgerEntry]
+	if msg.DestinationOwnWallet {
+		proceedsLeg = fn.Some(LedgerEntry{
+			DebitAccount:  AccountWalletBalance,
+			CreditAccount: AccountTransfersOut,
+			AmountSat:     netAmount,
+			EventType:     EventVTXOSent,
+			Description: fmt.Sprintf(
+				"unilateral exit proceeds to own wallet for "+
+					"%x:%d at height %d", msg.OutpointHash,
+				msg.OutpointIndex, msg.BlockHeight,
+			),
+			CreatedAt: now,
+			IdempotencyKey: exitProceedsIdempotencyKey(
+				msg.OutpointHash, msg.OutpointIndex,
+			),
+			ChainTxid:          msg.OutpointHash[:],
+			ChainVout:          &chainVout,
+			ConfirmationHeight: &confirmationHeight,
+		})
 	}
 
 	feeLeg := LedgerEntry{
@@ -488,12 +526,12 @@ func (a *LedgerActor) handleExitCost(ctx context.Context, msg *ExitCostMsg,
 		ConfirmationHeight: &confirmationHeight,
 	}
 
-	// Book the send leg and the fee leg via two InsertLedgerEntry
-	// calls inside ONE Commit. Both join the same lease-fenced writer
-	// transaction, so a crash or error between them rolls back both
-	// writes and the mailbox ack together -- no partial-write window.
-	// The separately namespaced outpoint identities make an out-of-band
-	// replay resolve to the same two rows via the partial unique index.
+	// Book every leg via InsertLedgerEntry calls inside ONE Commit. They
+	// all join the same lease-fenced writer transaction, so a crash or
+	// error between them rolls back every write and the mailbox ack
+	// together -- no partial-write window. The separately namespaced
+	// outpoint identities make an out-of-band replay resolve to the same
+	// rows via the partial unique index.
 	return a.commit(ctx, ax, errMsg, func(ctx context.Context,
 		q ledgerTx) error {
 
@@ -503,6 +541,14 @@ func (a *LedgerActor) handleExitCost(ctx context.Context, msg *ExitCostMsg,
 
 		if err := q.ledger.InsertLedgerEntry(ctx, feeLeg); err != nil {
 			return fmt.Errorf("exit fee leg: %w", err)
+		}
+
+		var proceedsErr error
+		proceedsLeg.WhenSome(func(leg LedgerEntry) {
+			proceedsErr = q.ledger.InsertLedgerEntry(ctx, leg)
+		})
+		if proceedsErr != nil {
+			return fmt.Errorf("exit proceeds leg: %w", proceedsErr)
 		}
 
 		return nil
@@ -516,6 +562,7 @@ const (
 	operationUnilateralExit = "unilateral_exit"
 	legSend                 = "send"
 	legFee                  = "fee"
+	legProceeds             = "proceeds"
 )
 
 // outpointIdempotencyPayload returns the stable natural identity shared by
@@ -569,6 +616,16 @@ func exitSendIdempotencyKey(hash [32]byte, index uint32) []byte {
 // ExitSendIdempotencyKey exposes exit-send key derivation to migration code.
 func ExitSendIdempotencyKey(hash [32]byte, index uint32) []byte {
 	return exitSendIdempotencyKey(hash, index)
+}
+
+// exitProceedsIdempotencyKey derives the leg that lands an own-wallet
+// exit's net value on wallet_balance. It is distinct from the send leg so the
+// send leg's dedup identity stays fixed whatever the destination flag says.
+func exitProceedsIdempotencyKey(hash [32]byte, index uint32) []byte {
+	return ledgerIdempotencyKey(
+		operationUnilateralExit, legProceeds,
+		outpointIdempotencyPayload(hash, index),
+	)
 }
 
 // exitFeeIdempotencyKey derives the unilateral exit's on-chain fee leg.

@@ -2845,12 +2845,29 @@ func (b *behavior) exitCostMsg(job *JobState) (*ledger.ExitCostMsg, error) {
 
 	target := b.proof.TargetOutpoint()
 
+	// DestinationOwnWallet is a literal rather than a comparison of
+	// safeTxOutPkScript(b.sweepTx, 0) against the wallet script, because
+	// nothing durable carries that script: buildSweepTx derives it from
+	// SweepWallet.NewWalletPkScript at build time and the checkpoint keeps
+	// only the sweep tx, so a restart-resumed unroll has nothing to
+	// compare against. Adding it would be a checkpoint format change.
+	//
+	// The invariant the literal stands on: every sweep this package builds
+	// pays output 0 to a script the wallet handed out. buildSweepTx
+	// (unroll/sweep.go) sources DestinationPkScript from
+	// SweepWallet.NewWalletPkScript, and both exit-spend policies write
+	// that script verbatim into the first output they add. So the exited
+	// value landed back in the client's own wallet rather than leaving for
+	// a counterparty, and the ledger books the send leg as an internal
+	// move into wallet_balance instead of an outflow. A future exit-spend
+	// policy that pays a caller-supplied destination must revisit this.
 	return &ledger.ExitCostMsg{
-		OutpointHash:  target.Hash,
-		OutpointIndex: target.Index,
-		AmountSat:     targetOutput.Value,
-		ExitCostSat:   exitCost,
-		BlockHeight:   height,
+		OutpointHash:         target.Hash,
+		OutpointIndex:        target.Index,
+		AmountSat:            targetOutput.Value,
+		ExitCostSat:          exitCost,
+		BlockHeight:          height,
+		DestinationOwnWallet: true,
 	}, nil
 }
 

@@ -868,6 +868,11 @@ FROM (
        AND deposit_bi.outpoint_index = le.chain_vout
     LEFT JOIN boarding_addresses AS deposit_ba
         ON deposit_ba.pk_script = deposit_bi.pk_script
+    -- The own-wallet exit proceeds leg (wallet_balance <- transfers_out)
+    -- is a contra leg that shares the send leg's chain identity; listing
+    -- it would show the same exit twice with the same fee attached.
+    WHERE NOT (le.debit_account = 'wallet_balance'
+               AND le.credit_account = 'transfers_out')
 
     UNION ALL
 

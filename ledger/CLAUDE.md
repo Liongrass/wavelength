@@ -65,7 +65,8 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/ledger.<
   `round_uuid` TEXT column (migration 000015) so ledger rows join
   against `rounds.round_id` / `vtxos.forfeit_round_id` in portable SQL.
 - `RefreshSendIdempotencyKey` / `ExitSendIdempotencyKey` /
-  `ExitFeeIdempotencyKey` — derive versioned operation-and-leg keys over the
+  `ExitFeeIdempotencyKey` (and the unexported exit proceeds key) — derive
+  versioned operation-and-leg keys over the
   36-byte `outpoint_hash || outpoint_index` identity. Refresh and exit sends
   for the same VTXO therefore cannot collide in
   `idx_client_ledger_idempotent_key`.
@@ -98,12 +99,23 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/ledger.<
   refresh emissions). Optional `IdempotencyKey` disambiguates
   round-scoped recipient/leave outflows that do not have a local VTXO
   outpoint.
-- `ExitCostMsg` — unilateral exit as two ledger entries: send leg
-  (`transfers_out` ⇐⇒ `vtxo_balance` net-of-fee) + fee leg
-  (`onchain_fees` ⇐⇒ `vtxo_balance` miner fee). Wallet-side movement
-  is covered separately by the `wallet_utxo_log` audit trail. Both rows
-  retain the exited VTXO outpoint as their stable chain identity, while
-  `ConfirmationHeight` is the final sweep height that completed the exit.
+- `ExitCostMsg` — unilateral exit as two or three ledger entries: send
+  leg (net-of-fee, `transfers_out` ⇐⇒ `vtxo_balance`) + fee leg
+  (`onchain_fees` ⇐⇒ `vtxo_balance` miner fee), plus a proceeds leg
+  (`wallet_balance` ⇐⇒ `transfers_out`, same net amount) when
+  `DestinationOwnWallet` reports the exit paid an output the client's
+  own wallet controls. The proceeds leg cancels the send leg on
+  `transfers_out`, so the value only crosses between two accounts the
+  client owns. The send leg's accounts never follow the flag: the
+  accounts are part of the dedup tuple, so a flag-dependent debit
+  account would let a resumed unroll job re-emitting across the
+  upgrade book a second `vtxo_balance` credit. The field is optional
+  on the wire, so a payload predating it decodes to `false` and writes
+  no proceeds leg. Wallet-side movement is covered separately by the
+  `wallet_utxo_log` audit trail. All rows retain the exited VTXO
+  outpoint as their stable chain identity under distinct leg names
+  (`send`, `fee`, `proceeds`), while `ConfirmationHeight` is the final
+  sweep height that completed the exit.
 - `UTXOCreatedMsg` — wallet UTXO confirmations with classification.
   `handleUTXOCreated` writes TWO rows: `wallet_utxo_log` audit row
   AND a ledger row keyed by an outpoint-derived idempotency key.
@@ -149,7 +161,9 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/ledger.<
     `notifyMaterializedVTXOs`.
   - ← `unroll`: `ExitCostMsg` after the final sweep confirms, with
     gross value from the proof target output and fee derived from the
-    persisted sweep transaction.
+    persisted sweep transaction. `DestinationOwnWallet` is always true
+    there: the sweep destination comes from
+    `SweepWallet.NewWalletPkScript`.
   - ← `wallet`: `UTXOCreatedMsg` on confirmed wallet UTXO observation
     plus one `BoardingSweepConfirmedMsg` per confirmed boarding sweep
     (the single atomic event the ledger expands into all clearing legs).
@@ -168,7 +182,7 @@ or balance reconciliation. Required emission pairs:
 | OOR receive | `VTXOReceivedMsg{SourceOOR}` net. No `FeePaidMsg`. |
 | OOR send | `VTXOSentMsg{SessionID}` net. No `FeePaidMsg`. |
 | In-round send | `VTXOSentMsg{RoundID}` net. Recipient/leave sends without outpoints must set `IdempotencyKey`. `SessionID`/`RoundID` are mutually exclusive. |
-| Unilateral exit | `ExitCostMsg{AmountSat=gross, ExitCostSat=fee}`. Handler expands to send-leg + fee-leg internally. |
+| Unilateral exit | `ExitCostMsg{AmountSat=gross, ExitCostSat=fee, DestinationOwnWallet}`. Handler expands to send-leg + fee-leg internally; the flag adds a separately keyed proceeds leg that moves the net value from `transfers_out` onto `wallet_balance`. |
 
 ## Invariants
 
