@@ -676,6 +676,12 @@ func exitProceedsIdempotencyKey(hash [32]byte, index uint32) []byte {
 	)
 }
 
+// ExitProceedsIdempotencyKey exposes the proceeds-leg identity to the
+// accounting invariant checker, which pairs an operation's legs by key.
+func ExitProceedsIdempotencyKey(hash [32]byte, index uint32) []byte {
+	return exitProceedsIdempotencyKey(hash, index)
+}
+
 // exitFeeIdempotencyKey derives the unilateral exit's on-chain fee leg.
 func exitFeeIdempotencyKey(hash [32]byte, index uint32) []byte {
 	return ledgerIdempotencyKey(
