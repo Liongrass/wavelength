@@ -171,6 +171,7 @@ const (
 	vtxoSentRoundIDType     tlv.Type = 5
 	vtxoSentOutpointType    tlv.Type = 7
 	vtxoSentIdempotencyType tlv.Type = 9
+	vtxoSentProceedsOwnType tlv.Type = 11
 
 	// ExitCostMsg field types.
 	exitCostOutpointHashType  tlv.Type = 1
@@ -576,6 +577,18 @@ type VTXOSentMsg struct {
 	// recipient outputs. When set, it takes precedence over
 	// Outpoint for ledger-entry deduplication.
 	IdempotencyKey []byte
+
+	// ProceedsOwnWallet reports whether this send paid an output the
+	// client's own backing wallet controls -- a cooperative leave to a
+	// script the daemon minted itself. When true the handler books a
+	// second, separately keyed proceeds leg that cancels the send leg on
+	// transfers_out and lands the value on wallet_balance, because the
+	// value did not leave: it crossed from the off-chain asset to the
+	// on-chain one. The send leg itself is unaffected, since its accounts
+	// are part of the dedup tuple. A payload predating this field decodes
+	// to false, which is the foreign-destination booking those messages
+	// were written under.
+	ProceedsOwnWallet bool
 }
 
 // MessageType returns the message type name for routing.
@@ -595,6 +608,10 @@ func (m *VTXOSentMsg) Encode(w io.Writer) error {
 	roundID := m.RoundID[:]
 	outpoint := &outpointRecord{OutPoint: m.Outpoint}
 	idempotencyKey := m.IdempotencyKey
+	var proceedsOwn uint8
+	if m.ProceedsOwnWallet {
+		proceedsOwn = 1
+	}
 
 	stream, err := tlv.NewStream(
 		tlv.MakePrimitiveRecord(
@@ -610,6 +627,9 @@ func (m *VTXOSentMsg) Encode(w io.Writer) error {
 		tlv.MakePrimitiveRecord(
 			vtxoSentIdempotencyType, &idempotencyKey,
 		),
+		tlv.MakePrimitiveRecord(
+			vtxoSentProceedsOwnType, &proceedsOwn,
+		),
 	)
 	if err != nil {
 		return err
@@ -618,7 +638,10 @@ func (m *VTXOSentMsg) Encode(w io.Writer) error {
 	return stream.Encode(w)
 }
 
-// Decode deserializes a TLV stream into the message.
+// Decode deserializes a TLV stream into the message. The own-wallet proceeds
+// flag is optional: a payload written before it existed leaves proceedsOwn
+// zero, which reproduces the foreign-destination booking those messages
+// assumed.
 func (m *VTXOSentMsg) Decode(r io.Reader) error {
 	var (
 		sessionID      []byte
@@ -626,6 +649,7 @@ func (m *VTXOSentMsg) Decode(r io.Reader) error {
 		roundID        []byte
 		outpoint       outpointRecord
 		idempotencyKey []byte
+		proceedsOwn    uint8
 	)
 
 	stream, err := tlv.NewStream(
@@ -641,6 +665,9 @@ func (m *VTXOSentMsg) Decode(r io.Reader) error {
 		makeOutpointRecord(vtxoSentOutpointType, &outpoint),
 		tlv.MakePrimitiveRecord(
 			vtxoSentIdempotencyType, &idempotencyKey,
+		),
+		tlv.MakePrimitiveRecord(
+			vtxoSentProceedsOwnType, &proceedsOwn,
 		),
 	)
 	if err != nil {
@@ -673,6 +700,7 @@ func (m *VTXOSentMsg) Decode(r io.Reader) error {
 	m.AmountSat = amt
 	m.Outpoint = outpoint.OutPoint
 	m.IdempotencyKey = append(m.IdempotencyKey[:0], idempotencyKey...)
+	m.ProceedsOwnWallet = proceedsOwn != 0
 
 	return nil
 }

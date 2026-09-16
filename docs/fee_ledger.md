@@ -56,6 +56,8 @@ rather than a single "net transfers" account so tax-reporting
 tooling can see gross send and gross receive flows
 independently. Netting them would collapse useful information.
 
+| `owned_wallet_scripts` | — | Not an account: the durable registry of backing-wallet scripts this daemon minted, seeded by migration `000022`. It is what lets a leave or a sweep destination be recognised as ours. |
+
 `opening_balance` is the equity counterparty for wallet UTXO
 deposits. Without it, `SourceRoundBoarding` outflows
 (crediting `wallet_balance`) would have no matching deposit leg
@@ -97,6 +99,7 @@ replay dedup — see the [Replay safety](#replay-safety) section.
 | `VTXOReceivedMsg` | `SourceOOR` | `vtxo_balance` | `transfers_in` | Out-of-round receive from another participant. |
 | `VTXOReceivedMsg` | `SourceOOR` under a session with a booked `vtxo_sent` leg | `vtxo_balance` | `transfers_out` | The sender's own change from an outgoing OOR transfer, pushed back as a separate incoming session. The handler derives this from the ledger's own rows and books it as `SourceOORSelfChange`; it cancels the part of the companion `VTXOSentMsg` debit that never left. |
 | `VTXOSentMsg` | (any) | `transfers_out` | `vtxo_balance` | One message per sent VTXO. Outpoint stamps an idempotency key so multi-VTXO rounds don't collapse. |
+| `VTXOSentMsg` (proceeds leg) | `ProceedsOwnWallet=true` | `wallet_balance` | `transfers_out` | Cooperative leave paying a backing-wallet script this daemon minted. Cancels the send leg on `transfers_out`: an internal asset transfer, not an outflow. Keyed by the send leg's key scoped under a distinct leg name, so the send leg's dedup identity is untouched. |
 | `FeePaidMsg` | `FeeTypeBoarding` or `FeeTypeRefresh` | `fees_paid` | `vtxo_balance` | Operator fee for the round. |
 | `FeePaidMsg` | `FeeTypeOnchainSweep` | `onchain_fees` | `wallet_clearing` | Boarding sweep chain cost, keyed by sweep txid. Retained for direct callers; the boarding sweep producer now folds this leg into `BoardingSweepConfirmedMsg`. |
 | `ExitCostMsg` (send leg) | — | `transfers_out` | `vtxo_balance` | Net-of-fee value swept out of the VTXO. Booked the same way whatever the destination, so its dedup identity never depends on the flag. |
@@ -303,6 +306,65 @@ idempotency key and does not depend on the session row, which flips to
 the incoming direction, so it holds for unkeyed sends and survives a
 restart that re-drives materialization.
 
+### Cooperative leave
+
+The client forfeits a VTXO and the round pays an on-chain output
+instead of a replacement VTXO. Whether that is an outflow or an
+internal transfer depends entirely on who controls the destination.
+
+```
+emitter: round.RoundClientActor.emitVTXOsReceived, from the
+         roundLedgerOutflows entry built by the round's intents
+
+Send leg (vtxo_sent):
+  debit  transfers_out    += leave amount
+  credit vtxo_balance     += leave amount
+
+Proceeds leg (vtxo_sent), only when ProceedsOwnWallet=true:
+  debit  wallet_balance   += leave amount
+  credit transfers_out    += leave amount
+```
+
+The flag rides on `types.LeaveRequest.DestinationOwnWallet`, which the
+wallet stamps at intent-composition time by asking the
+`owned_wallet_scripts` registry whether it minted the destination. The
+field is local-only and never reaches the join-round wire: the operator
+has no business knowing whose wallet a leave pays.
+
+The registry is written at mint time rather than queried from a wallet
+backend, because the three supported backends answer script ownership
+differently or not at all, and because a destination that is already
+being paid is too late to ask about. Every script the daemon hands out
+goes in: receive addresses through `Server.NewWalletAddress`, and sweep
+and change destinations through the `NewWalletPkScript` implementations.
+A script the registry has never seen answers false, which books the
+leave as a genuine outflow — the conservative direction, since
+overstating ownership would understate what the client paid out.
+
+Two leaves are deliberately never flagged. A caller-supplied
+destination is foreign unless the registry recognises it. And the
+boarding-limit change leave pays a *boarding* script, whose later
+`UTXOCreatedMsg` deposit leg already books the return; flagging it
+would credit `wallet_balance` twice for the same satoshis. That
+reasoning depends on the destination actually being a boarding script,
+so `boardingChangeLeave` verifies it against the boarding-address
+registry and fails the board rather than silently losing the deposit
+leg if a refactor changes the destination.
+
+Like the exit's, the send leg's accounts are fixed rather than
+following the flag, because the accounts are part of the dedup tuple.
+The proceeds leg takes the send leg's own key scoped under a distinct
+leg name, so a replay across the upgrade adds the proceeds leg and
+nothing else. A flagged send with no idempotency key books no proceeds
+leg at all: such a send dedups on the round or session partial index,
+where a second leg on the same accounts would have no distinct identity
+to occupy.
+
+The transaction history excludes the proceeds leg by the same condition
+that hides the exit's, since both are contra legs on
+`wallet_balance <- transfers_out` that cancel a send leg sharing their
+chain identity.
+
 ### Unilateral exit
 
 Client unilaterally broadcasts a VTXO exit tree. The swept value
@@ -496,21 +558,6 @@ with the operator-side accounting tool.
   write double-entry wallet-clearing legs, but other direct
   wallet spends still need a classification-specific ledger
   producer before they can affect `wallet_balance`.
-- **Leave proceeds to an own-wallet destination.** A cooperative
-  leave books its outflow on `transfers_out`, which is right for a
-  foreign destination but understates the client's total when the
-  leave paid the client's own wallet (the facade's default
-  cooperative exit, which allocates a fresh backing-wallet address
-  when the caller supplies none). The unroll exit already books
-  this correctly via `ExitCostMsg.DestinationOwnWallet`, but no leave
-  producer can assert ownership today: leave destinations arrive as
-  caller-supplied addresses or pkScripts through the RPC surface, the
-  client has no script-ownership oracle across its three wallet
-  backends, and the one leave the wallet mints itself — the
-  boarding-limit change output — pays a boarding script whose later
-  `UTXOCreatedMsg` deposit leg already books the return, so flagging
-  it would double-count. Closing this needs either an ownership query
-  on the wallet backends or a destination flag on the leave RPC.
 - **Recycled exit proceeds.** A unilateral exit books its proceeds
   into `wallet_balance` via `ExitCostMsg.DestinationOwnWallet`, and
   nothing ever debits them again. The exit output pays a plain wallet

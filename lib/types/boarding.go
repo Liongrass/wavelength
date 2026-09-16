@@ -166,6 +166,20 @@ type LeaveRequest struct {
 	// IsChange marks this LeaveRequest as the client's designated
 	// fee-bearing change output for the intent.
 	IsChange bool
+
+	// DestinationOwnWallet reports that Output.PkScript is a backing-wallet
+	// script this daemon minted itself, so the leave's value moved between
+	// two accounts the client owns rather than leaving. The ledger uses it
+	// to book a second, cancelling proceeds leg onto wallet_balance. It is
+	// set from the owned-script registry at intent-composition time,
+	// because only the wallet can answer script ownership and a
+	// caller-supplied destination cannot be trusted to claim it.
+	//
+	// The field is local-only and is NOT serialized on the join-round
+	// wire; the operator has no business knowing whose wallet a leave
+	// pays. False is the conservative default: an unrecognised
+	// destination books the leave as a genuine outflow.
+	DestinationOwnWallet bool
 }
 
 // ForfeitRequest represents a request to forfeit a VTXO.

@@ -186,6 +186,7 @@ or balance reconciliation. Required emission pairs:
 | OOR self-change | `VTXOReceivedMsg{SourceOOR, SessionID}` for the sender's own change coming back as an incoming session; the handler sees the session's earlier `vtxo_sent` leg and credits `transfers_out` so it cancels the part of the companion `VTXOSentMsg` that never left. |
 | OOR send | `VTXOSentMsg{SessionID}` net. No `FeePaidMsg`. |
 | In-round send | `VTXOSentMsg{RoundID}` net. Recipient/leave sends without outpoints must set `IdempotencyKey`. `SessionID`/`RoundID` are mutually exclusive. |
+| Own-wallet leave | `VTXOSentMsg{RoundID, ProceedsOwnWallet=true}` for a leave paying a backing-wallet script this daemon minted. The send leg is unchanged; a second leg `wallet_balance <- transfers_out`, keyed by the send key scoped under the `proceeds` leg name, cancels it. A flagged send with no `IdempotencyKey` books no proceeds leg, since it has no distinct identity for one. |
 | Unilateral exit | `ExitCostMsg{AmountSat=gross, ExitCostSat=fee, DestinationOwnWallet}`. Handler expands to send-leg + fee-leg internally; the flag adds a separately keyed proceeds leg that moves the net value from `transfers_out` onto `wallet_balance`. |
 
 ## Invariants

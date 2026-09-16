@@ -1082,6 +1082,18 @@ CREATE TABLE owned_receive_scripts (
     FOREIGN KEY (source) REFERENCES owned_receive_script_sources(source)
 );
 
+CREATE TABLE owned_wallet_scripts (
+    -- pk_script is the raw output script, and its own identity.
+    pk_script BLOB PRIMARY KEY,
+
+    -- source names the mint site, so an operator reading the table can tell
+    -- a receive address from a sweep or change destination.
+    source TEXT NOT NULL,
+
+    -- created_at is the Unix timestamp the script was recorded.
+    created_at BIGINT NOT NULL
+);
+
 CREATE TABLE pending_board_intents (
     intent_id BLOB PRIMARY KEY
         REFERENCES pending_intents(intent_id),

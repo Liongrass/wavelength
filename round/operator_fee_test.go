@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/lib/types"
 	"github.com/lightninglabs/wavelength/wallet"
@@ -190,8 +191,8 @@ func TestRoundLedgerOutflowKeysIncludeRoundID(t *testing.T) {
 	roundID1 := testRoundID("round-outflow-1")
 	roundID2 := testRoundID("round-outflow-2")
 
-	outflows1 := roundLedgerOutflows(roundID1, intents)
-	outflows2 := roundLedgerOutflows(roundID2, intents)
+	outflows1 := roundLedgerOutflows(roundID1, intents, nil)
+	outflows2 := roundLedgerOutflows(roundID2, intents, nil)
 
 	require.Len(t, outflows1, 2)
 	require.Len(t, outflows2, 2)
@@ -290,4 +291,198 @@ func TestComputeClientOperatorFeeIgnoresNilEntries(t *testing.T) {
 	require.Equal(
 		t, int64(500), computeClientOperatorFee(intents, vtxos),
 	)
+}
+
+// commitmentPacket wraps a set of outputs in the minimal PSBT shape
+// roundLedgerOutflows reads.
+func commitmentPacket(outs ...*wire.TxOut) *psbt.Packet {
+	return &psbt.Packet{
+		UnsignedTx: &wire.MsgTx{
+			TxOut: outs,
+		},
+	}
+}
+
+// TestRoundLedgerOutflowsCarryOwnWalletFlag proves the leave's own-wallet flag
+// reaches the ledger outflow with the commitment output index it paid, that an
+// unflagged leave stays an outflow, and that a foreign directed-send recipient
+// output can never be flagged. The boarding-limit change leave is the
+// unflagged case that matters most: it pays a boarding script whose later
+// deposit leg already books the return, so flagging it would count the same
+// satoshis onto wallet_balance twice.
+func TestRoundLedgerOutflowsCarryOwnWalletFlag(t *testing.T) {
+	t.Parallel()
+
+	ownScript := []byte{0x51, 0x20, 0xaa}
+	intents := Intents{
+		VTXOs: []types.VTXORequest{
+			{
+				Amount: btcutil.Amount(10_000),
+			},
+		},
+		Leaves: []*types.LeaveRequest{
+			{
+				Output: &wire.TxOut{
+					Value:    5_000,
+					PkScript: ownScript,
+				},
+				DestinationOwnWallet: true,
+			},
+			{
+				// The boarding-limit change leave, and any
+				// leave to a destination we cannot claim.
+				Output: &wire.TxOut{
+					Value: 3_000,
+				},
+			},
+			nil,
+		},
+	}
+
+	outflows := roundLedgerOutflows(
+		testRoundID("round-own-wallet"), intents,
+		commitmentPacket(
+			&wire.TxOut{
+				Value: 1_000,
+			}, &wire.TxOut{
+				Value:    5_000,
+				PkScript: ownScript,
+			},
+		),
+	)
+	require.Len(t, outflows, 3)
+
+	// The recipient VTXO output is somebody else's by definition.
+	require.Equal(t, int64(10_000), outflows[0].AmountSat)
+	require.False(t, outflows[0].ProceedsOwnWallet)
+
+	require.Equal(t, int64(5_000), outflows[1].AmountSat)
+	require.True(t, outflows[1].ProceedsOwnWallet)
+	require.Equal(t, uint32(1), outflows[1].ProceedsVout)
+
+	require.Equal(t, int64(3_000), outflows[2].AmountSat)
+	require.False(t, outflows[2].ProceedsOwnWallet)
+}
+
+// TestRoundLedgerOutflowsDropFlagWithoutAnOutpoint proves the flag fails
+// closed. A leave the commitment transaction cannot name unambiguously books
+// as a plain outflow, because a proceeds credit with no on-chain identity
+// could never be reversed when those coins are boarded again.
+func TestRoundLedgerOutflowsDropFlagWithoutAnOutpoint(t *testing.T) {
+	t.Parallel()
+
+	ownScript := []byte{0x51, 0x20, 0xaa}
+	leave := &types.LeaveRequest{
+		Output: &wire.TxOut{
+			Value:    5_000,
+			PkScript: ownScript,
+		},
+		DestinationOwnWallet: true,
+	}
+	intents := Intents{Leaves: []*types.LeaveRequest{leave}}
+	roundID := testRoundID("round-no-outpoint")
+
+	cases := []struct {
+		name string
+		tx   *psbt.Packet
+	}{
+		{
+			name: "no commitment transaction",
+			tx:   nil,
+		},
+		{
+			name: "output not present",
+			tx: commitmentPacket(
+				&wire.TxOut{Value: 5_000},
+			),
+		},
+		{
+			name: "two identical outputs",
+			tx: commitmentPacket(
+				&wire.TxOut{
+					Value:    5_000,
+					PkScript: ownScript,
+				},
+				&wire.TxOut{
+					Value:    5_000,
+					PkScript: ownScript,
+				},
+			),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			outflows := roundLedgerOutflows(roundID, intents, tc.tx)
+			require.Len(t, outflows, 1)
+			require.False(t, outflows[0].ProceedsOwnWallet)
+		})
+	}
+}
+
+// TestRoundLedgerOutflowsMatchQuotedLeaveValue proves a fee-bearing leave
+// still resolves its commitment output. The seal-time quote shaves the fee
+// off the requested output value, so the commitment transaction carries the
+// quoted amount and not the intent target. Matching on the request value
+// would find no output, drop the own-wallet flag, and leave the payment to
+// our own wallet booked as an outflow with no reversible audit row, which a
+// later re-board would then credit a second time.
+func TestRoundLedgerOutflowsMatchQuotedLeaveValue(t *testing.T) {
+	t.Parallel()
+
+	ownScript := []byte{0x51, 0x20, 0xbb}
+	newIntents := func() Intents {
+		return Intents{
+			Leaves: []*types.LeaveRequest{
+				{
+					Output: &wire.TxOut{
+						Value:    5_000,
+						PkScript: ownScript,
+					},
+					DestinationOwnWallet: true,
+				},
+			},
+
+			// The quote nets a 250-sat fee out of the requested
+			// 5_000-sat leave.
+			QuotedLeaveAmounts: []int64{
+				4_750,
+			},
+		}
+	}
+
+	// The commitment output carries the quoted value, so the vout
+	// resolves and the proceeds keep an on-chain identity.
+	outflows := roundLedgerOutflows(
+		testRoundID("round-quoted-leave"), newIntents(),
+		commitmentPacket(
+			&wire.TxOut{
+				Value: 1_000,
+			}, &wire.TxOut{
+				Value:    4_750,
+				PkScript: ownScript,
+			},
+		),
+	)
+	require.Len(t, outflows, 1)
+	require.Equal(t, int64(4_750), outflows[0].AmountSat)
+	require.True(t, outflows[0].ProceedsOwnWallet)
+	require.Equal(t, uint32(1), outflows[0].ProceedsVout)
+
+	// A commitment transaction carrying neither the quoted nor the
+	// requested value still fails closed.
+	outflows = roundLedgerOutflows(
+		testRoundID("round-quoted-leave"), newIntents(),
+		commitmentPacket(
+			&wire.TxOut{
+				Value:    5_000,
+				PkScript: ownScript,
+			},
+		),
+	)
+	require.Len(t, outflows, 1)
+	require.Equal(t, int64(4_750), outflows[0].AmountSat)
+	require.False(t, outflows[0].ProceedsOwnWallet)
 }

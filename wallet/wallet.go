@@ -199,6 +199,12 @@ type Ark struct {
 	// kept in lockstep with each pendingSweepState.inputs entry.
 	pendingSweepInputs map[wire.OutPoint]chainhash.Hash
 
+	// ownedScripts answers whether a leave destination is a backing-wallet
+	// script this daemon minted. nil means the registry is not wired, in
+	// which case every destination is treated as foreign -- the
+	// conservative answer, and the behaviour that predates the registry.
+	ownedScripts OwnedWalletScriptChecker
+
 	// clk is the clock used to stamp persistence timestamps. Tests pass
 	// a deterministic clock via WithClock; production wires the
 	// server-wide clock instance so all stores share one source of time.
@@ -412,6 +418,15 @@ func WithMetricsSink(sink fn.Option[metrics.Sink]) ArkOption {
 // Production wires this with the daemon-wide clock so persist timestamps
 // share one source of truth; tests use this to freeze time. When omitted,
 // the wallet falls back to clock.NewDefaultClock().
+// WithOwnedWalletScripts wires the owned-script registry so the wallet can
+// tell a leave that pays its own backing wallet from one that pays a
+// stranger. When omitted, every leave destination is treated as foreign.
+func WithOwnedWalletScripts(checker OwnedWalletScriptChecker) ArkOption {
+	return func(a *Ark) {
+		a.ownedScripts = checker
+	}
+}
+
 func WithClock(clk clock.Clock) ArkOption {
 	return func(a *Ark) {
 		a.clk = clk
@@ -2132,6 +2147,9 @@ func (a *Ark) handleLeaveVTXOs(ctx context.Context,
 				PkScript: leaveOutput.PkScript,
 				Value:    int64(vtxo.Amount),
 			},
+			DestinationOwnWallet: a.destinationIsOwnWallet(
+				ctx, leaveOutput.PkScript,
+			),
 		})
 	}
 
@@ -3499,4 +3517,36 @@ func buildBoardingTapscript(clientKey, operatorKey *btcec.PublicKey,
 	}
 
 	return tapscript, nil
+}
+
+// destinationIsOwnWallet reports whether a leave destination is a
+// backing-wallet script this daemon minted, which decides whether the ledger
+// books the leave's value as an outflow or as an internal transfer onto
+// wallet_balance.
+//
+// Every failure answers false. The registry being unwired, a lookup error, or
+// a script the registry has never seen all mean the same thing for
+// accounting: we cannot assert ownership, so the value is treated as having
+// genuinely left. Overstating ownership would understate what the client paid
+// out, and a leave is a funds-moving operation that must not fail because an
+// accounting flag could not be resolved.
+func (a *Ark) destinationIsOwnWallet(ctx context.Context,
+	pkScript []byte) bool {
+
+	if a.ownedScripts == nil || len(pkScript) == 0 {
+		return false
+	}
+
+	owned, err := a.ownedScripts.IsOwnedWalletScript(ctx, pkScript)
+	if err != nil {
+		// A safe fallback, not an actionable failure: the leave still
+		// proceeds and the value is booked the conservative way.
+		a.logger(ctx).InfoS(ctx, "Failed to resolve leave destination "+
+			"ownership; booking it as an outflow",
+			slog.String("error", err.Error()))
+
+		return false
+	}
+
+	return owned
 }

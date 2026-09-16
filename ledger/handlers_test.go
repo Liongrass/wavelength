@@ -2495,3 +2495,208 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 
 	return n, nil
 }
+
+// TestHandleVTXOSentOwnWalletProceedsBooksWalletBalance proves a cooperative
+// leave that paid a script the daemon's own backing wallet minted books a
+// second leg cancelling the send leg on transfers_out, while the send leg's
+// accounts and identity stay exactly what a foreign-destination leave writes.
+func TestHandleVTXOSentOwnWalletProceedsBooksWalletBalance(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	sendKey := []byte("round-outflow:round-a:leave:0")
+	msg := &VTXOSentMsg{
+		RoundID: [16]byte{
+			0x7a,
+		},
+		AmountSat:         50_000,
+		IdempotencyKey:    sendKey,
+		ProceedsOwnWallet: true,
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 2)
+
+	// Send leg: unchanged by the flag, because its accounts are part of
+	// the dedup tuple.
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(50_000), entries[0].AmountSat)
+	require.Equal(t, sendKey, entries[0].IdempotencyKey)
+
+	// Proceeds leg: wallet_balance <- transfers_out, separately keyed.
+	require.Equal(t, AccountWalletBalance, entries[1].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[1].CreditAccount)
+	require.Equal(t, int64(50_000), entries[1].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[1].EventType)
+	require.Equal(
+		t, sendProceedsIdempotencyKey(sendKey),
+		entries[1].IdempotencyKey,
+	)
+	require.NotEqual(
+		t, entries[0].IdempotencyKey, entries[1].IdempotencyKey,
+	)
+
+	// The leave nets to an internal transfer: vtxo_balance down,
+	// wallet_balance up, transfers_out flat.
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-50_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(50_000), balances[AccountWalletBalance])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestHandleVTXOSentForeignDestinationWritesNoProceedsLeg proves the default
+// stays a real outflow: without the flag the send leg stands alone.
+func TestHandleVTXOSentForeignDestinationWritesNoProceedsLeg(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				RoundID:   [16]byte{0x7b},
+				AmountSat: 50_000,
+				IdempotencyKey: []byte(
+					"round-outflow:round-b:leave:0",
+				),
+			},
+		),
+	)
+
+	entries := store.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+}
+
+// TestHandleVTXOSentProceedsReplayDedups proves the reachable upgrade replay:
+// a leave booked before the flag existed, re-emitted with the flag set, must
+// add only the proceeds leg rather than credit vtxo_balance a second time.
+func TestHandleVTXOSentProceedsReplayDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	msg := &VTXOSentMsg{
+		RoundID: [16]byte{
+			0x7c,
+		},
+		AmountSat:      30_000,
+		IdempotencyKey: []byte("round-outflow:round-c:leave:0"),
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+	require.Len(t, store.getEntries(), 1)
+
+	flagged := *msg
+	flagged.ProceedsOwnWallet = true
+	require.NoError(t, run(ctx, a, &flagged))
+	require.NoError(t, run(ctx, a, &flagged))
+
+	entries := store.getEntries()
+	require.Len(
+		t, entries, 2,
+		"replay across the flag must add only the proceeds leg",
+	)
+
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-30_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(30_000), balances[AccountWalletBalance])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestHandleVTXOSentProceedsNeedsAKey proves a flagged send with no
+// idempotency key is rejected rather than quietly booking only the send leg.
+// The proceeds leg is keyed off the send's key, and the paired leave_proceeds
+// audit row suppresses the deposit credit on the strength of that leg
+// existing, so dropping it would strand the value uncredited in both places.
+func TestHandleVTXOSentProceedsNeedsAKey(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	err := run(
+		ctx, a, &VTXOSentMsg{
+			SessionID:         [32]byte{0x7d},
+			AmountSat:         10_000,
+			ProceedsOwnWallet: true,
+		},
+	)
+	require.ErrorIs(t, err, ErrInvalidMessage)
+	require.Empty(t, store.getEntries())
+}
+
+// TestVTXOSentMsgProceedsFlagRoundTrips proves the flag survives the durable
+// mailbox codec and that a payload written before it existed decodes to the
+// foreign-destination booking it was written under.
+func TestVTXOSentMsgProceedsFlagRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for _, ownWallet := range []bool{false, true} {
+		msg := &VTXOSentMsg{
+			RoundID: [16]byte{
+				0x8a,
+			},
+			AmountSat:         70_000,
+			IdempotencyKey:    []byte("leave-key"),
+			ProceedsOwnWallet: ownWallet,
+		}
+
+		var buf bytes.Buffer
+		require.NoError(t, msg.Encode(&buf))
+
+		var decoded VTXOSentMsg
+		require.NoError(t, decoded.Decode(bytes.NewReader(buf.Bytes())))
+		require.Equal(t, *msg, decoded)
+	}
+
+	// A payload written before the flag existed carries no proceeds
+	// record at all, so build the pre-flag stream by hand.
+	var (
+		sessionID      = make([]byte, 32)
+		amountSat      = uint64(20_000)
+		roundID        = make([]byte, 16)
+		outpoint       = outpointRecord{}
+		idempotencyKey = []byte("legacy-leave-key")
+	)
+	roundID[0] = 0x8b
+
+	legacyStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(vtxoSentSessionIDType, &sessionID),
+		tlv.MakePrimitiveRecord(vtxoSentAmountSatType, &amountSat),
+		tlv.MakePrimitiveRecord(vtxoSentRoundIDType, &roundID),
+		makeOutpointRecord(vtxoSentOutpointType, &outpoint),
+		tlv.MakePrimitiveRecord(
+			vtxoSentIdempotencyType, &idempotencyKey,
+		),
+	)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	require.NoError(t, legacyStream.Encode(&legacyBuf))
+
+	var legacy VTXOSentMsg
+	require.NoError(t, legacy.Decode(bytes.NewReader(legacyBuf.Bytes())))
+	require.Equal(t, int64(20_000), legacy.AmountSat)
+	require.False(
+		t, legacy.ProceedsOwnWallet,
+		"a missing proceeds record must keep the old behaviour",
+	)
+}

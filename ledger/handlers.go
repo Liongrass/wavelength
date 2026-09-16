@@ -401,6 +401,7 @@ func (a *LedgerActor) handleVTXOSent(ctx context.Context, msg *VTXOSentMsg,
 		)
 	}
 
+	now := a.clk.Now().Unix()
 	entry := LedgerEntry{
 		DebitAccount:   AccountTransfersOut,
 		CreditAccount:  AccountVTXOBalance,
@@ -409,15 +410,80 @@ func (a *LedgerActor) handleVTXOSent(ctx context.Context, msg *VTXOSentMsg,
 		RoundID:        roundID,
 		EventType:      EventVTXOSent,
 		Description:    description,
-		CreatedAt:      a.clk.Now().Unix(),
+		CreatedAt:      now,
 		IdempotencyKey: idempotencyKey,
+	}
+
+	// A send that paid the client's own backing wallet did not leave: the
+	// value crossed from the off-chain asset to the on-chain one. That
+	// movement is its own leg, keyed separately, so it cancels the send
+	// leg on transfers_out and lands the value on wallet_balance without
+	// touching the send leg's dedup identity -- which it must not, because
+	// the accounts are part of the dedup tuple and a send leg that
+	// switched accounts with the flag would land in a different tuple than
+	// its pre-flag twin and double-credit vtxo_balance on replay. This is
+	// the same shape handleExitCost uses for an own-wallet exit.
+	//
+	// The proceeds leg needs its own key, and the send leg's key is
+	// whatever the producer supplied, so the leg name is appended to it
+	// rather than derived from an outpoint the leave does not have.
+	//
+	// The flag and the key are coupled: the paired leave_proceeds audit row
+	// suppresses the deposit credit on the strength of this leg existing,
+	// so a flag arriving without a key would leave the coins uncredited in
+	// both places. Producers always set one today; fail loudly rather than
+	// degrade quietly if that ever stops holding.
+	if msg.ProceedsOwnWallet && len(idempotencyKey) == 0 {
+		return a.fail(
+			ctx, errMsg, fmt.Errorf("%w: VTXOSentMsg sets "+
+				"proceeds_own_wallet without an idempotency "+
+				"key, which the proceeds leg is keyed from",
+				ErrInvalidMessage),
+		)
+	}
+
+	var proceedsLeg fn.Option[LedgerEntry]
+	if msg.ProceedsOwnWallet {
+		proceedsLeg = fn.Some(LedgerEntry{
+			DebitAccount:  AccountWalletBalance,
+			CreditAccount: AccountTransfersOut,
+			AmountSat:     msg.AmountSat,
+			SessionID:     sessionID,
+			RoundID:       roundID,
+			EventType:     EventVTXOSent,
+			Description:   description + " (own-wallet proceeds)",
+			CreatedAt:     now,
+			IdempotencyKey: sendProceedsIdempotencyKey(
+				idempotencyKey,
+			),
+		})
 	}
 
 	return a.commit(ctx, ax, errMsg, func(ctx context.Context,
 		q ledgerTx) error {
 
-		return q.ledger.InsertLedgerEntry(ctx, entry)
+		if err := q.ledger.InsertLedgerEntry(ctx, entry); err != nil {
+			return fmt.Errorf("send leg: %w", err)
+		}
+
+		var proceedsErr error
+		proceedsLeg.WhenSome(func(leg LedgerEntry) {
+			proceedsErr = q.ledger.InsertLedgerEntry(ctx, leg)
+		})
+		if proceedsErr != nil {
+			return fmt.Errorf("send proceeds leg: %w", proceedsErr)
+		}
+
+		return nil
 	})
+}
+
+// sendProceedsIdempotencyKey derives the identity of the leg that lands an
+// own-wallet send's value on wallet_balance. It scopes the send's own key
+// under the versioned proceeds leg name, so the proceeds leg is unique
+// wherever the send leg was and the send leg's identity is untouched.
+func sendProceedsIdempotencyKey(sendKey []byte) []byte {
+	return ledgerIdempotencyKey(operationSend, legProceeds, sendKey)
 }
 
 // zeroHash is a convenience sentinel for detecting an absent
@@ -606,6 +672,7 @@ func (a *LedgerActor) handleExitCost(ctx context.Context, msg *ExitCostMsg,
 const ledgerIdempotencyVersion = "ledger:v1:"
 
 const (
+	operationSend           = "send"
 	operationRoundRefresh   = "round_refresh"
 	operationUnilateralExit = "unilateral_exit"
 	legSend                 = "send"

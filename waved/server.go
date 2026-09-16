@@ -4383,6 +4383,9 @@ func (s *Server) initWalletActor(ctx context.Context,
 		wallet.WithMetricsSink(s.metricsSink),
 		wallet.WithFetchOperatorTerms(s.fetchCachedOperatorTerms),
 		wallet.WithFetchLiveBalance(s.fetchLiveVTXOBalance),
+		wallet.WithOwnedWalletScripts(
+			s.ownedWalletScripts(),
+		),
 	)
 	walletKey := actor.NewServiceKey[
 		wallet.WalletMsg, wallet.WalletResp,
@@ -5422,6 +5425,10 @@ func (s *Server) lndWalletAccount() string {
 type lndUnrollWallet struct {
 	*lndbackend.ClientWallet
 	boardingBackend *lndbackend.BoardingBackend
+
+	// scripts records every destination script this adapter mints, so the
+	// accounting can later recognise an output paying one of them as ours.
+	scripts ownedWalletScriptRegistrar
 }
 
 // ListUnspent returns UTXOs from the boarding backend's configured LND wallet
@@ -5459,6 +5466,8 @@ func (w *lndUnrollWallet) NewWalletPkScript(ctx context.Context) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("pay to addr script: %w", err)
 	}
+
+	recordOwnedWalletScript(ctx, w.scripts, pkScript)
 
 	return pkScript, nil
 }
@@ -5552,6 +5561,10 @@ func (w *lndUnrollWallet) ReleaseOutput(ctx context.Context, id wallet.LockID,
 // and adds the ListUnspent and FinalizePsbt methods.
 type lwUnrollWallet struct {
 	*lwwallet.Wallet
+
+	// scripts records every destination script this adapter mints; see
+	// lndUnrollWallet.scripts.
+	scripts ownedWalletScriptRegistrar
 }
 
 // ListUnspent returns confirmed wallet UTXOs from btcwallet,
@@ -5615,6 +5628,8 @@ func (w *lwUnrollWallet) NewWalletPkScript(ctx context.Context) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("pay to addr script: %w", err)
 	}
+
+	recordOwnedWalletScript(ctx, w.scripts, pkScript)
 
 	return pkScript, nil
 }
@@ -5706,6 +5721,10 @@ func (w *lwUnrollWallet) ReleaseOutput(_ context.Context, id wallet.LockID,
 // unroll broadcaster and executor wallet interfaces.
 type btcwUnrollWallet struct {
 	*btcwbackend.Wallet
+
+	// scripts records every destination script this adapter mints; see
+	// lndUnrollWallet.scripts.
+	scripts ownedWalletScriptRegistrar
 }
 
 // ListUnspent returns confirmed wallet UTXOs from btcwallet, converting
@@ -5751,6 +5770,8 @@ func (w *btcwUnrollWallet) NewWalletPkScript(ctx context.Context) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("pay to addr script: %w", err)
 	}
+
+	recordOwnedWalletScript(ctx, w.scripts, pkScript)
 
 	return pkScript, nil
 }
@@ -5880,17 +5901,24 @@ func (s *Server) initUnrollSubsystem(ctx context.Context,
 		w := &lndUnrollWallet{
 			ClientWallet:    clientWallet,
 			boardingBackend: boardingBackend,
+			scripts:         s.ownedWalletScripts(),
 		}
 		unrollWallet = w
 
 	case WalletTypeLwwallet:
 		lww := s.lwWallet.UnsafeFromSome()
-		w := &lwUnrollWallet{Wallet: lww}
+		w := &lwUnrollWallet{
+			Wallet:  lww,
+			scripts: s.ownedWalletScripts(),
+		}
 		unrollWallet = w
 
 	case WalletTypeBtcwallet:
 		btcw := s.btcwWallet.UnsafeFromSome()
-		w := &btcwUnrollWallet{Wallet: btcw}
+		w := &btcwUnrollWallet{
+			Wallet:  btcw,
+			scripts: s.ownedWalletScripts(),
+		}
 		unrollWallet = w
 	}
 

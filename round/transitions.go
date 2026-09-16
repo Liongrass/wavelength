@@ -4616,8 +4616,12 @@ func computeClientOperatorFee(intents Intents, ownedVTXOs []*ClientVTXO) int64 {
 // resulting rows are separate from operator fees so directed-send
 // recipient value and cooperative leave value remain visible in the
 // transfers_out account.
-func roundLedgerOutflows(roundID RoundID,
-	intents Intents) []RoundLedgerOutflow {
+//
+// commitmentTx is the round's unsigned commitment transaction, used to give a
+// leave that paid our own wallet an on-chain identity. It may be nil, in
+// which case no leave can be flagged.
+func roundLedgerOutflows(roundID RoundID, intents Intents,
+	commitmentTx *psbt.Packet) []RoundLedgerOutflow {
 
 	var outflows []RoundLedgerOutflow
 
@@ -4644,13 +4648,81 @@ func roundLedgerOutflows(roundID RoundID,
 			continue
 		}
 
+		// A leave paying a script the daemon minted is an internal
+		// transfer, not an outflow. The wallet stamped the flag at
+		// intent-composition time from the owned-script registry; a
+		// nil leave request cannot have been stamped, so it keeps the
+		// conservative false.
+		//
+		// The flag only survives if the leave's output can be found in
+		// the commitment transaction, because the ledger needs an
+		// outpoint to record those proceeds under. See ProceedsVout.
+		leave := intents.Leaves[i]
+		ownWallet := leave != nil && leave.DestinationOwnWallet
+
+		var vout uint32
+		if ownWallet {
+			found, index := commitmentVout(
+				commitmentTx, leave, amt,
+			)
+			ownWallet = found
+			vout = index
+		}
+
 		outflows = append(outflows, RoundLedgerOutflow{
-			AmountSat:      amt,
-			IdempotencyKey: roundOutflowKey(roundID, "leave", i),
+			AmountSat:         amt,
+			IdempotencyKey:    roundOutflowKey(roundID, "leave", i),
+			ProceedsOwnWallet: ownWallet,
+			ProceedsVout:      vout,
 		})
 	}
 
 	return outflows
+}
+
+// commitmentVout locates a leave's output in the commitment transaction by
+// script and value, returning its index.
+//
+// amountSat is the authoritative, quote-adjusted leave value the caller is
+// booking, not the pre-quote request target. The commitment transaction
+// carries the quoted value, so a fee-bearing leave (implicit single-output
+// change, or an explicit change leave) only matches on the quoted amount.
+// Matching on leave.Output.Value instead would find nothing and silently
+// drop the own-wallet flag.
+//
+// It fails closed. No commitment transaction, no match, or more than one
+// match all return false, and the caller then drops the own-wallet flag
+// rather than booking proceeds it could not name on-chain. Two leaves paying
+// the same script the same amount in one round are indistinguishable here,
+// and guessing between them would key both proceeds rows to one outpoint.
+func commitmentVout(commitmentTx *psbt.Packet, leave *types.LeaveRequest,
+	amountSat int64) (bool, uint32) {
+
+	if commitmentTx == nil || commitmentTx.UnsignedTx == nil ||
+		leave == nil || leave.Output == nil {
+		return false, 0
+	}
+
+	var (
+		found bool
+		vout  uint32
+	)
+	for i, txOut := range commitmentTx.UnsignedTx.TxOut {
+		if txOut == nil || txOut.Value != amountSat ||
+			!bytes.Equal(txOut.PkScript, leave.Output.PkScript) {
+
+			continue
+		}
+
+		if found {
+			return false, 0
+		}
+
+		found = true
+		vout = uint32(i)
+	}
+
+	return found, vout
 }
 
 // roundOutflowKey returns a deterministic per-round outflow key for
@@ -5174,7 +5246,9 @@ func (s *InputSigSentState) ProcessEvent(ctx context.Context, event ClientEvent,
 
 		operatorFee := computeClientOperatorFee(s.Intents, vtxos)
 		operatorFeeType := roundOperatorFeeType(s.Intents)
-		outflows := roundLedgerOutflows(s.RoundID, s.Intents)
+		outflows := roundLedgerOutflows(
+			s.RoundID, s.Intents, s.CommitmentTx,
+		)
 
 		// Build outbox messages starting with standard notifications.
 		outbox := make([]ClientOutMsg, 0, 3)
