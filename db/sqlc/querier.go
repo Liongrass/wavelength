@@ -31,6 +31,9 @@ type Querier interface {
 	CountActivityEntriesByStatus(ctx context.Context, status int64) (int64, error)
 	CountBoardingIntentsByStatus(ctx context.Context, status string) (int64, error)
 	CountClientLedgerEntries(ctx context.Context) (int64, error)
+	// CountOwnedWalletScript reports whether a pkScript is in the registry.
+	// Absent means "not known to be ours", which is the conservative answer.
+	CountOwnedWalletScript(ctx context.Context, pkScript []byte) (int64, error)
 	// Count the anchors retained for one intent (a failed intent keeps its
 	// anchors so it stays correlatable by its consumed outpoints).
 	CountPendingIntentAnchorsByIntentID(ctx context.Context, intentID []byte) (int64, error)
@@ -156,6 +159,10 @@ type Querier interface {
 	// GetVTXOReplacement retrieves the replacement VTXO outpoint for a forfeited
 	// VTXO. Returns NULL if not forfeited or no replacement recorded.
 	GetVTXOReplacement(ctx context.Context, arg GetVTXOReplacementParams) (GetVTXOReplacementRow, error)
+	// GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
+	// outpoint, if any. The boarding deposit path uses it to recognise a funding
+	// input as a previously recorded own-wallet proceeds UTXO.
+	GetWalletUTXOLogCreatedByOutpoint(ctx context.Context, arg GetWalletUTXOLogCreatedByOutpointParams) (WalletUtxoLog, error)
 	// Boarding address queries.
 	InsertBoardingAddress(ctx context.Context, arg InsertBoardingAddressParams) error
 	// Boarding intent queries.
@@ -559,6 +566,11 @@ type Querier interface {
 	UpsertOORSessionRegistry(ctx context.Context, arg UpsertOORSessionRegistryParams) error
 	UpsertOORVTXOBinding(ctx context.Context, arg UpsertOORVTXOBindingParams) (int64, error)
 	UpsertOwnedReceiveScript(ctx context.Context, arg UpsertOwnedReceiveScriptParams) error
+	// UpsertOwnedWalletScript records a backing-wallet script the daemon minted.
+	// Minting is idempotent from the registry's point of view: re-recording the
+	// same script is a no-op, and the first source recorded wins so a script's
+	// provenance never changes underneath an operator reading the table.
+	UpsertOwnedWalletScript(ctx context.Context, arg UpsertOwnedWalletScriptParams) error
 	UpsertPendingBoardIntent(ctx context.Context, arg UpsertPendingBoardIntentParams) error
 	UpsertPendingIntentAnchor(ctx context.Context, arg UpsertPendingIntentAnchorParams) error
 	// Re-arm a re-persisted intent as pending. NewPendingIntentID is

@@ -20,6 +20,39 @@ func (q *Queries) CountWalletUTXOLog(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const GetWalletUTXOLogCreatedByOutpoint = `-- name: GetWalletUTXOLogCreatedByOutpoint :one
+SELECT entry_id, outpoint_hash, outpoint_index, amount_sat,
+       event, block_height, classified_as, created_at
+FROM wallet_utxo_log
+WHERE outpoint_hash = $1
+  AND outpoint_index = $2
+  AND event = 'created'
+`
+
+type GetWalletUTXOLogCreatedByOutpointParams struct {
+	OutpointHash  []byte
+	OutpointIndex int32
+}
+
+// GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
+// outpoint, if any. The boarding deposit path uses it to recognise a funding
+// input as a previously recorded own-wallet proceeds UTXO.
+func (q *Queries) GetWalletUTXOLogCreatedByOutpoint(ctx context.Context, arg GetWalletUTXOLogCreatedByOutpointParams) (WalletUtxoLog, error) {
+	row := q.db.QueryRowContext(ctx, GetWalletUTXOLogCreatedByOutpoint, arg.OutpointHash, arg.OutpointIndex)
+	var i WalletUtxoLog
+	err := row.Scan(
+		&i.EntryID,
+		&i.OutpointHash,
+		&i.OutpointIndex,
+		&i.AmountSat,
+		&i.Event,
+		&i.BlockHeight,
+		&i.ClassifiedAs,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const InsertWalletUTXOLog = `-- name: InsertWalletUTXOLog :exec
 INSERT INTO wallet_utxo_log (
     outpoint_hash, outpoint_index, amount_sat,

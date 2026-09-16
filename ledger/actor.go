@@ -149,6 +149,29 @@ const (
 	ClassificationRoundFunding = "round_funding"
 	ClassificationChange       = "change"
 	ClassificationUnknown      = "unknown"
+
+	// ClassificationExitProceeds marks the sweep output a unilateral exit
+	// paid to a wallet script. It is audit-only: the ExitCostMsg proceeds
+	// leg already credited wallet_balance for that value, so a second
+	// deposit leg would count the same coins twice.
+	ClassificationExitProceeds = "exit_proceeds"
+
+	// ClassificationLeaveProceeds marks the on-chain output of a
+	// cooperative leave that paid a script the daemon minted. Audit-only
+	// for the same reason: the VTXOSentMsg proceeds leg already credited
+	// wallet_balance when the round confirmed.
+	ClassificationLeaveProceeds = "leave_proceeds"
+
+	// ClassificationRecycledChange marks the change of a partial spend of
+	// either of the above. Unlike them it does book its own credit leg,
+	// because no earlier message did.
+	ClassificationRecycledChange = "recycled_change"
+
+	// ClassificationDepositFunding marks the spend of an own-wallet
+	// proceeds UTXO into a boarding address. That deposit's own leg
+	// credits wallet_balance a second time for coins already credited, so
+	// this classification books the reversing leg.
+	ClassificationDepositFunding = "deposit_funding"
 )
 
 // LedgerEntry is the domain-level representation of a

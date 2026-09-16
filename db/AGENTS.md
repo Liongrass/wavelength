@@ -184,6 +184,19 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/db.<Symb
   Bitcoin selection omits asset rows. Asset descriptors do not expose a
   plain standard-policy `TapScript`.
 
+- `owned_wallet_scripts` is written at mint time, never inferred. It is the
+  only ownership oracle the client has, because the three wallet backends
+  answer script ownership differently or not at all. An absent script means
+  "not known to be ours", which books a destination as a genuine outflow.
+  There is no backfill: the table starts empty on an upgraded database and
+  fills as the daemon mints, so scripts minted before migration `000022`
+  read as foreign for good.
+- `ledger_deposit_funding_inputs` is ledger-internal plumbing, not an audit
+  trail. It records which outpoints funded which boarding deposit, with no
+  amount, so the two independent messages describing a recycled own-wallet
+  coin can reconcile whichever order they commit in. Foreign inputs are
+  recorded too, because ownership can become known later; that is exactly why
+  it is not a `wallet_utxo_log` row.
 - **Never write raw SQL in Go** — add queries to `db/queries/`,
   regenerate with `make sqlc`.
 - Transaction atomicity: entire checkpoint succeeds or none.

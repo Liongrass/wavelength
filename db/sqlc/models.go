@@ -279,6 +279,12 @@ type OwnedReceiveScriptSource struct {
 	Name   string
 }
 
+type OwnedWalletScript struct {
+	PkScript  []byte
+	Source    string
+	CreatedAt int64
+}
+
 type PendingBoardIntent struct {
 	IntentID        []byte
 	TargetVtxoCount int32
