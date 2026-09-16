@@ -12,8 +12,10 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
+	"github.com/lightninglabs/wavelength/ledger"
 	libtypes "github.com/lightninglabs/wavelength/lib/types"
 	"github.com/lightninglabs/wavelength/vtxo"
+	fn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
 )
 
@@ -128,6 +130,15 @@ type LocalPersistenceOutboxHandler struct {
 	// received OOR VTXOs are actively monitored when the handler is used
 	// outside the OOR durable actor.
 	NotifyIncomingVTXOs IncomingVTXONotifier
+
+	// LedgerSink books the receives this handler materializes outside the
+	// OOR durable actor -- wallet recovery is the one such caller in
+	// production. Inside the actor the session behaviour stages its own
+	// VTXOReceivedMsg per descriptor, so this sink is used only on the
+	// path that does not go through it. Without it a recovered daemon
+	// carries VTXOs its ledger never saw arrive, and vtxo_balance
+	// understates the wallet by their value for good.
+	LedgerSink fn.Option[ledger.Sink]
 }
 
 // Handle executes one outbox request and emits follow-up FSM events.
@@ -573,12 +584,63 @@ func (h *LocalPersistenceOutboxHandler) materializeIncoming(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
+
+		// Book them, for the same reason and on the same condition:
+		// this is the path the durable session actor did not take, so
+		// nothing else will.
+		err = h.emitVTXOsReceived(
+			ctx, msg.SessionID, materializedVTXOs,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return []Event{&IncomingHandledEvent{
 		MaterializedVTXOs:     materializedVTXOs,
 		MaterializedOutpoints: materializedOutpoints,
 	}}, nil
+}
+
+// emitVTXOsReceived books one receive per materialized descriptor.
+//
+// It mirrors the session behaviour's own emission exactly, session id
+// included, so a recovered receive is classified the same way a live one is:
+// the ledger recognises an incoming session it already booked an outgoing
+// send under as the sender's own change coming back, and that judgement is
+// made from its own rows rather than from anything this caller supplies.
+//
+// A refused enqueue fails the materialization. The VTXO is durable by the
+// time this runs and nothing re-derives the missing leg, so the recoverable
+// outcome is to retry the whole request rather than to leave a VTXO the
+// ledger never saw.
+func (h *LocalPersistenceOutboxHandler) emitVTXOsReceived(ctx context.Context,
+	sessionID SessionID, descs []*vtxo.Descriptor) error {
+
+	if h.LedgerSink.IsNone() {
+		return nil
+	}
+	sink := h.LedgerSink.UnsafeFromSome()
+
+	for _, desc := range descs {
+		if desc == nil {
+			continue
+		}
+
+		err := sink.Tell(ctx, &ledger.VTXOReceivedMsg{
+			OutpointHash:  desc.Outpoint.Hash,
+			OutpointIndex: desc.Outpoint.Index,
+			AmountSat:     int64(desc.Amount),
+			Source:        ledger.SourceOOR,
+			SessionID:     sessionID,
+		})
+		if err != nil {
+			return fmt.Errorf("enqueue VTXOReceivedMsg for %v: %w",
+				desc.Outpoint, err)
+		}
+	}
+
+	return nil
 }
 
 // persistIncomingAncestorPackages stores chained OOR artifacts before the

@@ -31,6 +31,11 @@ type Querier interface {
 	CountActivityEntriesByStatus(ctx context.Context, status int64) (int64, error)
 	CountBoardingIntentsByStatus(ctx context.Context, status string) (int64, error)
 	CountClientLedgerEntries(ctx context.Context) (int64, error)
+	// Counts the legs booked at one idempotency key and event type, ignoring the
+	// account pair. A handler that picks its accounts from mutable state needs to
+	// know that *some* leg already exists at this chain identity, not that a leg
+	// with the accounts it happens to have chosen this time exists.
+	CountClientLedgerEntriesForKey(ctx context.Context, arg CountClientLedgerEntriesForKeyParams) (int64, error)
 	// CountDepositFundingInput reports whether an outpoint is recorded as the
 	// funding input of any boarding deposit. An own-wallet proceeds row arriving
 	// after the deposit it funded uses this to discover that it must reverse its

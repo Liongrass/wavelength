@@ -34,6 +34,16 @@ WHERE idempotency_key = $1
   AND debit_account = $3
   AND credit_account = $4;
 
+-- name: CountClientLedgerEntriesForKey :one
+-- Counts the legs booked at one idempotency key and event type, ignoring the
+-- account pair. A handler that picks its accounts from mutable state needs to
+-- know that *some* leg already exists at this chain identity, not that a leg
+-- with the accounts it happens to have chosen this time exists.
+SELECT COUNT(*)
+FROM ledger_entries
+WHERE idempotency_key = $1
+  AND event_type = $2;
+
 -- name: GetClientLedgerEntryBySessionID :one
 SELECT entry_id, debit_account, credit_account, amount_sat,
        round_id, session_id, idempotency_key,

@@ -318,6 +318,13 @@ same-key message is still queued, retry backoff included. A message
 that exhausts its attempts is passed over rather than wedging its
 lane, so a poisoned send cannot block its session's receives forever.
 
+Wallet recovery materializes incoming transfers through
+`oor.LocalPersistenceOutboxHandler` directly, without the session
+actor that would otherwise stage these messages, so that handler
+carries its own `LedgerSink` and emits the same `VTXOReceivedMsg` per
+descriptor. Without it a recovered daemon would hold VTXOs its ledger
+never saw arrive.
+
 ### Cooperative leave
 
 The client forfeits a VTXO and the round pays an on-chain output

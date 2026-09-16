@@ -303,6 +303,15 @@ type LedgerStore interface {
 	// insert commits against.
 	HasSessionEntry(ctx context.Context, sessionID [32]byte, eventType,
 		debitAccount, creditAccount string) (bool, error)
+
+	// HasEntryForKey reports whether any leg is already booked at this
+	// idempotency key and event type, whatever account pair it carries.
+	// The unique index that dedups inserts includes the accounts, so a
+	// handler whose account choice depends on mutable state cannot lean
+	// on the insert alone to keep a second producer from booking the same
+	// coins twice. It joins any outer actor transaction present in ctx.
+	HasEntryForKey(ctx context.Context, key []byte,
+		eventType string) (bool, error)
 }
 
 // UTXOAuditEntry is the domain-level representation of a wallet

@@ -61,6 +61,31 @@ func (m *mockLedgerStore) HasSessionEntry(_ context.Context, sessionID [32]byte,
 	)
 }
 
+// HasEntryForKey scans the recorded entries ignoring the account pair.
+func (m *mockLedgerStore) HasEntryForKey(_ context.Context, key []byte,
+	eventType string) (bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return hasEntryForKey(m.entries, key, eventType)
+}
+
+// hasEntryForKey mirrors CountClientLedgerEntriesForKey over an in-memory
+// slice: key plus event type, accounts ignored.
+func hasEntryForKey(entries []LedgerEntry, key []byte,
+	eventType string) (bool, error) {
+
+	for _, entry := range entries {
+		if entry.EventType == eventType &&
+			bytes.Equal(entry.IdempotencyKey, key) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // hasSessionEntry mirrors GetClientLedgerEntryBySessionID over an in-memory
 // slice: a match needs the session id plus the full event/account tuple.
 func hasSessionEntry(entries []LedgerEntry, sessionID [32]byte, eventType,
@@ -1325,6 +1350,16 @@ func (d *dedupLedgerStore) HasSessionEntry(_ context.Context,
 	)
 }
 
+// HasEntryForKey scans the persisted entries ignoring the account pair.
+func (d *dedupLedgerStore) HasEntryForKey(_ context.Context, key []byte,
+	eventType string) (bool, error) {
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return hasEntryForKey(d.entries, key, eventType)
+}
+
 // TestHandleExitCostNamespacesBothLegs verifies that handleExitCost emits the
 // send and fee entries under distinct operation-and-leg identities. Both keys
 // retain the same outpoint payload, while the namespace prevents either leg
@@ -1664,6 +1699,12 @@ func (f *failingLedgerStore) InsertLedgerEntry(_ context.Context,
 
 func (f *failingLedgerStore) HasSessionEntry(_ context.Context, _ [32]byte, _,
 	_, _ string) (bool, error) {
+
+	return false, f.err
+}
+
+func (f *failingLedgerStore) HasEntryForKey(_ context.Context, _ []byte,
+	_ string) (bool, error) {
 
 	return false, f.err
 }
@@ -3280,4 +3321,65 @@ func assertSweepReturnReversal(t *testing.T, sweepFirst bool) {
 		)
 	}
 	require.Equal(t, 1, reversals)
+}
+
+// TestVTXOReceiveBooksOnceAcrossProducers pins the rule that a receive is
+// booked at most once per outpoint, whatever accounts a later producer would
+// pick for it.
+//
+// The live path books an OOR receive as transfers_in while the session has no
+// send leg yet. Wallet recovery can re-emit the same descriptor afterwards,
+// by which time the session does carry a send leg and the receive classifies
+// as self-change -- a different account pair, and therefore a different row
+// under the insert's unique index. Chain identity is what must not be booked
+// twice.
+func TestVTXOReceiveBooksOnceAcrossProducers(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	sessionID := [32]byte{0xc1}
+	receive := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0xc2,
+		},
+		OutpointIndex: 1,
+		AmountSat:     25_000,
+		Source:        SourceOOR,
+		SessionID:     sessionID,
+	}
+
+	// The live receive lands first, with nothing in the session to make it
+	// self-change.
+	require.NoError(t, run(ctx, a, receive))
+
+	// The session then gains its outgoing send leg.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				Outpoint:  proceedsOutpoint(0xc3, 0),
+				AmountSat: 30_000,
+				SessionID: sessionID,
+			},
+		),
+	)
+
+	// Recovery re-emits the same receive. It would now classify as
+	// self-change and land in a different account pair, so only the
+	// chain-identity check keeps it from booking a second credit.
+	require.NoError(t, run(ctx, a, receive))
+
+	var received int
+	for _, entry := range store.getEntries() {
+		if entry.EventType == EventVTXOReceived {
+			received++
+		}
+	}
+	require.Equal(
+		t, 1, received,
+		"one outpoint must carry exactly one receive leg",
+	)
 }

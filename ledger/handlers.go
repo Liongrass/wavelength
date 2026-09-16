@@ -197,6 +197,10 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 		debitAccount  string
 		creditAccount string
 		source        = msg.Source
+
+		// skip is set by classify when this outpoint already carries a
+		// receive leg, so the commit body writes nothing.
+		skip bool
 	)
 
 	// An OOR receive under a session this ledger already booked an
@@ -217,7 +221,38 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 	// backoff included. A head that exhausts its attempts is passed over
 	// rather than blocking the lane forever, so a poisoned send cannot
 	// wedge its session's receives.
+	// Per-VTXO idempotency key so multiple owned receives in
+	// the same round (three-way directed send, multi-leg refresh,
+	// a round with both a boarding intent and a received transfer)
+	// don't collide on idx_client_ledger_idempotent_round. The
+	// partial round/session indexes stay as defense-in-depth
+	// against a caller that omits the outpoint.
+	idempotencyKey := walletUTXOIdempotencyKey(
+		msg.OutpointHash, msg.OutpointIndex,
+	)
+
 	classify := func(ctx context.Context, q ledgerTx) error {
+		// A receive already booked at this outpoint is done, whatever
+		// account pair it was booked with. The insert's unique index
+		// includes the accounts, so it would let a second producer --
+		// wallet recovery re-emitting a descriptor the live path
+		// already booked -- through as a fresh row whenever the
+		// classification below flipped in between. Chain identity is
+		// the thing that cannot be booked twice, so it is what we
+		// check.
+		booked, err := q.ledger.HasEntryForKey(
+			ctx, idempotencyKey, EventVTXOReceived,
+		)
+		if err != nil {
+			return fmt.Errorf("look up booked receive %x:%d: %w",
+				msg.OutpointHash, msg.OutpointIndex, err)
+		}
+		if booked {
+			skip = true
+
+			return nil
+		}
+
 		if source != SourceOOR || msg.SessionID == zeroSessionID {
 			return nil
 		}
@@ -292,16 +327,6 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 		)
 	}
 
-	// Per-VTXO idempotency key so multiple owned receives in
-	// the same round (three-way directed send, multi-leg refresh,
-	// a round with both a boarding intent and a received transfer)
-	// don't collide on idx_client_ledger_idempotent_round. The
-	// partial round/session indexes stay as defense-in-depth
-	// against a caller that omits the outpoint.
-	idempotencyKey := walletUTXOIdempotencyKey(
-		msg.OutpointHash, msg.OutpointIndex,
-	)
-
 	// Surface the VTXO outpoint on the row's structured chain
 	// fields too. Without these the consumer-facing onchain view
 	// renders a "round"-kind entry with an empty txid and has to
@@ -314,6 +339,18 @@ func (a *LedgerActor) handleVTXOReceived(ctx context.Context,
 
 		if err := classify(ctx, q); err != nil {
 			return err
+		}
+		if skip {
+			a.log.DebugS(ctx, "Skipping VTXO receive already "+
+				"booked at this outpoint",
+				slog.String(
+					"outpoint", fmt.Sprintf("%x:%d",
+						msg.OutpointHash,
+						msg.OutpointIndex),
+				),
+			)
+
+			return nil
 		}
 
 		entry := LedgerEntry{
