@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
 	"github.com/lightningnetwork/lnd/clock"
@@ -174,6 +175,36 @@ const (
 	ClassificationDepositFunding = "deposit_funding"
 )
 
+// IsOwnWalletProceeds reports whether a 'created' classification names an
+// own-wallet proceeds UTXO: a wallet output whose value the ledger has
+// already credited to wallet_balance at that outpoint.
+//
+// The members share one lifecycle. Each is a coin the client both owns and
+// has already booked, so spending one into a boarding address credits the
+// same satoshis a second time through that deposit's own leg. Naming the
+// family in one place is what lets handleUTXOCreated reverse the credit
+// without caring which member produced it.
+//
+// Every wallet-level classification has to answer two independent questions,
+// and adding one here is only half the answer. This predicate says "the value
+// at this outpoint is already in wallet_balance, so reverse it if it funds a
+// boarding deposit". creditAlreadyBooked (ledger/handlers.go) says "an
+// earlier message is what credited it, so handleUTXOCreated must not credit
+// it again". They differ: recycled change and boarding sweep returns belong
+// here but not there, because no earlier UTXOCreatedMsg-shaped producer
+// booked them. A new classification must be considered against both.
+func IsOwnWalletProceeds(classification string) bool {
+	switch classification {
+	case ClassificationExitProceeds, ClassificationLeaveProceeds,
+		ClassificationRecycledChange,
+		ClassificationBoardingSweepReturn:
+		return true
+
+	default:
+		return false
+	}
+}
+
 // LedgerEntry is the domain-level representation of a
 // double-entry ledger record for the client. This decouples the
 // ledger actor from sqlc-generated types.
@@ -310,6 +341,28 @@ type UTXOAuditStore interface {
 	InsertUTXOAuditEntry(
 		ctx context.Context, entry UTXOAuditEntry,
 	) error
+
+	// LookupCreatedUTXO returns the 'created' audit row at an outpoint.
+	// The boolean is false when no such row exists, which is not an
+	// error: most outpoints the handler asks about are not ours. The
+	// unique index on (outpoint, event) makes the answer at most one row.
+	LookupCreatedUTXO(ctx context.Context, outpoint wire.OutPoint) (
+		UTXOAuditEntry, bool, error)
+
+	// InsertDepositFundingInput records that a boarding deposit's funding
+	// transaction spent one previous outpoint. It carries no amount and
+	// no accounting meaning, so it is safe to record for an input the
+	// client does not own. Re-inserting the same pair is a no-op, since
+	// the durable mailbox replays unprocessed messages on restart.
+	InsertDepositFundingInput(ctx context.Context,
+		input, deposit wire.OutPoint, createdAt int64) error
+
+	// IsDepositFundingInput reports whether an outpoint is recorded as
+	// the funding input of any boarding deposit. An own-wallet proceeds
+	// row arriving after the deposit it funded uses this to discover that
+	// it owes a reversing leg.
+	IsDepositFundingInput(ctx context.Context,
+		outpoint wire.OutPoint) (bool, error)
 }
 
 // ActorConfig configures the client-side LedgerActor.

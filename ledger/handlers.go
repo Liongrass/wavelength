@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
 	fn "github.com/lightningnetwork/lnd/fn/v2"
 )
@@ -676,6 +677,7 @@ const (
 	operationRoundRefresh   = "round_refresh"
 	operationUnilateralExit = "unilateral_exit"
 	legSend                 = "send"
+	legSpend                = "spend"
 	legFee                  = "fee"
 	legProceeds             = "proceeds"
 )
@@ -870,8 +872,13 @@ func (a *LedgerActor) handleUTXOCreated(ctx context.Context,
 		ConfirmationHeight: &confirmationHeight,
 	}
 
-	// The audit row and the ledger deposit leg commit together in one
-	// lease-fenced transaction.
+	outpoint := wire.OutPoint{
+		Hash:  chainhash.Hash(msg.OutpointHash),
+		Index: msg.OutpointIndex,
+	}
+
+	// The audit row, the credit leg, and any reversal this outpoint turns
+	// out to owe all commit together in one lease-fenced transaction.
 	return a.commit(ctx, ax, errMsg, func(ctx context.Context,
 		q ledgerTx) error {
 
@@ -879,7 +886,200 @@ func (a *LedgerActor) handleUTXOCreated(ctx context.Context,
 			return err
 		}
 
-		return q.ledger.InsertLedgerEntry(ctx, entry)
+		// Exit and leave proceeds book no credit leg here: the
+		// ExitCostMsg or VTXOSentMsg proceeds leg already credited
+		// wallet_balance for exactly this value when the sweep or the
+		// round confirmed, and a second leg would count the same coins
+		// twice. Recycled change is not in that position -- no earlier
+		// message described it -- so it books its credit like any
+		// other wallet UTXO.
+		if !creditAlreadyBooked(msg.Classification) {
+			err := q.ledger.InsertLedgerEntry(ctx, entry)
+			if err != nil {
+				return err
+			}
+		}
+
+		if msg.Classification == ClassificationDeposit {
+			return a.bookDepositFunding(ctx, q, msg, now)
+		}
+
+		if IsOwnWalletProceeds(msg.Classification) {
+			return a.reverseIfDepositFunded(
+				ctx, q, outpoint, msg.AmountSat,
+				int32(msg.BlockHeight), now,
+			)
+		}
+
+		return nil
+	})
+}
+
+// creditAlreadyBooked reports whether an earlier ledger message already
+// credited wallet_balance for the value of a UTXO with this classification,
+// so handleUTXOCreated must not credit it again.
+//
+// It is deliberately narrower than IsOwnWalletProceeds (ledger/actor.go).
+// Every member of that family names coins the ledger will have credited by
+// the time the story ends, but only some of them were credited by an earlier
+// message. Recycled change has no such producer and books its own credit
+// here; boarding sweep returns never reach handleUTXOCreated at all, because
+// their credit rides BoardingSweepConfirmedMsg. A new classification must be
+// considered against both predicates: they answer different questions.
+func creditAlreadyBooked(classification string) bool {
+	switch classification {
+	case ClassificationExitProceeds, ClassificationLeaveProceeds:
+		return true
+
+	default:
+		return false
+	}
+}
+
+// bookDepositFunding records the previous outpoints a boarding deposit's
+// funding transaction spent, and reverses the wallet_balance credit of every
+// one that is already a recorded own-wallet proceeds UTXO.
+//
+// The funding-input index is written for every input, recognised or not,
+// because recognition can arrive later: the proceeds message describing one of
+// these coins may still be in flight. The index carries no amount and no
+// accounting meaning, which is what lets it name a stranger's coin safely.
+// The audit row and the reversing leg are written only for inputs this ledger
+// actually credited, so every deposit_funding audit row has a real amount and
+// a real leg beside it.
+func (a *LedgerActor) bookDepositFunding(ctx context.Context, q ledgerTx,
+	msg *UTXOCreatedMsg, now int64) error {
+
+	deposit := wire.OutPoint{
+		Hash:  chainhash.Hash(msg.OutpointHash),
+		Index: msg.OutpointIndex,
+	}
+
+	for _, input := range msg.FundingInputs {
+		err := q.audit.InsertDepositFundingInput(
+			ctx, input, deposit, now,
+		)
+		if err != nil {
+			return fmt.Errorf("record funding input %v: %w", input,
+				err)
+		}
+
+		created, found, err := q.audit.LookupCreatedUTXO(ctx, input)
+		if err != nil {
+			return fmt.Errorf("look up funding input %v: %w", input,
+				err)
+		}
+		if !found || !IsOwnWalletProceeds(created.ClassifiedAs) {
+			continue
+		}
+
+		err = a.bookProceedsReversal(
+			ctx, q, input, created.AmountSat,
+			int32(msg.BlockHeight), now,
+		)
+		if err != nil {
+			return err
+		}
+
+		a.log.InfoS(ctx, "Reversing recycled own-wallet proceeds "+
+			"credit for boarding deposit",
+			slog.String("outpoint", input.String()),
+			slog.String(
+				"proceeds_classification", created.ClassifiedAs,
+			),
+			slog.Int64("amount_sat", created.AmountSat),
+		)
+	}
+
+	return nil
+}
+
+// reverseIfDepositFunded is the mirror of bookDepositFunding: an own-wallet
+// proceeds row arriving after the deposit it funded finds the deposit's
+// funding-input index already written and books the same reversing leg from
+// this side.
+//
+// Whichever of the two messages commits second performs the reversal, and the
+// leg's idempotency key is the same either way, so the two attempts collapse
+// into one row rather than racing. Neither side reads the other's in-flight
+// state: each reads only what the other has already committed.
+func (a *LedgerActor) reverseIfDepositFunded(ctx context.Context, q ledgerTx,
+	outpoint wire.OutPoint, amountSat int64, blockHeight int32,
+	now int64) error {
+
+	funded, err := q.audit.IsDepositFundingInput(ctx, outpoint)
+	if err != nil {
+		return fmt.Errorf("look up deposit funding for %v: %w",
+			outpoint, err)
+	}
+	if !funded {
+		return nil
+	}
+
+	if err := a.bookProceedsReversal(
+		ctx, q, outpoint, amountSat, blockHeight, now,
+	); err != nil {
+		return err
+	}
+
+	a.log.InfoS(ctx, "Reversing own-wallet proceeds credit for a "+
+		"boarding deposit already booked",
+		slog.String("outpoint", outpoint.String()),
+		slog.Int64("amount_sat", amountSat),
+	)
+
+	return nil
+}
+
+// bookProceedsReversal writes the audit row and the ledger leg that undo a
+// wallet_balance credit the ledger already made for an outpoint now funding a
+// boarding deposit.
+//
+// Debiting opening_balance mirrors that deposit's own credit, so the pair
+// nets to nothing and the recycled coins are counted once. The key is
+// namespaced by classification because the boarding sweep's input leg keys on
+// the bare outpoint and the two can name the same coin; the dedup tuple
+// already differs by accounts, so without the namespace two legs for one
+// outpoint would both persist and each would look like a valid replay target
+// for the other's message.
+func (a *LedgerActor) bookProceedsReversal(ctx context.Context, q ledgerTx,
+	outpoint wire.OutPoint, amountSat int64, blockHeight int32,
+	now int64) error {
+
+	hash := [32]byte(outpoint.Hash)
+	chainVout := int32(outpoint.Index)
+	confirmationHeight := blockHeight
+
+	err := q.audit.InsertUTXOAuditEntry(ctx, UTXOAuditEntry{
+		OutpointHash:  hash[:],
+		OutpointIndex: chainVout,
+		AmountSat:     amountSat,
+		Event:         "spent",
+		BlockHeight:   blockHeight,
+		ClassifiedAs:  ClassificationDepositFunding,
+		CreatedAt:     now,
+	})
+	if err != nil {
+		return fmt.Errorf("audit funding spend %v: %w", outpoint, err)
+	}
+
+	return q.ledger.InsertLedgerEntry(ctx, LedgerEntry{
+		DebitAccount:  AccountOpeningBalance,
+		CreditAccount: AccountWalletBalance,
+		AmountSat:     amountSat,
+		EventType:     EventWalletUTXOSpent,
+		Description: fmt.Sprintf(
+			"wallet UTXO spent at %v (classification %s) at "+
+				"height %d", outpoint,
+			ClassificationDepositFunding, blockHeight,
+		),
+		CreatedAt: now,
+		IdempotencyKey: classifiedUTXOIdempotencyKey(
+			ClassificationDepositFunding, hash, outpoint.Index,
+		),
+		ChainTxid:          hash[:],
+		ChainVout:          &chainVout,
+		ConfirmationHeight: &confirmationHeight,
 	})
 }
 
@@ -983,6 +1183,21 @@ func (a *LedgerActor) handleUTXOSpent(ctx context.Context, msg *UTXOSpentMsg,
 	})
 }
 
+// classifiedUTXOIdempotencyKey derives an outpoint-scoped dedup key that is
+// namespaced by classification. One outpoint can be the subject of two
+// different wallet-spend legs -- a boarding sweep consuming it, and a boarding
+// deposit funded by it -- and those legs book different accounts. The bare
+// outpoint key is reserved for the historical boarding-sweep leg, so every
+// later classification takes a namespaced key rather than colliding with it.
+func classifiedUTXOIdempotencyKey(classification string, hash [32]byte,
+	index uint32) []byte {
+
+	return ledgerIdempotencyKey(
+		classification, legSpend,
+		outpointIdempotencyPayload(hash, index),
+	)
+}
+
 // handleBoardingSweepConfirmed books every leg of a confirmed boarding
 // sweep inside a single Commit so the wallet_clearing account is updated
 // atomically: the fee leg, one audit + clearing-debit leg per spent input,
@@ -1050,6 +1265,7 @@ func (a *LedgerActor) handleBoardingSweepConfirmed(ctx context.Context,
 	// Build every leg up front so the commit closure stays a thin,
 	// shallow insert sequence and the whole set is booked atomically.
 	legs := a.boardingSweepLegs(msg)
+	now := a.clk.Now().Unix()
 
 	return a.commit(ctx, ax, errMsg, func(ctx context.Context,
 		q ledgerTx) error {
@@ -1071,7 +1287,25 @@ func (a *LedgerActor) handleBoardingSweepConfirmed(ctx context.Context,
 			}
 		}
 
-		return nil
+		// A wallet-return output is own-wallet proceeds like any
+		// other, so if the boarding deposit that spent it was booked
+		// first, this is the side that owes the reversing leg. The
+		// deposit-first order is handled symmetrically by
+		// bookDepositFunding, which reads the audit row written just
+		// above.
+		if msg.DestinationExternal || q.audit == nil {
+			return nil
+		}
+
+		returnPoint := wire.OutPoint{
+			Hash:  chainhash.Hash(msg.Txid),
+			Index: 0,
+		}
+
+		return a.reverseIfDepositFunded(
+			ctx, q, returnPoint, msg.DestinationSat,
+			int32(msg.BlockHeight), now,
+		)
 	})
 }
 

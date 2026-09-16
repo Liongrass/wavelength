@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/ledger"
 )
@@ -155,4 +157,95 @@ func (s *UTXOAuditStoreDB) CountUTXOAuditEntries(ctx context.Context) (int64,
 	)
 
 	return count, err
+}
+
+// LookupCreatedUTXO returns the 'created' audit row at an outpoint. The
+// boolean is false when no such row exists, which is not an error: most
+// outpoints the ledger asks about are not ours.
+func (s *UTXOAuditStoreDB) LookupCreatedUTXO(ctx context.Context,
+	outpoint wire.OutPoint) (ledger.UTXOAuditEntry, bool, error) {
+
+	var (
+		entry ledger.UTXOAuditEntry
+		found bool
+	)
+	err := s.ExecTx(ctx, ReadTxOption(), func(q *sqlc.Queries) error {
+		row, err := q.GetWalletUTXOLogCreatedByOutpoint(
+			ctx, sqlc.GetWalletUTXOLogCreatedByOutpointParams{
+				OutpointHash:  outpoint.Hash[:],
+				OutpointIndex: int32(outpoint.Index),
+			},
+		)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+
+		case err != nil:
+			return err
+		}
+
+		entry = ledger.UTXOAuditEntry{
+			OutpointHash:  row.OutpointHash,
+			OutpointIndex: row.OutpointIndex,
+			AmountSat:     row.AmountSat,
+			Event:         row.Event,
+			BlockHeight:   row.BlockHeight,
+			ClassifiedAs:  row.ClassifiedAs,
+			CreatedAt:     row.CreatedAt,
+		}
+		found = true
+
+		return nil
+	})
+	if err != nil {
+		return ledger.UTXOAuditEntry{}, false, err
+	}
+
+	return entry, found, nil
+}
+
+// InsertDepositFundingInput records one previous outpoint a boarding
+// deposit's funding transaction spent.
+func (s *UTXOAuditStoreDB) InsertDepositFundingInput(ctx context.Context,
+	input, deposit wire.OutPoint, createdAt int64) error {
+
+	return s.ExecTx(ctx, WriteTxOption(), func(q *sqlc.Queries) error {
+		return q.InsertDepositFundingInput(
+			ctx, sqlc.InsertDepositFundingInputParams{
+				InputHash:    input.Hash[:],
+				InputIndex:   int32(input.Index),
+				DepositHash:  deposit.Hash[:],
+				DepositIndex: int32(deposit.Index),
+				CreatedAt:    createdAt,
+			},
+		)
+	})
+}
+
+// IsDepositFundingInput reports whether an outpoint is recorded as the
+// funding input of any boarding deposit.
+func (s *UTXOAuditStoreDB) IsDepositFundingInput(ctx context.Context,
+	outpoint wire.OutPoint) (bool, error) {
+
+	var found bool
+	err := s.ExecTx(ctx, ReadTxOption(), func(q *sqlc.Queries) error {
+		count, err := q.CountDepositFundingInput(
+			ctx, sqlc.CountDepositFundingInputParams{
+				InputHash:  outpoint.Hash[:],
+				InputIndex: int32(outpoint.Index),
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		found = count > 0
+
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return found, nil
 }

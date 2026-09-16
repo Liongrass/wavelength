@@ -89,6 +89,10 @@ type Config struct {
 	// final sweep has confirmed.
 	LedgerSink fn.Option[ledger.Sink]
 
+	// OwnedWalletScripts identifies which sweep output paid our own
+	// wallet. See RegistryConfig.OwnedWalletScripts.
+	OwnedWalletScripts fn.Option[OwnedWalletScriptChecker]
+
 	// proofNodeFloorAlerts is shared by every child of one registry so all
 	// legacy fallback scans produce one operator alert.
 	proofNodeFloorAlerts *proofNodeFloorAlertDeduper
@@ -201,6 +205,7 @@ type behavior struct {
 
 	terminalNotified           bool
 	exitCostNotified           bool
+	proceedsRecorded           bool
 	abandonedBroadcastsRemoved bool
 
 	// failedBroadcastTxids records every txid txconfirm has reported as
@@ -2770,34 +2775,169 @@ func (b *behavior) removeAbandonedBroadcasts(ctx context.Context,
 func (b *behavior) emitExitCostIfCompleted(ctx context.Context, phase Phase,
 	job *JobState) bool {
 
-	if phase != PhaseCompleted || b.exitCostNotified ||
-		b.cfg.LedgerSink.IsNone() {
+	if phase != PhaseCompleted || b.cfg.LedgerSink.IsNone() {
 		return true
 	}
-
-	msg, err := b.exitCostMsg(job)
-	if err != nil {
-		b.log.ErrorS(ctx, "Unbuildable unroll exit cost on completed "+
-			"actor", err)
-		b.exitCostNotified = true
-
+	if b.exitCostNotified && b.proceedsRecorded {
 		return true
 	}
 
 	notifyCtx := actor.WithoutTx(context.WithoutCancel(ctx))
-	if err := b.cfg.LedgerSink.UnsafeFromSome().Tell(
-		notifyCtx, msg,
-	); err != nil {
+	sink := b.cfg.LedgerSink.UnsafeFromSome()
 
+	if !b.exitCostNotified {
+		msg, err := b.exitCostMsg(job)
+		if err != nil {
+			b.log.ErrorS(ctx, "Unbuildable unroll exit cost on "+
+				"completed actor", err)
+			b.exitCostNotified = true
+			b.proceedsRecorded = true
+
+			return true
+		}
+
+		if err := sink.Tell(notifyCtx, msg); err != nil {
+			b.log.WarnS(ctx, "Deferring unroll terminal handoff; "+
+				"ledger exit-cost tell failed", err)
+
+			return false
+		}
+
+		b.exitCostNotified = true
+	}
+
+	return b.recordExitProceedsUTXO(ctx, notifyCtx, sink, job)
+}
+
+// recordExitProceedsUTXO records the sweep output the exit paid into the
+// wallet UTXO audit log. It carries its own once-flag rather than sharing the
+// exit cost's, so a transient failure here retries only this message and does
+// not re-send the cost leg.
+//
+// The row is audit-only by classification: handleUTXOCreated books no ledger
+// leg for exit proceeds, because the ExitCostMsg proceeds leg already
+// credited wallet_balance for exactly this value. What the row buys is
+// recognition later. These proceeds pay a plain wallet script, not a boarding
+// address, so nothing else in the client ever records them; if the user then
+// spends them into a boarding address, that deposit credits wallet_balance a
+// second time for the same coins. The audit row is how the ledger recognises
+// that funding input and books the reversing leg.
+//
+// Failing to build the message is not an error worth retrying -- the sweep is
+// confirmed and the registry will not learn about the script later -- so the
+// once-flag is set and the handoff proceeds.
+func (b *behavior) recordExitProceedsUTXO(ctx, notifyCtx context.Context,
+	sink ledger.Sink, job *JobState) bool {
+
+	if b.proceedsRecorded {
+		return true
+	}
+
+	msg, err := b.exitProceedsMsg(ctx, job)
+	if err != nil {
+		b.log.WarnS(ctx, "Unable to identify the sweep output paying "+
+			"our wallet; recording no exit-proceeds row, so "+
+			"boarding these coins later will credit them twice",
+			err)
+		b.proceedsRecorded = true
+
+		return true
+	}
+
+	if err := sink.Tell(notifyCtx, msg); err != nil {
 		b.log.WarnS(ctx, "Deferring unroll terminal handoff; ledger "+
-			"exit-cost tell failed", err)
+			"exit-proceeds tell failed", err)
 
 		return false
 	}
 
-	b.exitCostNotified = true
+	b.proceedsRecorded = true
 
 	return true
+}
+
+// exitProceedsMsg describes the sweep output that paid the client's wallet.
+//
+// The output is selected, not assumed: every candidate is checked against the
+// owned-script registry the daemon writes when it mints a destination. This
+// used to hardcode index 0 on the strength of an invariant about how the exit
+// spend policy lays out its outputs, which is a fragile thing to key an
+// accounting record to.
+//
+// buildSweepTx gives the sweep exactly one output today, so the selected
+// output's value equals the sum of the outputs that exitCostMsg credits as
+// proceeds. The two agree only because of that invariant, which
+// TestBuildSweepTxSingleOutput pins: an anchor output added to the sweep
+// would make the credited proceeds exceed this audit row's amount, and the
+// later reversal would under-reverse by the anchor value.
+//
+// Selection fails closed. No registry, no match, or more than one match all
+// return an error, and the caller then records nothing. That loses the later
+// reversal for these coins, which overstates the client, but naming the wrong
+// output would reverse a credit against a stranger's satoshis.
+func (b *behavior) exitProceedsMsg(ctx context.Context, job *JobState) (
+	*ledger.UTXOCreatedMsg, error) {
+
+	if b.sweepTx == nil {
+		return nil, fmt.Errorf("missing sweep transaction")
+	}
+	if b.cfg.OwnedWalletScripts.IsNone() {
+		return nil, fmt.Errorf("owned wallet script registry is not " +
+			"configured")
+	}
+	scripts := b.cfg.OwnedWalletScripts.UnsafeFromSome()
+
+	var (
+		found bool
+		vout  uint32
+		value int64
+	)
+	for i, txOut := range b.sweepTx.TxOut {
+		if txOut == nil || txOut.Value <= 0 {
+			continue
+		}
+
+		owned, err := scripts.IsOwnedWalletScript(ctx, txOut.PkScript)
+		if err != nil {
+			return nil, fmt.Errorf("check sweep output %d "+
+				"ownership: %w", i, err)
+		}
+		if !owned {
+			continue
+		}
+
+		if found {
+			return nil, fmt.Errorf("sweep transaction has more "+
+				"than one output paying our wallet (%d and %d)",
+				vout, i)
+		}
+
+		found = true
+		vout = uint32(i)
+		value = txOut.Value
+	}
+	if !found {
+		return nil, fmt.Errorf("sweep transaction has no output " +
+			"paying a script this daemon minted")
+	}
+
+	// Zero is a sentinel for "not known", not block 0: the sweep's confirm
+	// height is an Option and this path can run before it is filled in.
+	// Readers deriving a ledger-era floor from audit heights must exclude
+	// it -- see ListBoardingIntentsWithoutDepositLeg.
+	height := uint32(0)
+	confirmHeight := job.PlannerState.Sweep.ConfirmHeight
+	if confirmHeight.IsSome() && confirmHeight.UnsafeFromSome() > 0 {
+		height = uint32(confirmHeight.UnsafeFromSome())
+	}
+
+	return &ledger.UTXOCreatedMsg{
+		OutpointHash:   [32]byte(b.sweepTx.TxHash()),
+		OutpointIndex:  vout,
+		AmountSat:      value,
+		BlockHeight:    height,
+		Classification: ledger.ClassificationExitProceeds,
+	}, nil
 }
 
 // exitCostMsg derives the ledger event from the proof target output and the
@@ -2853,14 +2993,19 @@ func (b *behavior) exitCostMsg(job *JobState) (*ledger.ExitCostMsg, error) {
 	// compare against. Adding it would be a checkpoint format change.
 	//
 	// The invariant the literal stands on: every sweep this package builds
-	// pays output 0 to a script the wallet handed out. buildSweepTx
-	// (unroll/sweep.go) sources DestinationPkScript from
-	// SweepWallet.NewWalletPkScript, and both exit-spend policies write
-	// that script verbatim into the first output they add. So the exited
-	// value landed back in the client's own wallet rather than leaving for
-	// a counterparty, and the ledger books the send leg as an internal
-	// move into wallet_balance instead of an outflow. A future exit-spend
-	// policy that pays a caller-supplied destination must revisit this.
+	// pays a script the wallet handed out. buildSweepTx (unroll/sweep.go)
+	// sources DestinationPkScript from SweepWallet.NewWalletPkScript, and
+	// the one exit-spend policy in this package,
+	// StandardVTXOExitSpendPolicy, writes that script verbatim into the
+	// output it adds. So the exited value landed back in the client's own
+	// wallet rather than leaving for a counterparty, and the ledger books
+	// the send leg as an internal move into wallet_balance instead of an
+	// outflow. A future exit-spend policy that pays a caller-supplied
+	// destination must revisit this.
+	//
+	// The flag says only that the value came home; which output it came
+	// home to is exitProceedsMsg's question, and that one is answered
+	// from the owned-script registry rather than from this invariant.
 	return &ledger.ExitCostMsg{
 		OutpointHash:         target.Hash,
 		OutpointIndex:        target.Index,

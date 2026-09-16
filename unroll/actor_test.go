@@ -798,6 +798,17 @@ type fakeSweepWallet struct {
 	pkScriptRequests atomic.Int64
 }
 
+// fakeOwnedScripts recognises exactly the scripts fakeSweepWallet mints,
+// standing in for the durable registry the daemon writes at mint time.
+type fakeOwnedScripts struct{}
+
+// IsOwnedWalletScript reports whether pkScript is one this daemon minted.
+func (fakeOwnedScripts) IsOwnedWalletScript(_ context.Context,
+	pkScript []byte) (bool, error) {
+
+	return bytes.Equal(pkScript, []byte{txscript.OP_TRUE}), nil
+}
+
 // NewWalletPkScript returns a deterministic destination script.
 func (w *fakeSweepWallet) NewWalletPkScript(context.Context) ([]byte, error) {
 	w.pkScriptRequests.Add(1)
@@ -4156,6 +4167,9 @@ func TestSweepConfirmationCompletesActor(t *testing.T) {
 		"unroll-ledger", 2,
 	)
 	beh.cfg.LedgerSink = fn.Some[ledger.Sink](ledgerSink)
+	beh.cfg.OwnedWalletScripts = fn.Some[OwnedWalletScriptChecker](
+		fakeOwnedScripts{},
+	)
 
 	mustAsk(t, unrollActor.Ref(), &StartUnrollRequest{
 		Height:  100,
@@ -4226,6 +4240,24 @@ func TestSweepConfirmationCompletesActor(t *testing.T) {
 	// it books the proceeds into wallet_balance rather than as an
 	// outflow to a counterparty.
 	require.True(t, exitCostMsg.DestinationOwnWallet)
+
+	// The sweep output that paid the wallet is also recorded in the UTXO
+	// audit log, so a later boarding deposit funded by those proceeds can
+	// recognise its own coins and book the leg that reverses this credit.
+	// The row is audit-only by classification: the proceeds leg above
+	// already credited wallet_balance for this value.
+	ledgerMsg, ok = ledgerSink.AwaitMessage(testTimeout)
+	require.True(t, ok)
+	proceedsMsg, ok := ledgerMsg.(*ledger.UTXOCreatedMsg)
+	require.True(t, ok)
+	require.Equal(t, [32]byte(sweepTxid), proceedsMsg.OutpointHash)
+	require.Zero(t, proceedsMsg.OutpointIndex)
+	require.Equal(t, sweepTx.TxOut[0].Value, proceedsMsg.AmountSat)
+	require.Equal(t, uint32(105), proceedsMsg.BlockHeight)
+	require.Equal(
+		t, ledger.ClassificationExitProceeds,
+		proceedsMsg.Classification,
+	)
 
 	// Late chain notifications can be queued behind the terminal
 	// transition while the registry is draining the actor for cleanup.
@@ -4318,6 +4350,9 @@ func TestExitCostTellFailureDefersTerminalHandoff(t *testing.T) {
 		"unroll-ledger", 2,
 	)
 	beh.cfg.LedgerSink = fn.Some[ledger.Sink](ledgerSink)
+	beh.cfg.OwnedWalletScripts = fn.Some[OwnedWalletScriptChecker](
+		fakeOwnedScripts{},
+	)
 
 	mustAsk(t, unrollActor.Ref(), &HeightObservedMsg{Height: 106})
 
@@ -5114,4 +5149,124 @@ func TestUnrollStartSweepReusesStagedSweepOnLiveDesync(t *testing.T) {
 		t, sweepTxids, 1,
 		"a live-desync re-entry must not derive a second sweep",
 	)
+}
+
+// TestExitProceedsMsgSelectsTheOwnedOutput proves the exit-proceeds record
+// names the sweep output that actually pays this daemon's wallet, rather than
+// assuming an index. The sweep carries an anchor output alongside the wallet
+// one, so an index assumption would record the wrong outpoint and the wrong
+// value.
+func TestExitProceedsMsgSelectsTheOwnedOutput(t *testing.T) {
+	t.Parallel()
+
+	ours := []byte{txscript.OP_TRUE}
+	anchor := []byte{txscript.OP_FALSE}
+
+	b := &behavior{
+		log: btclog.Disabled,
+		sweepTx: &wire.MsgTx{
+			TxOut: []*wire.TxOut{
+				{
+					Value:    330,
+					PkScript: anchor,
+				},
+				{
+					Value:    90_000,
+					PkScript: ours,
+				},
+			},
+		},
+	}
+	b.cfg.OwnedWalletScripts = fn.Some[OwnedWalletScriptChecker](
+		fakeOwnedScripts{},
+	)
+
+	msg, err := b.exitProceedsMsg(t.Context(), &JobState{})
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), msg.OutpointIndex)
+	require.Equal(t, int64(90_000), msg.AmountSat)
+	require.Equal(
+		t, ledger.ClassificationExitProceeds, msg.Classification,
+	)
+}
+
+// TestExitProceedsMsgFailsClosed proves selection refuses to guess. No
+// registry, no matching output, or two matching outputs each produce an error
+// and no record at all -- which loses the later reversal for those coins,
+// while naming the wrong output would reverse a credit against satoshis that
+// are not ours.
+func TestExitProceedsMsgFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	ours := []byte{txscript.OP_TRUE}
+	registry := fn.Some[OwnedWalletScriptChecker](fakeOwnedScripts{})
+
+	cases := []struct {
+		name     string
+		sweepTx  *wire.MsgTx
+		registry fn.Option[OwnedWalletScriptChecker]
+	}{
+		{
+			name: "no registry",
+			sweepTx: &wire.MsgTx{
+				TxOut: []*wire.TxOut{
+					{
+						Value:    90_000,
+						PkScript: ours,
+					},
+				},
+			},
+			registry: fn.None[OwnedWalletScriptChecker](),
+		},
+		{
+			name: "no owned output",
+			sweepTx: &wire.MsgTx{
+				TxOut: []*wire.TxOut{
+					{
+						Value: 90_000,
+						PkScript: []byte{
+							txscript.OP_FALSE,
+						},
+					},
+				},
+			},
+			registry: registry,
+		},
+		{
+			name: "two owned outputs",
+			sweepTx: &wire.MsgTx{
+				TxOut: []*wire.TxOut{
+					{
+						Value:    40_000,
+						PkScript: ours,
+					},
+					{
+						Value:    50_000,
+						PkScript: ours,
+					},
+				},
+			},
+			registry: registry,
+		},
+		{
+			name:     "no sweep transaction",
+			sweepTx:  nil,
+			registry: registry,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b := &behavior{
+				log:     btclog.Disabled,
+				sweepTx: tc.sweepTx,
+			}
+			b.cfg.OwnedWalletScripts = tc.registry
+
+			_, err := b.exitProceedsMsg(t.Context(), &JobState{})
+			require.Error(t, err)
+		})
+	}
 }

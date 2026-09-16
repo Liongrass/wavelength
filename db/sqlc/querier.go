@@ -31,6 +31,11 @@ type Querier interface {
 	CountActivityEntriesByStatus(ctx context.Context, status int64) (int64, error)
 	CountBoardingIntentsByStatus(ctx context.Context, status string) (int64, error)
 	CountClientLedgerEntries(ctx context.Context) (int64, error)
+	// CountDepositFundingInput reports whether an outpoint is recorded as the
+	// funding input of any boarding deposit. An own-wallet proceeds row arriving
+	// after the deposit it funded uses this to discover that it must reverse its
+	// own credit.
+	CountDepositFundingInput(ctx context.Context, arg CountDepositFundingInputParams) (int64, error)
 	// CountOwnedWalletScript reports whether a pkScript is in the registry.
 	// Absent means "not known to be ours", which is the conservative answer.
 	CountOwnedWalletScript(ctx context.Context, pkScript []byte) (int64, error)
@@ -160,8 +165,9 @@ type Querier interface {
 	// VTXO. Returns NULL if not forfeited or no replacement recorded.
 	GetVTXOReplacement(ctx context.Context, arg GetVTXOReplacementParams) (GetVTXOReplacementRow, error)
 	// GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
-	// outpoint, if any. The boarding deposit path uses it to recognise a funding
-	// input as a previously recorded own-wallet proceeds UTXO.
+	// outpoint, if any. idx_utxo_log_outpoint_event makes it at most one row.
+	// The ledger actor uses it to recognise a boarding deposit's funding input as
+	// a UTXO whose value it already credited to wallet_balance.
 	GetWalletUTXOLogCreatedByOutpoint(ctx context.Context, arg GetWalletUTXOLogCreatedByOutpointParams) (WalletUtxoLog, error)
 	// Boarding address queries.
 	InsertBoardingAddress(ctx context.Context, arg InsertBoardingAddressParams) error
@@ -188,6 +194,11 @@ type Querier interface {
 	InsertClientLedgerEntry(ctx context.Context, arg InsertClientLedgerEntryParams) error
 	// Client tree txids queries.
 	InsertClientTreeTxid(ctx context.Context, arg InsertClientTreeTxidParams) error
+	// InsertDepositFundingInput records one previous outpoint a boarding
+	// deposit's funding transaction spent. Crash-replay safe: the durable ledger
+	// mailbox replays unprocessed messages on startup, so a re-delivered deposit
+	// re-inserts the same rows and must not fail.
+	InsertDepositFundingInput(ctx context.Context, arg InsertDepositFundingInputParams) error
 	InsertExitFundingAddress(ctx context.Context, arg InsertExitFundingAddressParams) error
 	InsertIdempotentOwnedReceiveScript(ctx context.Context, arg InsertIdempotentOwnedReceiveScriptParams) (int64, error)
 	InsertMacaroonRootKey(ctx context.Context, arg InsertMacaroonRootKeyParams) error

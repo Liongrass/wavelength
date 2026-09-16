@@ -181,12 +181,16 @@ const (
 	exitCostBlockHeightType   tlv.Type = 9
 	exitCostDestOwnType       tlv.Type = 11
 
-	// UTXOCreatedMsg / UTXOSpentMsg field types.
+	// UTXOCreatedMsg / UTXOSpentMsg field types. FundingInputs is
+	// UTXOCreatedMsg-only and optional; a payload written before
+	// it existed decodes to an empty list, which books the
+	// created row exactly as it did then.
 	utxoOutpointHashType   tlv.Type = 1
 	utxoOutpointIndexType  tlv.Type = 3
 	utxoAmountSatType      tlv.Type = 5
 	utxoBlockHeightType    tlv.Type = 7
 	utxoClassificationType tlv.Type = 9
+	utxoFundingInputsType  tlv.Type = 11
 
 	// BoardingSweepConfirmedMsg field types.
 	sweepConfirmedTxidType        tlv.Type = 1
@@ -201,6 +205,57 @@ const (
 // input inside a BoardingSweepConfirmedMsg: a 32-byte outpoint hash, a
 // 4-byte big-endian output index, and an 8-byte big-endian satoshi amount.
 const sweepInputRecordSize = 32 + 4 + 8
+
+// outpointListRecordSize is the fixed wire width of one outpoint inside a
+// flattened outpoint list: a 32-byte hash followed by a 4-byte big-endian
+// output index.
+const outpointListRecordSize = 32 + 4
+
+// encodeOutpointList flattens a list of outpoints into a single byte blob of
+// fixed-width records. Same shape as encodeSweepInputs, minus the amount: a
+// flat blob keeps the TLV layout one primitive record while preserving
+// per-outpoint granularity.
+func encodeOutpointList(outpoints []wire.OutPoint) []byte {
+	out := make([]byte, 0, len(outpoints)*outpointListRecordSize)
+	var rec [outpointListRecordSize]byte
+	for _, op := range outpoints {
+		copy(rec[:32], op.Hash[:])
+		binary.BigEndian.PutUint32(rec[32:36], op.Index)
+		out = append(out, rec[:]...)
+	}
+
+	return out
+}
+
+// decodeOutpointList reverses encodeOutpointList, rejecting a blob whose
+// length is not a whole multiple of the record size so a corrupt stream
+// surfaces at the decode boundary rather than as a truncated outpoint.
+func decodeOutpointList(name string, blob []byte) ([]wire.OutPoint, error) {
+	if len(blob)%outpointListRecordSize != 0 {
+		return nil, fmt.Errorf("%w: %s blob has %d bytes, not a "+
+			"multiple of %d", ErrInvalidMessage, name, len(blob),
+			outpointListRecordSize)
+	}
+
+	count := len(blob) / outpointListRecordSize
+	if count == 0 {
+		return nil, nil
+	}
+
+	outpoints := make([]wire.OutPoint, 0, count)
+	for i := 0; i < count; i++ {
+		rec := blob[i*outpointListRecordSize : (i+1)*
+			outpointListRecordSize]
+
+		var op wire.OutPoint
+		copy(op.Hash[:], rec[:32])
+		op.Index = binary.BigEndian.Uint32(rec[32:36])
+
+		outpoints = append(outpoints, op)
+	}
+
+	return outpoints, nil
+}
 
 // LedgerMsg is the message constraint for the client-side ledger
 // durable actor mailbox. It embeds actor.TLVMessage so both
@@ -875,6 +930,20 @@ type UTXOCreatedMsg struct {
 	// Classification categorizes the UTXO origin (e.g.
 	// "deposit", "change", "sweep_return").
 	Classification string
+
+	// FundingInputs are the previous outpoints the transaction that
+	// created this UTXO spent. Only ClassificationDeposit carries them,
+	// and only the wallet can supply them, since it is the one side
+	// holding the full funding transaction.
+	//
+	// They exist so the deposit can recognise its own funding: an input
+	// that is an own-wallet proceeds UTXO was already credited to
+	// wallet_balance once, and this deposit's leg would credit the same
+	// satoshis again. The handler records one 'spent' audit row per input
+	// and reverses the credit for each one it can already see. Optional
+	// on the wire; a payload written before the field existed decodes to
+	// an empty list and books exactly as it did then.
+	FundingInputs []wire.OutPoint
 }
 
 // MessageType returns the message type name for routing.
@@ -894,6 +963,7 @@ func (m *UTXOCreatedMsg) Encode(w io.Writer) error {
 	amountSat := uint64(m.AmountSat)
 	blockHeight := m.BlockHeight
 	classification := []byte(m.Classification)
+	fundingInputs := encodeOutpointList(m.FundingInputs)
 
 	stream, err := tlv.NewStream(
 		tlv.MakePrimitiveRecord(
@@ -910,6 +980,9 @@ func (m *UTXOCreatedMsg) Encode(w io.Writer) error {
 		),
 		tlv.MakePrimitiveRecord(
 			utxoClassificationType, &classification,
+		),
+		tlv.MakePrimitiveRecord(
+			utxoFundingInputsType, &fundingInputs,
 		),
 	)
 	if err != nil {
@@ -919,7 +992,9 @@ func (m *UTXOCreatedMsg) Encode(w io.Writer) error {
 	return stream.Encode(w)
 }
 
-// Decode deserializes a TLV stream into the message.
+// Decode deserializes a TLV stream into the message. The funding-input list
+// is optional: a payload written before it existed leaves the blob empty,
+// which decodes to no inputs and books the created row as it did then.
 func (m *UTXOCreatedMsg) Decode(r io.Reader) error {
 	var (
 		outpointHash   []byte
@@ -927,6 +1002,7 @@ func (m *UTXOCreatedMsg) Decode(r io.Reader) error {
 		amountSat      uint64
 		blockHeight    uint32
 		classification []byte
+		fundingInputs  []byte
 	)
 
 	stream, err := tlv.NewStream(
@@ -944,6 +1020,9 @@ func (m *UTXOCreatedMsg) Decode(r io.Reader) error {
 		),
 		tlv.MakePrimitiveRecord(
 			utxoClassificationType, &classification,
+		),
+		tlv.MakePrimitiveRecord(
+			utxoFundingInputsType, &fundingInputs,
 		),
 	)
 	if err != nil {
@@ -968,11 +1047,19 @@ func (m *UTXOCreatedMsg) Decode(r io.Reader) error {
 		return err
 	}
 
+	inputs, err := decodeOutpointList(
+		"UTXOCreatedMsg.FundingInputs", fundingInputs,
+	)
+	if err != nil {
+		return err
+	}
+
 	copy(m.OutpointHash[:], outpointHash)
 	m.OutpointIndex = outpointIndex
 	m.AmountSat = amt
 	m.BlockHeight = blockHeight
 	m.Classification = string(classification)
+	m.FundingInputs = inputs
 
 	return nil
 }

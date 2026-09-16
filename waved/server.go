@@ -5963,6 +5963,15 @@ func (s *Server) initUnrollSubsystem(ctx context.Context,
 		exitObserver = fn.Some[actor.TellOnlyRef[vtxo.ManagerMsg]](ref)
 	})
 
+	// A closed database yields None, which the exit path reads as "cannot
+	// identify which sweep output paid our wallet" and records nothing.
+	unrollOwnedScripts := fn.None[unroll.OwnedWalletScriptChecker]()
+	if scripts := s.ownedWalletScripts(); scripts != nil {
+		unrollOwnedScripts = fn.Some[unroll.OwnedWalletScriptChecker](
+			scripts,
+		)
+	}
+
 	registry := unroll.NewUnrollRegistryActor(unroll.RegistryConfig{
 		Store: &unroll.DBRegistryStore{
 			UEStore: ueStore,
@@ -5976,6 +5985,7 @@ func (s *Server) initUnrollSubsystem(ctx context.Context,
 		LedgerSink: fn.Some(
 			ledger.NewSink(s.actorSystem),
 		),
+		OwnedWalletScripts:         unrollOwnedScripts,
 		Log:                        fn.Some(s.subLogger("UNRL")),
 		MaxSweepFeeRateSatPerVByte: s.unrollMaxFeeRate(),
 		SweepFeeRateFallbackSatPerVByte: s.

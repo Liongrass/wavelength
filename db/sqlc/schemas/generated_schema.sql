@@ -676,6 +676,26 @@ CREATE TABLE internal_keys (
     CHECK (length(pubkey) = 33)
 );
 
+CREATE TABLE ledger_deposit_funding_inputs (
+    -- input_hash and input_index identify the previous outpoint the funding
+    -- transaction spent.
+    input_hash BLOB NOT NULL,
+    input_index INTEGER NOT NULL,
+
+    -- deposit_hash and deposit_index identify the boarding deposit that
+    -- funding transaction created. One input can fund only one deposit in
+    -- practice, but the deposit is part of the key so a transaction paying
+    -- two boarding addresses records both without either overwriting the
+    -- other.
+    deposit_hash BLOB NOT NULL,
+    deposit_index INTEGER NOT NULL,
+
+    -- created_at is the Unix timestamp the row was recorded.
+    created_at BIGINT NOT NULL,
+
+    PRIMARY KEY (input_hash, input_index, deposit_hash, deposit_index)
+);
+
 CREATE TABLE ledger_entries (
     entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
 
@@ -1088,6 +1108,15 @@ CREATE TABLE owned_wallet_scripts (
 
     -- source names the mint site, so an operator reading the table can tell
     -- a receive address from a sweep or change destination.
+    --
+    -- The neighbouring owned_receive_scripts constrains its own source column
+    -- with a foreign key into a lookup table. This column deliberately does
+    -- not. That column is a discovery classification the OOR protocol reasons
+    -- over, where an unrecognised value would change behaviour; this one is
+    -- operator-facing provenance that nothing reads back, and every writer is
+    -- a Go constant in this repository. A lookup table would buy a constraint
+    -- on a value no code branches on, at the cost of a second table and a
+    -- migration every time a new mint site appears.
     source TEXT NOT NULL,
 
     -- created_at is the Unix timestamp the script was recorded.

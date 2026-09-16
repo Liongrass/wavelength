@@ -57,6 +57,7 @@ tooling can see gross send and gross receive flows
 independently. Netting them would collapse useful information.
 
 | `owned_wallet_scripts` | — | Not an account: the durable registry of backing-wallet scripts this daemon minted, seeded by migration `000022`. It is what lets a leave or a sweep destination be recognised as ours. |
+| `ledger_deposit_funding_inputs` | — | Not an account: the index from a boarding deposit's funding inputs back to the deposit, added by migration `000023`. It carries no amount, and exists so the two messages that describe a recycled coin can reconcile in either order. |
 
 `opening_balance` is the equity counterparty for wallet UTXO
 deposits. Without it, `SourceRoundBoarding` outflows
@@ -89,6 +90,9 @@ replay dedup — see the [Replay safety](#replay-safety) section.
 | Message | Source value | Debit | Credit | Notes |
 |---|---|---|---|---|
 | `UTXOCreatedMsg` | deposit-like classifications | `wallet_balance` | `opening_balance` | Deposit leg. Written alongside the `wallet_utxo_log` audit row by `handleUTXOCreated`. |
+| `UTXOCreatedMsg` | `exit_proceeds`, `leave_proceeds` | — | — | Audit row only, no ledger leg. The `ExitCostMsg` or `VTXOSentMsg` proceeds leg already credited `wallet_balance` for this value; the row exists so a later spend of the coins can be recognised. |
+| `UTXOCreatedMsg` | `recycled_change` | `wallet_balance` | `opening_balance` | Change of a partial spend of the above. Books its credit like any other wallet UTXO, because no earlier message described it. |
+| `UTXOCreatedMsg` (reversal leg) | `deposit`, or any own-wallet proceeds | `opening_balance` | `wallet_balance` | Reverses the earlier credit of a proceeds UTXO now funding a boarding deposit, mirroring the deposit leg the same transaction produces. Booked by whichever of the two messages commits second, and the audit row it writes is classified `deposit_funding`. Keyed by classification so it cannot collide with the boarding-sweep input leg naming the same outpoint. |
 | `BoardingSweepConfirmedMsg` | fee leg | `onchain_fees` | `wallet_clearing` | Miner fee + P2A anchor for a confirmed boarding sweep. One of the legs `handleBoardingSweepConfirmed` books atomically. |
 | `BoardingSweepConfirmedMsg` | per input | `wallet_clearing` | `wallet_balance` | One leg + audit row per swept boarding input. |
 | `BoardingSweepConfirmedMsg` | wallet-return dest | `wallet_balance` | `wallet_clearing` | Internal sweep return (`DestinationExternal=false`), with a `wallet_utxo_log` "created" row. |
@@ -360,6 +364,17 @@ leg at all: such a send dedups on the round or session partial index,
 where a second leg on the same accounts would have no distinct identity
 to occupy.
 
+A flagged leave also records its on-chain output in the wallet UTXO
+audit log, classified `leave_proceeds` and deliberately leg-less. The
+round actor stages that `UTXOCreatedMsg` alongside the send, at
+`(commitment txid, ProceedsVout)`. The vout is resolved by matching the
+leave's script and value against the commitment transaction and fails
+closed: a leave that cannot be located unambiguously loses the flag
+entirely, because a proceeds credit with no on-chain identity could
+never be reversed when those coins are boarded again. See
+[Recycled own-wallet proceeds](#recycled-own-wallet-proceeds) for what
+that identity buys.
+
 The transaction history excludes the proceeds leg by the same condition
 that hides the exit's, since both are contra legs on
 `wallet_balance <- transfers_out` that cancel a send leg sharing their
@@ -398,8 +413,12 @@ send leg on `transfers_out`, landing the net value on
 `wallet_balance`. The exit proceeds are an internal asset transfer:
 the client still owns them, they just moved across the on-chain /
 off-chain boundary. That sweep output pays a plain wallet script
-rather than a boarding address, so no `UTXOCreatedMsg` producer books
-it a second time.
+rather than a boarding address, so no deposit leg books it a second
+time. It is still recorded in the wallet UTXO audit log, classified
+`exit_proceeds` and deliberately leg-less, because the client has to
+be able to recognise those coins later.
+
+That recognition is what closes the recycling gap, described next.
 
 `DestinationOwnWallet=false` writes no proceeds leg, so the send leg
 stands as a real outflow for an exit whose destination is foreign,
@@ -430,6 +449,84 @@ and those are not yet captured by this leg. The exit cost
 recorded today therefore understates the true on-chain cost of a
 deep-tree exit; folding in the tree-broadcast fees is a deferred
 item.
+
+### Recycled own-wallet proceeds
+
+Three kinds of wallet UTXO share one awkward property: the ledger has
+already credited their value to `wallet_balance` at a known outpoint.
+Exit proceeds (`exit_proceeds`), a cooperative leave paying our own
+wallet (`leave_proceeds`), and the change of a partial spend of either
+(`recycled_change`). Nothing ever debits those credits again, because
+none of those outputs pays a boarding address and so none produces a
+boarding intent.
+
+If the user then boards one of them, that deposit's own
+`UTXOCreatedMsg` credits `wallet_balance` a second time for the same
+satoshis, and the client's total overstates by the recycled amount on
+every cycle.
+
+The reversal is arranged so it cannot depend on message ordering,
+because the two facts it needs are reported by different producers:
+
+```
+The deposit's message carries its funding transaction's previous
+outpoints, and books, in its own committed transaction:
+
+  for each funding input:
+      record (input -> deposit) in ledger_deposit_funding_inputs
+      if that input already has an own-wallet proceeds 'created' row:
+          audit  input as 'spent' / deposit_funding
+          debit  opening_balance += input amount
+          credit wallet_balance  += input amount
+
+The proceeds message books the mirror, in its own committed
+transaction:
+
+  if this outpoint is already a recorded deposit funding input:
+      audit  it as 'spent' / deposit_funding
+      debit  opening_balance += amount
+      credit wallet_balance  += amount
+```
+
+Whichever message commits second sees the other's committed half and
+performs the reversal; neither reads in-flight state. Both attempts
+derive the same idempotency key, so if both were to fire they collapse
+to one row. The ledger actor serializes every handler and commits each
+in its own transaction, which is what makes "already committed" a
+meaningful question to ask.
+
+`ledger_deposit_funding_inputs` records every funding input, including
+coins the client does not own, because ownership may only become known
+later. It deliberately carries no amount and lives outside
+`wallet_utxo_log`: an audit row for a stranger's outpoint would be a
+fiction, and every reconciliation over that log would then need a
+special case for it. Only inputs the ledger actually credited get a
+`deposit_funding` audit row, so every such row has a real amount and a
+real leg beside it.
+
+The wallet's part is to report facts, not to judge them. It attaches
+the funding outpoints to the deposit message, and separately credits
+back any *other* output of the funding transaction paying a script in
+`owned_wallet_scripts` — the change of a partial spend — under
+`recycled_change`, since the reversal removes the whole input. Both are
+enqueued inside the same `InsertBoardingIntents` transaction as the
+deposit leg: a crash between them would leave the books wrong with no
+producer left to correct them, because `seenUtxos` permanently
+suppresses re-detection of a processed outpoint.
+
+Two limits are worth stating plainly. The change credit needs the
+registry to recognise the change script, and a script minted before
+the registry existed is not recognised, so its change stays uncredited
+— an understatement, the safe direction, and one that cannot compound
+because an uncredited output has no credit for a later board to
+reverse. And there is no backfill: `owned_wallet_scripts` starts empty
+on every existing deployment and fills as the daemon mints. Until a
+given script has been minted under the new code, a leave or sweep
+paying it reads as foreign and its proceeds are neither flagged nor
+recorded, which reproduces the pre-registry behaviour rather than
+introducing a new error. Backfilling would mean enumerating each
+backend's derived scripts, which is exactly the per-backend ownership
+query the registry exists to avoid.
 
 ## Emission sites
 
@@ -558,24 +655,24 @@ with the operator-side accounting tool.
   write double-entry wallet-clearing legs, but other direct
   wallet spends still need a classification-specific ledger
   producer before they can affect `wallet_balance`.
-- **Recycled exit proceeds.** A unilateral exit books its proceeds
-  into `wallet_balance` via `ExitCostMsg.DestinationOwnWallet`, and
-  nothing ever debits them again. The exit output pays a plain wallet
-  script rather than a boarding address, so it produces no boarding
-  intent and no later `UTXOCreatedMsg`; the credit simply stands. If
-  the user then spends those proceeds into a boarding address, that
-  deposit's own `UTXOCreatedMsg` credits `wallet_balance` a second
-  time for the same coins, and the total overstates the client by the
-  recycled amount. Closing this needs a `wallet_clearing`-style
-  close-out leg on the spend that funds the boarding address, the way
-  the boarding sweep already clears its inputs.
 - **Operator-swept VTXOs.** No producer books a VTXO whose batch
-  the operator swept after expiry. This is deliberate for now:
-  the server keeps honouring the claim, so the owner can still
-  reclaim it by refreshing, and the asset is real until the
-  operator's policy says otherwise. It does mean `vtxo_balance`
-  can include value that a long-offline client may never
-  recover.
+  the operator swept after expiry. This is a decision, not a gap:
+  the server keeps honouring the claim after its own sweep, so the
+  owner can still reclaim the value by forfeiting the VTXO into an
+  ordinary round, and the asset is real until the operator's policy
+  says otherwise. Writing it off would book a loss the client has
+  not taken and that a single refresh would undo.
+
+  The client is not blind to the sweep. The unroll path observes it
+  as an exit conflict, and the VTXO reaches `Expired` status, which
+  the invariant checker's live set deliberately includes for exactly
+  this reason. What is missing is not observation but a policy: how
+  long after batch expiry the operator stops honouring a reclaim.
+  Until that window is a term the client can read, any write-off
+  would be the client guessing at the operator's policy. The cost of
+  waiting is bounded and visible: `vtxo_balance` can include value a
+  long-offline client may never come back for, and the checker's
+  `vtxo_balance_inventory` figure counts it.
 
 ## Related documents
 

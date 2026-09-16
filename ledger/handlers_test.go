@@ -88,6 +88,10 @@ func hasSessionEntry(entries []LedgerEntry, sessionID [32]byte, eventType,
 type mockUTXOAuditStore struct {
 	mu      sync.Mutex
 	entries []UTXOAuditEntry
+
+	// fundingInputs records the outpoints reported as funding a boarding
+	// deposit, so a test can pre-seed the deposit-arrived-first ordering.
+	fundingInputs map[wire.OutPoint]struct{}
 }
 
 func (m *mockUTXOAuditStore) InsertUTXOAuditEntry(_ context.Context,
@@ -99,6 +103,54 @@ func (m *mockUTXOAuditStore) InsertUTXOAuditEntry(_ context.Context,
 	m.entries = append(m.entries, entry)
 
 	return nil
+}
+
+// LookupCreatedUTXO returns the recorded 'created' row at an outpoint.
+func (m *mockUTXOAuditStore) LookupCreatedUTXO(_ context.Context,
+	outpoint wire.OutPoint) (UTXOAuditEntry, bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, entry := range m.entries {
+		if entry.Event != "created" ||
+			entry.OutpointIndex != int32(outpoint.Index) ||
+			!bytes.Equal(entry.OutpointHash, outpoint.Hash[:]) {
+
+			continue
+		}
+
+		return entry, true, nil
+	}
+
+	return UTXOAuditEntry{}, false, nil
+}
+
+// InsertDepositFundingInput records a deposit's funding input.
+func (m *mockUTXOAuditStore) InsertDepositFundingInput(_ context.Context,
+	input, _ wire.OutPoint, _ int64) error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.fundingInputs == nil {
+		m.fundingInputs = make(map[wire.OutPoint]struct{})
+	}
+	m.fundingInputs[input] = struct{}{}
+
+	return nil
+}
+
+// IsDepositFundingInput reports whether an outpoint funded a deposit.
+func (m *mockUTXOAuditStore) IsDepositFundingInput(_ context.Context,
+	outpoint wire.OutPoint) (bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, ok := m.fundingInputs[outpoint]
+
+	return ok, nil
 }
 
 func (m *mockUTXOAuditStore) getEntries() []UTXOAuditEntry {
@@ -2699,4 +2751,533 @@ func TestVTXOSentMsgProceedsFlagRoundTrips(t *testing.T) {
 		t, legacy.ProceedsOwnWallet,
 		"a missing proceeds record must keep the old behaviour",
 	)
+}
+
+// TestHandleUTXOCreatedExitProceedsIsAuditOnly proves the sweep output a
+// unilateral exit paid to the wallet is recorded in the audit log but books
+// no ledger leg. The ExitCostMsg proceeds leg already credited wallet_balance
+// for exactly this value; a deposit leg here would credit it twice.
+func TestHandleUTXOCreatedExitProceedsIsAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a, &UTXOCreatedMsg{
+				OutpointHash:   [32]byte{0x91},
+				OutpointIndex:  0,
+				AmountSat:      95_000,
+				BlockHeight:    900_000,
+				Classification: ClassificationExitProceeds,
+			},
+		),
+	)
+
+	require.Empty(
+		t, ledgerStore.getEntries(),
+		"exit proceeds must not book a second wallet_balance credit",
+	)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(t, "created", audits[0].Event)
+	require.Equal(t, ClassificationExitProceeds, audits[0].ClassifiedAs)
+	require.Equal(t, int64(95_000), audits[0].AmountSat)
+}
+
+// proceedsOutpoint is a convenient outpoint built from a one-byte hash seed.
+func proceedsOutpoint(seed byte, index uint32) wire.OutPoint {
+	var hash chainhash.Hash
+	hash[0] = seed
+
+	return wire.OutPoint{Hash: hash, Index: index}
+}
+
+// depositMsg builds a boarding-deposit UTXOCreatedMsg funded by the given
+// previous outpoints.
+func depositMsg(seed byte, amount int64,
+	inputs ...wire.OutPoint) *UTXOCreatedMsg {
+
+	return &UTXOCreatedMsg{
+		OutpointHash: [32]byte{
+			seed,
+		},
+		OutpointIndex:  0,
+		AmountSat:      amount,
+		BlockHeight:    900_100,
+		Classification: ClassificationDeposit,
+		FundingInputs:  inputs,
+	}
+}
+
+// proceedsMsg builds an own-wallet proceeds UTXOCreatedMsg at an outpoint.
+func proceedsMsg(outpoint wire.OutPoint, amount int64,
+	classification string) *UTXOCreatedMsg {
+
+	return &UTXOCreatedMsg{
+		OutpointHash:   [32]byte(outpoint.Hash),
+		OutpointIndex:  outpoint.Index,
+		AmountSat:      amount,
+		BlockHeight:    900_000,
+		Classification: classification,
+	}
+}
+
+// netBalances folds a ledger entry list into a per-account signed total.
+func netBalances(entries []LedgerEntry) map[string]int64 {
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+
+	return balances
+}
+
+// TestRecycledProceedsReverseInEitherOrder is the core property of the
+// recycled-proceeds design: the reversing leg is booked by whichever of the
+// two messages commits second, so the outcome does not depend on the order
+// two independent producers happen to reach the ledger in.
+//
+// The same table covers all three proceeds classifications, because the whole
+// point of the family is that the reversal does not care which one produced
+// the credit.
+func TestRecycledProceedsReverseInEitherOrder(t *testing.T) {
+	t.Parallel()
+
+	classifications := []string{
+		ClassificationExitProceeds,
+		ClassificationLeaveProceeds,
+		ClassificationRecycledChange,
+	}
+
+	orders := []struct {
+		name         string
+		proceedsLast bool
+	}{
+		{
+			name:         "proceeds first",
+			proceedsLast: false,
+		},
+		{
+			name:         "deposit first",
+			proceedsLast: true,
+		},
+	}
+
+	for _, classification := range classifications {
+		for _, order := range orders {
+			name := classification + "/" + order.name
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				assertReversal(
+					t, classification, order.proceedsLast,
+				)
+			})
+		}
+	}
+}
+
+// assertReversal runs one proceeds/deposit pair in the requested order and
+// checks that wallet_balance ends up crediting the coins exactly once.
+func assertReversal(t *testing.T, classification string, proceedsLast bool) {
+	t.Helper()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	const amount = 90_000
+	input := proceedsOutpoint(0x92, 0)
+	proceeds := proceedsMsg(input, amount, classification)
+	deposit := depositMsg(0x93, amount, input)
+
+	msgs := []*UTXOCreatedMsg{proceeds, deposit}
+	if proceedsLast {
+		msgs = []*UTXOCreatedMsg{deposit, proceeds}
+	}
+	for _, msg := range msgs {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	entries := store.getEntries()
+	balances := netBalances(entries)
+
+	// Exactly one credit of these coins survives, whichever order the two
+	// messages arrived in.
+	//
+	// For exit and leave proceeds the credit was booked by an earlier
+	// message outside this handler, so the deposit's credit and the
+	// reversal cancel and the net here is zero. Recycled change books its
+	// own credit in this handler, so its net is one amount. Either way
+	// the coins are counted once and never twice.
+	want := int64(0)
+	if classification == ClassificationRecycledChange {
+		want = amount
+	}
+	require.Equal(
+		t, want, balances[AccountWalletBalance],
+		"recycled proceeds must be credited exactly once",
+	)
+
+	var reversals int
+	for _, entry := range entries {
+		if entry.DebitAccount != AccountOpeningBalance ||
+			entry.CreditAccount != AccountWalletBalance {
+
+			continue
+		}
+
+		reversals++
+		require.Equal(t, int64(amount), entry.AmountSat)
+		require.Equal(t, EventWalletUTXOSpent, entry.EventType)
+
+		// The reversing leg's key is namespaced by classification, so
+		// it can never collide with the boarding-sweep input leg that
+		// keys on the bare outpoint and books different accounts.
+		hash := [32]byte(input.Hash)
+		require.NotEqual(
+			t, walletUTXOIdempotencyKey(hash, input.Index),
+			entry.IdempotencyKey,
+		)
+		require.Equal(
+			t, classifiedUTXOIdempotencyKey(
+				ClassificationDepositFunding, hash, input.Index,
+			),
+			entry.IdempotencyKey,
+		)
+	}
+	require.Equal(t, 1, reversals)
+
+	// The spend is recorded in the audit log under the classification the
+	// reversal booked, with the real amount.
+	var spends int
+	for _, entry := range audit.getEntries() {
+		if entry.Event != "spent" {
+			continue
+		}
+
+		spends++
+		require.Equal(
+			t, ClassificationDepositFunding, entry.ClassifiedAs,
+		)
+		require.Equal(t, int64(amount), entry.AmountSat)
+	}
+	require.Equal(t, 1, spends)
+}
+
+// TestRecycledProceedsReplayDedups proves the reversing leg survives
+// at-least-once delivery: replaying either message books no second reversal,
+// and a boarding-sweep input spend naming the same outpoint still books its
+// own distinct leg.
+func TestRecycledProceedsReplayDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	a.cfg.UTXOAuditStore = &mockUTXOAuditStore{}
+	ctx := t.Context()
+
+	input := proceedsOutpoint(0x94, 1)
+	proceeds := proceedsMsg(input, 40_000, ClassificationExitProceeds)
+	deposit := depositMsg(0x95, 40_000, input)
+
+	for _, msg := range []*UTXOCreatedMsg{
+		proceeds, deposit, proceeds, deposit,
+	} {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	before := store.getEntries()
+	require.Equal(
+		t, int64(0), netBalances(before)[AccountWalletBalance],
+		"replay must not re-credit or re-reverse",
+	)
+
+	sweepClass := ClassificationBoardingSweepInput
+	sweepInput := &UTXOSpentMsg{
+		OutpointHash:   [32]byte(input.Hash),
+		OutpointIndex:  input.Index,
+		AmountSat:      40_000,
+		BlockHeight:    900_200,
+		Classification: sweepClass,
+	}
+	require.NoError(t, run(ctx, a, sweepInput))
+
+	require.Len(
+		t, store.getEntries(), len(before)+1,
+		"the two classifications book distinct legs for one outpoint",
+	)
+}
+
+// TestPartialSpendChangeIsCreditedBack proves the arithmetic of a partial
+// spend. Boarding part of a proceeds UTXO reverses the whole input, so the
+// change that came straight back must be credited again or the client is
+// understated by it -- and boarding that change a generation later must
+// reverse it in turn rather than counting it twice.
+func TestPartialSpendChangeIsCreditedBack(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	a.cfg.UTXOAuditStore = &mockUTXOAuditStore{}
+	ctx := t.Context()
+
+	const (
+		proceedsSat = 100_000
+		boardedSat  = 60_000
+		changeSat   = 39_000
+	)
+
+	// Generation one: exit proceeds, partly boarded.
+	exit := proceedsOutpoint(0x96, 0)
+	require.NoError(
+		t,
+		run(
+			ctx, a, proceedsMsg(
+				exit, proceedsSat, ClassificationExitProceeds,
+			),
+		),
+	)
+	require.NoError(t, run(ctx, a, depositMsg(0x97, boardedSat, exit)))
+
+	change := proceedsOutpoint(0x97, 1)
+	require.NoError(
+		t,
+		run(
+			ctx, a, proceedsMsg(
+				change, changeSat, ClassificationRecycledChange,
+			),
+		),
+	)
+
+	// The exit's proceeds leg credited wallet_balance outside this
+	// handler, so here the net is the boarded deposit plus the change,
+	// minus the reversal of the whole input.
+	balances := netBalances(store.getEntries())
+	require.Equal(
+		t, int64(boardedSat+changeSat-proceedsSat),
+		balances[AccountWalletBalance],
+	)
+
+	// Generation two: the change is boarded in turn.
+	require.NoError(t, run(ctx, a, depositMsg(0x98, changeSat, change)))
+
+	balances = netBalances(store.getEntries())
+	require.Equal(
+		t, int64(boardedSat+changeSat-proceedsSat),
+		balances[AccountWalletBalance],
+		"boarding the change must reverse its credit, not add one",
+	)
+}
+
+// TestDepositIgnoresForeignFundingInputs proves a deposit funded by coins the
+// client never credited books nothing extra: no reversal, and no audit row
+// that would make a stranger's outpoint look like one of ours.
+func TestDepositIgnoresForeignFundingInputs(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	foreign := proceedsOutpoint(0x99, 3)
+	require.NoError(t, run(ctx, a, depositMsg(0x9a, 70_000, foreign)))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountWalletBalance, entries[0].DebitAccount)
+
+	for _, entry := range audit.getEntries() {
+		require.Equal(
+			t, "created", entry.Event, "a foreign funding "+
+				"input must not produce an audit row of "+
+				"its own",
+		)
+	}
+}
+
+// TestHandleUTXOCreatedRecycledChangeBooksItsCredit proves recycled change is
+// not audit-only: no earlier message described it, so it books the credit leg
+// every other wallet UTXO books.
+func TestHandleUTXOCreatedRecycledChangeBooksItsCredit(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a,
+			proceedsMsg(
+				proceedsOutpoint(0x9b, 1), 12_000,
+				ClassificationRecycledChange,
+			),
+		),
+	)
+
+	entries := ledgerStore.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountWalletBalance, entries[0].DebitAccount)
+	require.Equal(t, AccountOpeningBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(12_000), entries[0].AmountSat)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(
+		t, ClassificationRecycledChange, audits[0].ClassifiedAs,
+	)
+}
+
+// TestHandleUTXOCreatedLeaveProceedsIsAuditOnly proves the leave's on-chain
+// output writes an audit row and no ledger leg. The VTXOSentMsg proceeds leg
+// already credited wallet_balance for exactly this value.
+func TestHandleUTXOCreatedLeaveProceedsIsAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a,
+			proceedsMsg(
+				proceedsOutpoint(0x9c, 2), 55_000,
+				ClassificationLeaveProceeds,
+			),
+		),
+	)
+
+	require.Empty(
+		t, ledgerStore.getEntries(),
+		"leave proceeds must not book a second wallet_balance credit",
+	)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(t, ClassificationLeaveProceeds, audits[0].ClassifiedAs)
+}
+
+// TestBoardingSweepReturnReversesOnReboard covers the coin a client gets back
+// when it boards, never joins a round, and the boarding sweep returns the
+// funds to its wallet. That return output is credited to wallet_balance like
+// any other own-wallet proceeds, so boarding it a second time must reverse the
+// first credit rather than count the same satoshis twice.
+//
+// Both arrival orders are exercised: the deposit can reach the ledger before
+// or after the sweep confirmation that produced its input, and either side
+// books the reversal when it commits second.
+func TestBoardingSweepReturnReversesOnReboard(t *testing.T) {
+	t.Parallel()
+
+	orders := []struct {
+		name       string
+		sweepFirst bool
+	}{
+		{
+			name:       "sweep return first",
+			sweepFirst: true,
+		},
+		{
+			name:       "deposit first",
+			sweepFirst: false,
+		},
+	}
+
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+
+			assertSweepReturnReversal(t, order.sweepFirst)
+		})
+	}
+}
+
+// assertSweepReturnReversal runs one sweep-return/re-board pair in the
+// requested order and asserts the coins are credited exactly once.
+func assertSweepReturnReversal(t *testing.T, sweepFirst bool) {
+	t.Helper()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	const (
+		boarded   = int64(100_000)
+		chainCost = int64(1_000)
+		returned  = boarded - chainCost
+	)
+
+	sweepTxid := [32]byte{0xa1}
+	returnPoint := wire.OutPoint{
+		Hash:  chainhash.Hash(sweepTxid),
+		Index: 0,
+	}
+
+	sweep := &BoardingSweepConfirmedMsg{
+		Txid:         sweepTxid,
+		BlockHeight:  900_000,
+		ChainCostSat: chainCost,
+		Inputs: []SweepInput{
+			{
+				Outpoint:  proceedsOutpoint(0xa0, 0),
+				AmountSat: boarded,
+			},
+		},
+		DestinationSat: returned,
+	}
+	deposit := depositMsg(0xa2, returned, returnPoint)
+
+	msgs := []LedgerMsg{sweep, deposit}
+	if !sweepFirst {
+		msgs = []LedgerMsg{deposit, sweep}
+	}
+	for _, msg := range msgs {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	entries := store.getEntries()
+
+	// Over the whole story the only value that should leave wallet_balance
+	// is the sweep's chain cost: the boarded coin moves out through
+	// clearing, the return credits it back, and the re-board's credit and
+	// the reversal cancel. Without the reversal this reads as the returned
+	// value credited twice.
+	balances := netBalances(entries)
+	require.Equal(
+		t, returned-boarded, balances[AccountWalletBalance],
+		"a re-boarded sweep return must be credited exactly once",
+	)
+
+	var reversals int
+	for _, entry := range entries {
+		if entry.DebitAccount != AccountOpeningBalance ||
+			entry.CreditAccount != AccountWalletBalance {
+
+			continue
+		}
+
+		reversals++
+		require.Equal(t, returned, entry.AmountSat)
+		require.Equal(t, EventWalletUTXOSpent, entry.EventType)
+		require.Equal(
+			t, classifiedUTXOIdempotencyKey(
+				ClassificationDepositFunding, sweepTxid, 0,
+			),
+			entry.IdempotencyKey,
+		)
+	}
+	require.Equal(t, 1, reversals)
 }

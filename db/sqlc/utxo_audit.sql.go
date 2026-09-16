@@ -35,8 +35,9 @@ type GetWalletUTXOLogCreatedByOutpointParams struct {
 }
 
 // GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
-// outpoint, if any. The boarding deposit path uses it to recognise a funding
-// input as a previously recorded own-wallet proceeds UTXO.
+// outpoint, if any. idx_utxo_log_outpoint_event makes it at most one row.
+// The ledger actor uses it to recognise a boarding deposit's funding input as
+// a UTXO whose value it already credited to wallet_balance.
 func (q *Queries) GetWalletUTXOLogCreatedByOutpoint(ctx context.Context, arg GetWalletUTXOLogCreatedByOutpointParams) (WalletUtxoLog, error) {
 	row := q.db.QueryRowContext(ctx, GetWalletUTXOLogCreatedByOutpoint, arg.OutpointHash, arg.OutpointIndex)
 	var i WalletUtxoLog

@@ -35,8 +35,9 @@ LIMIT $2 OFFSET $3;
 
 -- name: GetWalletUTXOLogCreatedByOutpoint :one
 -- GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
--- outpoint, if any. The boarding deposit path uses it to recognise a funding
--- input as a previously recorded own-wallet proceeds UTXO.
+-- outpoint, if any. idx_utxo_log_outpoint_event makes it at most one row.
+-- The ledger actor uses it to recognise a boarding deposit's funding input as
+-- a UTXO whose value it already credited to wallet_balance.
 SELECT entry_id, outpoint_hash, outpoint_index, amount_sat,
        event, block_height, classified_as, created_at
 FROM wallet_utxo_log

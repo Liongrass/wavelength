@@ -169,6 +169,14 @@ type InternalKey struct {
 	CreatedAt int64
 }
 
+type LedgerDepositFundingInput struct {
+	InputHash    []byte
+	InputIndex   int32
+	DepositHash  []byte
+	DepositIndex int32
+	CreatedAt    int64
+}
+
 type LedgerEntry struct {
 	EntryID            int64
 	DebitAccount       string

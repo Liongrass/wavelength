@@ -62,7 +62,7 @@ func TestEmitUTXOCreatedForwardsClassification(t *testing.T) {
 		t,
 		a.emitUTXOCreated(
 			t.Context(), utxo, 800_123,
-			ledger.ClassificationDeposit,
+			ledger.ClassificationDeposit, nil,
 		),
 	)
 
@@ -111,6 +111,7 @@ func TestEmitUTXOCreatedNegativeHeight(t *testing.T) {
 		t,
 		a.emitUTXOCreated(
 			t.Context(), utxo, -1, ledger.ClassificationDeposit,
+			nil,
 		),
 	)
 
@@ -138,6 +139,7 @@ func TestEmitUTXOCreatedNilUTXO(t *testing.T) {
 		t,
 		a.emitUTXOCreated(
 			t.Context(), nil, 800_000, ledger.ClassificationDeposit,
+			nil,
 		),
 	)
 
@@ -170,6 +172,7 @@ func TestEmitUTXOCreatedNoSink(t *testing.T) {
 		t,
 		a.emitUTXOCreated(
 			t.Context(), utxo, 100, ledger.ClassificationDeposit,
+			nil,
 		),
 	)
 }
