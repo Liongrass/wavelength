@@ -227,6 +227,28 @@ type Querier interface {
 	ListBoardingIntentsByStatus(ctx context.Context, status string) ([]BoardingIntent, error)
 	ListBoardingIntentsByStatusAndMinHeight(ctx context.Context, arg ListBoardingIntentsByStatusAndMinHeightParams) ([]BoardingIntent, error)
 	ListBoardingIntentsBySweepableStatuses(ctx context.Context, arg ListBoardingIntentsBySweepableStatusesParams) ([]BoardingIntent, error)
+	// ListBoardingIntentsWithoutDepositLeg is the converse: a confirmed boarding
+	// intent with no wallet_utxo_created ledger leg at its outpoint. The deposit
+	// leg is what balances the later boarding outflow, so a missing one drifts
+	// wallet_balance negative by the intent amount.
+	//
+	// Every status qualifies, not just 'confirmed': intents are written only once
+	// the boarding UTXO has confirmed, so every row here was confirmed and the
+	// later lifecycle statuses (adopted, swept) describe an intent that should
+	// still carry its deposit leg. What does need excluding is the pre-ledger
+	// era. boarding_intents arrives in migration 2 and the accounting schema in
+	// migration 6, so an upgraded database holds intents from before any leg
+	// could have been written. The scan therefore floors at the oldest audit row.
+	// On a database with no audit rows the floor is NULL, the comparison is
+	// never true, and nothing is reported -- the right answer for a ledger that
+	// has recorded no wallet UTXO at all.
+	//
+	// Zero heights are excluded from the floor. Producers write 0 for a height
+	// they do not know yet (see blockHeight in round/actor.go), and one such row
+	// would drag the minimum to 0, erase the floor and report every pre-ledger
+	// intent as a violation. A sentinel is not evidence about when the ledger
+	// era began, so it does not get a vote.
+	ListBoardingIntentsWithoutDepositLeg(ctx context.Context) ([]ListBoardingIntentsWithoutDepositLegRow, error)
 	ListBoardingSweepInputs(ctx context.Context, txid []byte) ([]BoardingSweepInput, error)
 	ListBoardingSweeps(ctx context.Context, arg ListBoardingSweepsParams) ([]BoardingSweep, error)
 	ListChainInfo(ctx context.Context) ([]ChainInfo, error)
@@ -235,24 +257,61 @@ type Querier interface {
 	ListClientLedgerEntries(ctx context.Context, arg ListClientLedgerEntriesParams) ([]LedgerEntry, error)
 	ListClientLedgerEntriesByType(ctx context.Context, arg ListClientLedgerEntriesByTypeParams) ([]LedgerEntry, error)
 	ListClientLedgerEventTotals(ctx context.Context) ([]ListClientLedgerEventTotalsRow, error)
+	// ListDepositLegsWithoutBoardingIntent finds the third known anomaly's first
+	// direction: an audit row classified as a boarding deposit whose outpoint
+	// has no boarding intent. Only the 'deposit' classification is checked;
+	// change and sweep-return deposits legitimately have no intent.
+	ListDepositLegsWithoutBoardingIntent(ctx context.Context) ([]ListDepositLegsWithoutBoardingIntentRow, error)
 	// ListEntriesByKindStatus returns entries of the given kind and status, paged
 	// by the unique canonical_id ascending. It backs the startup rehydration of
 	// the wallet-local pending map: filtering in SQL keeps that scan O(matching
 	// rows) instead of decoding the whole activity feed, and the canonical_id
 	// cursor is strictly monotonic (a full page always advances it).
 	ListEntriesByKindStatus(ctx context.Context, arg ListEntriesByKindStatusParams) ([]ActivityEntry, error)
+	// ListFlagFollowingExitSendLegs finds the first known anomaly: an exit send
+	// leg whose debit account followed the own-wallet destination flag, so it
+	// reads "wallet_balance <- vtxo_balance" under a vtxo_sent event. Current
+	// code always books the send leg on transfers_out and puts the own-wallet
+	// movement in a separately keyed proceeds leg, so any row in this shape
+	// predates that fix. twin_count reports whether the correctly-shaped send
+	// leg for the same chain identity also exists.
+	ListFlagFollowingExitSendLegs(ctx context.Context) ([]ListFlagFollowingExitSendLegsRow, error)
 	// ListForfeitingVTXOsByRound returns the outpoint and amount of every VTXO
 	// sitting in Forfeiting status whose forfeit reservation is bound to the
 	// given round. Used during restart recovery to rebuild a reloaded round's
 	// forfeit set, so the status-reconcile release path has real outpoints to
 	// return to Live rather than the empty in-memory set the crash discarded.
 	ListForfeitingVTXOsByRound(ctx context.Context, forfeitRoundID sql.NullString) ([]ListForfeitingVTXOsByRoundRow, error)
+	// ListKeyedLedgerEntries returns every entry carrying an idempotency key.
+	// The checker parses the versioned "ledger:v1:<operation>:<leg>:" prefix in
+	// Go, groups the legs of one outpoint-scoped operation, and compares their
+	// amounts. Doing the prefix surgery in Go keeps the key encoding in one
+	// place instead of restating it in a dialect-portable SQL expression.
+	ListKeyedLedgerEntries(ctx context.Context) ([]LedgerEntry, error)
+	// ListLedgerEntriesForFingerprint returns the whole journal in entry-ID
+	// order so the checker can fingerprint it. The fingerprint binds to journal
+	// content alone and names no database, host or file, which is what lets a
+	// report prepared against a restored copy be compared with the production
+	// daemon: identical journals produce an identical hash. It also means the
+	// hash cannot tell an operator which of the two they are pointed at, so the
+	// checker prints the entry count alongside it.
+	ListLedgerEntriesForFingerprint(ctx context.Context) ([]LedgerEntry, error)
+	// ListLedgerIdempotencyKeyDuplicates mirrors
+	// idx_client_ledger_idempotent_key.
+	ListLedgerIdempotencyKeyDuplicates(ctx context.Context) ([]ListLedgerIdempotencyKeyDuplicatesRow, error)
 	// ListLedgerRoundIDsMissingUuid returns the distinct raw round_id BLOBs that
 	// have not yet been mirrored into the round_uuid TEXT column. The BLOB-to-UUID
 	// string conversion is not expressible in the SQL dialect subset shared by
 	// SQLite and Postgres, so the migration-015 post-step performs it in Go and
 	// writes the result back via BackfillLedgerRoundUuid.
 	ListLedgerRoundIDsMissingUuid(ctx context.Context) ([][]byte, error)
+	// ListLedgerRoundKeyDuplicates mirrors idx_client_ledger_idempotent_round:
+	// no two round-keyed entries without an explicit idempotency key may share
+	// (round_id, event_type, debit_account, credit_account).
+	ListLedgerRoundKeyDuplicates(ctx context.Context) ([]ListLedgerRoundKeyDuplicatesRow, error)
+	// ListLedgerSessionKeyDuplicates mirrors
+	// idx_client_ledger_idempotent_session.
+	ListLedgerSessionKeyDuplicates(ctx context.Context) ([]ListLedgerSessionKeyDuplicatesRow, error)
 	// Migration 19 rewrites only the legacy 36-byte outpoint identities used by
 	// refresh sends and unilateral-exit legs. Other event types may also carry
 	// 36-byte natural keys, so the account/event shapes are part of the filter.
@@ -310,6 +369,12 @@ type Querier interface {
 	// ListRoundsPaginated returns rounds ordered by round_id with cursor-
 	// based pagination. When cursor is empty, returns from the beginning.
 	ListRoundsPaginated(ctx context.Context, arg ListRoundsPaginatedParams) ([]Round, error)
+	// ListSelfChangeBookedAsTransfersIn finds the second known anomaly: an OOR
+	// receive booked as transfers_in even though its session already carries an
+	// outgoing vtxo_sent leg, which makes the receive the sender's own change.
+	// The receive row carries no session_id of its own, so the session is
+	// recovered through the OOR binding the history query uses.
+	ListSelfChangeBookedAsTransfersIn(ctx context.Context) ([]ListSelfChangeBookedAsTransfersInRow, error)
 	// ListSpendingReservationOutpoints returns every reserved outpoint. Used by
 	// the startup sweep to build the set of live reservations.
 	ListSpendingReservationOutpoints(ctx context.Context) ([]ListSpendingReservationOutpointsRow, error)
@@ -365,9 +430,21 @@ type Querier interface {
 	// a forfeit_round_id, instead of aggregating every fee row in the ledger on
 	// every call.
 	ListVTXOsByStatus(ctx context.Context, status int32) ([]ListVTXOsByStatusRow, error)
+	// ListWalletLedgerLegsWithoutAuditRow is the converse direction: a wallet
+	// UTXO ledger leg whose audit row is missing, or present for a different
+	// amount. Every such leg is a violation, since handleUTXOCreated and
+	// handleUTXOSpent write both rows in one transaction from the same message.
+	ListWalletLedgerLegsWithoutAuditRow(ctx context.Context) ([]ListWalletLedgerLegsWithoutAuditRowRow, error)
 	ListWalletUTXOLog(ctx context.Context, arg ListWalletUTXOLogParams) ([]WalletUtxoLog, error)
 	ListWalletUTXOLogByBlock(ctx context.Context, blockHeight int32) ([]WalletUtxoLog, error)
 	ListWalletUTXOLogByClassification(ctx context.Context, arg ListWalletUTXOLogByClassificationParams) ([]WalletUtxoLog, error)
+	// ListWalletUTXOLogWithoutLedgerLeg returns audit rows that have no ledger
+	// entry at the same chain identity, event class AND amount. Matching the
+	// amount too costs nothing and turns a pair that disagrees about value into
+	// a finding rather than a silent pass. The checker filters the result down to
+	// the classifications that are supposed to book a leg; audit-only
+	// classifications legitimately appear here.
+	ListWalletUTXOLogWithoutLedgerLeg(ctx context.Context) ([]WalletUtxoLog, error)
 	// Status 2 = Failed (anchored to Go iota in db/credit_operation_store.go
 	// CreditOpStatus). Failed operations never dedup a keyed retry, so the lookup
 	// skips them: only a pending or completed operation answers for an op_key.
@@ -421,7 +498,27 @@ type Querier interface {
 	// has since taken.
 	RevertRoundAdoptedBoardingIntents(ctx context.Context, arg RevertRoundAdoptedBoardingIntentsParams) error
 	SumBoardingIntentAmountsByStatus(ctx context.Context, status string) (interface{}, error)
+	// SumLedgerWalletLegs totals the ledger legs that move value in and out of
+	// wallet_balance, split by event type and by whether wallet_balance is the
+	// debit or the credit side. The checker reconciles these against the audit
+	// log totals above.
+	SumLedgerWalletLegs(ctx context.Context) ([]SumLedgerWalletLegsRow, error)
 	SumUnspentVTXOAmounts(ctx context.Context) (interface{}, error)
+	// Read-only projections used by the accounting invariant checker
+	// (internal/cmd/tools/accounting). Every query here is a SELECT; the
+	// checker never writes. Keep the classification policy that decides
+	// which audit rows are expected to carry a ledger leg in Go next to
+	// the handlers that apply it, so these queries stay policy-free and
+	// return the raw rows the checker filters.
+	// SumUnspentVTXOAmountsByStatus totals the unspent VTXOs per status. Which
+	// statuses count toward the ledger's vtxo_balance, and which are reconciling
+	// items the check reports rather than fails on, is policy: it lives in Go
+	// next to the handlers whose timing decides it, per this file's header.
+	SumUnspentVTXOAmountsByStatus(ctx context.Context) ([]SumUnspentVTXOAmountsByStatusRow, error)
+	// SumWalletUTXOLogByEventAndClassification returns the audit log totalled
+	// per (event, classification) pair. The checker decides which pairs are
+	// expected to have booked a ledger leg.
+	SumWalletUTXOLogByEventAndClassification(ctx context.Context) ([]SumWalletUTXOLogByEventAndClassificationRow, error)
 	UpdateBoardingIntentStatus(ctx context.Context, arg UpdateBoardingIntentStatusParams) error
 	UpdateLedgerEntryIdempotencyKey(ctx context.Context, arg UpdateLedgerEntryIdempotencyKeyParams) (int64, error)
 	UpdateLegacyExitLedgerEntry(ctx context.Context, arg UpdateLegacyExitLedgerEntryParams) (int64, error)
