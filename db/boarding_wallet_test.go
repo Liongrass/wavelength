@@ -1,7 +1,9 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	btcaddr "github.com/btcsuite/btcd/address/v2"
@@ -12,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightninglabs/wavelength/baselib/actor"
 	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/lib/arkscript"
 	"github.com/lightninglabs/wavelength/lib/types"
@@ -154,7 +157,7 @@ func createSweepStoreIntentWithSeed(t *testing.T, store *BoardingWalletStore,
 		},
 		Status: wallet.BoardingStatusConfirmed,
 	}
-	require.NoError(t, store.InsertBoardingIntents(ctx, intent))
+	require.NoError(t, store.InsertBoardingIntents(ctx, nil, intent))
 
 	return intent
 }
@@ -360,7 +363,7 @@ func TestBoardingIntentLifecycle(t *testing.T) {
 	}
 
 	// Insert the intent.
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	// Retrieve the intent by outpoint.
@@ -385,7 +388,7 @@ func TestBoardingIntentLifecycle(t *testing.T) {
 	intent.Status = wallet.BoardingStatusAdopted
 
 	// Re-insert (upsert) with updated status.
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	// Retrieve again and verify status update.
@@ -411,7 +414,7 @@ func TestBoardingIntentConfirmedReplayDoesNotRegressStatus(t *testing.T) {
 	)
 
 	intent.Status = wallet.BoardingStatusConfirmed
-	require.NoError(t, store.InsertBoardingIntents(ctx, intent))
+	require.NoError(t, store.InsertBoardingIntents(ctx, nil, intent))
 
 	retrievedIntent, err := store.GetIntent(ctx, intent.Outpoint)
 	require.NoError(t, err)
@@ -573,7 +576,7 @@ func TestUpdateBoardingIntentStatus(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	err = store.UpdateBoardingIntentStatus(
@@ -631,7 +634,7 @@ func TestFetchBoardingIntentsByStatus(t *testing.T) {
 			Status: status,
 		}
 
-		err = store.InsertBoardingIntents(ctx, intent)
+		err = store.InsertBoardingIntents(ctx, nil, intent)
 		require.NoError(t, err)
 	}
 
@@ -1026,7 +1029,7 @@ func TestFetchBoardingIntents(t *testing.T) {
 			Status: status,
 		}
 
-		err = store.InsertBoardingIntents(ctx, intent)
+		err = store.InsertBoardingIntents(ctx, nil, intent)
 		require.NoError(t, err)
 	}
 
@@ -1073,7 +1076,7 @@ func TestLookupIntentByScript(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	retrievedIntent, err := store.LookupIntentByScript(ctx, pkScript)
@@ -1137,7 +1140,7 @@ func TestInsertMultipleBoardingIntents(t *testing.T) {
 	}
 
 	// Insert all intents in a single transaction.
-	err = store.InsertBoardingIntents(ctx, intents...)
+	err = store.InsertBoardingIntents(ctx, nil, intents...)
 	require.NoError(t, err)
 
 	// Verify all were inserted.
@@ -1217,7 +1220,7 @@ func TestIntentWithConfTx(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	// Retrieve and verify the transaction.
@@ -1280,7 +1283,7 @@ func TestIntentWithoutConfTx(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	// Retrieve and verify ConfTx is nil.
@@ -1361,7 +1364,7 @@ func TestIntentTxProofRoundTrip(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	retrieved, err := store.GetIntent(ctx, outpoint)
@@ -1425,7 +1428,7 @@ func TestIntentTxProofMissingDecodesAsNone(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	retrieved, err := store.GetIntent(ctx, outpoint)
@@ -1477,7 +1480,7 @@ func TestIntentTxProofCorruptDecodesAsNone(t *testing.T) {
 		Status: wallet.BoardingStatusConfirmed,
 	}
 
-	err = store.InsertBoardingIntents(ctx, intent)
+	err = store.InsertBoardingIntents(ctx, nil, intent)
 	require.NoError(t, err)
 
 	// Inject a malformed TLV blob directly into the tx_proof column.
@@ -1506,4 +1509,178 @@ func TestIntentTxProofCorruptDecodesAsNone(t *testing.T) {
 		t, retrieved.ChainInfo.TxProof.IsNone(),
 		"corrupt blob must decode as None, not error",
 	)
+}
+
+// TestFinalizeBoardingSweepInputsCallbackSharesTransaction proves the
+// finalize callback runs inside the input transition's transaction: it sees
+// the open transaction on its context, and its failure leaves the sweep
+// unresolved so the next start can re-drive it.
+func TestFinalizeBoardingSweepInputsCallbackSharesTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, _ := newBoardingStoreForTest(t)
+
+	intent := createSweepStoreIntent(t, store)
+	sweepTx := wire.NewMsgTx(2)
+	sweepTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: intent.Outpoint,
+	})
+	sweepTx.AddTxOut(&wire.TxOut{
+		Value:    int64(intent.ChainInfo.Amount - 500),
+		PkScript: []byte{txscript.OP_TRUE},
+	})
+	sweepTxid := sweepTx.TxHash()
+
+	require.NoError(
+		t,
+		store.CreatePendingBoardingSweep(
+			ctx, wallet.NewBoardingSweep{
+				Tx:                 sweepTx,
+				DestinationAddress: "bcrt1test",
+				TotalAmount:        intent.ChainInfo.Amount,
+				FeeAmount:          500,
+				FeeRateSatPerVByte: 2,
+				VBytes:             250,
+				CreatedHeight:      200,
+				Inputs: []wallet.NewBoardingSweepInput{{
+					Outpoint:       intent.Outpoint,
+					Amount:         intent.ChainInfo.Amount,
+					PreviousStatus: intent.Status,
+				}},
+			},
+		),
+	)
+	require.NoError(t, store.MarkBoardingSweepPublished(ctx, sweepTxid))
+
+	// A refused enqueue must roll the input transition back with it.
+	enqueueErr := errors.New("mailbox insert refused")
+	outpoints := []wire.OutPoint{intent.Outpoint}
+	err := store.FinalizeBoardingSweepInputs(
+		ctx, outpoints, sweepTxid, 222,
+		func(context.Context) error { return enqueueErr },
+	)
+	require.ErrorIs(t, err, enqueueErr)
+
+	pending, err := store.ListPendingBoardingSweeps(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "refused enqueue must not resolve sweep")
+	require.Equal(
+		t, wallet.BoardingSweepInputStatusPublished,
+		dbSweepInputStatus(t, pending[0].Inputs),
+	)
+
+	// A succeeding callback observes the transaction on its context and
+	// the sweep resolves with it.
+	var sawTx bool
+	require.NoError(
+		t, store.FinalizeBoardingSweepInputs(
+			ctx, outpoints, sweepTxid, 222,
+			func(txCtx context.Context) error {
+				_, sawTx = actor.TxFromContext(txCtx)
+
+				return nil
+			},
+		),
+	)
+	require.True(t, sawTx, "callback must run with the open transaction")
+
+	pending, err = store.ListPendingBoardingSweeps(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
+	updated, err := store.GetIntent(ctx, intent.Outpoint)
+	require.NoError(t, err)
+	require.Equal(t, wallet.BoardingStatusSwept, updated.Status)
+
+	// A redelivery finds every input already resolved and is a no-op that
+	// still runs the callback, so replayed accounting reaches the ledger.
+	var replayed bool
+	require.NoError(
+		t, store.FinalizeBoardingSweepInputs(
+			ctx, outpoints, sweepTxid, 222,
+			func(context.Context) error {
+				replayed = true
+
+				return nil
+			},
+		),
+	)
+	require.True(t, replayed)
+}
+
+// TestInsertBoardingIntentsCallbackSharesTransaction proves the insert
+// callback runs inside the intent's own transaction: it sees the open
+// transaction on its context, and its failure rolls the intent back so the
+// UTXO stays undetected and the next tip tick re-drives it.
+func TestInsertBoardingIntentsCallbackSharesTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, _ := newBoardingStoreForTest(t)
+
+	boardingAddr, _ := createTestBoardingAddress(t, 0x77)
+	require.NoError(t, store.InsertBoardingAddress(ctx, boardingAddr))
+
+	pkScript, err := txscript.PayToAddrScript(boardingAddr.Address)
+	require.NoError(t, err)
+
+	confTx := wire.NewMsgTx(2)
+	confTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash: chainhash.Hash{0x77},
+		},
+	})
+	confTx.AddTxOut(&wire.TxOut{
+		Value:    10_000,
+		PkScript: pkScript,
+	})
+	outpoint := wire.OutPoint{
+		Hash: confTx.TxHash(),
+	}
+	intent := wallet.BoardingIntent{
+		Address:  *boardingAddr,
+		Outpoint: outpoint,
+		ChainInfo: wallet.BoardingChainInfo{
+			ConfHeight: 100,
+			ConfHash: chainhash.Hash{
+				0xaa,
+			},
+			ConfTx:   confTx,
+			OutPoint: outpoint,
+			Amount:   10_000,
+		},
+		Status: wallet.BoardingStatusConfirmed,
+	}
+
+	// A refused enqueue must roll the intent write back with it.
+	enqueueErr := errors.New("mailbox insert refused")
+	err = store.InsertBoardingIntents(
+		ctx,
+		func(context.Context) error { return enqueueErr }, intent,
+	)
+	require.ErrorIs(t, err, enqueueErr)
+
+	intents, err := store.FetchBoardingIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, intents, "refused enqueue must not persist the intent")
+
+	// A succeeding callback observes the transaction on its context and
+	// the intent lands with it.
+	var sawTx bool
+	require.NoError(
+		t, store.InsertBoardingIntents(
+			ctx, func(txCtx context.Context) error {
+				_, sawTx = actor.TxFromContext(txCtx)
+
+				return nil
+			}, intent,
+		),
+	)
+	require.True(t, sawTx, "callback must run with the open transaction")
+
+	intents, err = store.FetchBoardingIntents(ctx)
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	require.Equal(t, outpoint, intents[0].Outpoint)
 }

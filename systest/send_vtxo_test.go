@@ -925,6 +925,7 @@ func seedVTXO(t *testing.T, cfg *waved.Config, operatorKey *btcec.PublicKey,
 				[]byte(t.Name() + "-" + label + "-block"),
 			),
 		},
+		nil,
 	)
 	require.NoError(t, err)
 

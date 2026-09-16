@@ -931,6 +931,75 @@ func TestLedgerStoreTransactionHistoryClassifiesOORReceiveWithoutSessionID(
 	require.Equal(t, sessionID, rows[0].SessionID)
 }
 
+// TestLedgerStoreTransactionHistoryHidesExitProceedsLeg verifies the
+// own-wallet exit proceeds leg never reaches the history: it shares the send
+// leg's chain identity, so listing it would show the same exit twice.
+func TestLedgerStoreTransactionHistoryHidesExitProceedsLeg(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, _ := newLedgerStoreAndDBForTest(t)
+	outpointHash := testBytes(32, 0x51)
+	outpointIndex := int32(1)
+	height := int32(800_900)
+	legs := []ledger.LedgerEntry{
+		{
+			DebitAccount:  ledger.AccountTransfersOut,
+			CreditAccount: ledger.AccountVTXOBalance,
+			AmountSat:     9_000,
+			EventType:     ledger.EventVTXOSent,
+			Description:   "unilateral exit net value",
+			IdempotencyKey: ledger.ExitSendIdempotencyKey(
+				[32]byte(outpointHash), uint32(outpointIndex),
+			),
+		},
+		{
+			DebitAccount:  ledger.AccountOnchainFees,
+			CreditAccount: ledger.AccountVTXOBalance,
+			AmountSat:     1_000,
+			EventType:     ledger.EventOnchainFeePaid,
+			Description:   "exit cost",
+			IdempotencyKey: ledger.ExitFeeIdempotencyKey(
+				[32]byte(outpointHash), uint32(outpointIndex),
+			),
+		},
+		{
+			DebitAccount:   ledger.AccountWalletBalance,
+			CreditAccount:  ledger.AccountTransfersOut,
+			AmountSat:      9_000,
+			EventType:      ledger.EventVTXOSent,
+			Description:    "exit proceeds to own wallet",
+			IdempotencyKey: testBytes(36, 0x52),
+		},
+	}
+	for _, leg := range legs {
+		leg.CreatedAt = 100
+		leg.ChainTxid = outpointHash
+		leg.ChainVout = &outpointIndex
+		leg.ConfirmationHeight = &height
+		require.NoError(t, store.InsertLedgerEntry(ctx, leg))
+	}
+
+	rows, err := store.ListTransactionHistory(ctx, "", 0, 0, 10, 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "only the send and fee legs are listed")
+	for _, row := range rows {
+		require.NotEqual(
+			t, ledger.AccountWalletBalance, row.DebitAccount,
+			"the proceeds contra leg must not surface",
+		)
+	}
+
+	var sendRows int
+	for _, row := range rows {
+		if row.Subtype == ledger.EventVTXOSent {
+			sendRows++
+			require.Equal(t, int64(1_000), row.FeeSat)
+		}
+	}
+	require.Equal(t, 1, sendRows, "one EXIT row per exit")
+}
+
 // TestLedgerStoreTransactionHistorySynthesizesOORReceiveFromBinding verifies
 // old ledger rows that predate structured outpoint fields can still be paired
 // through the OOR binding table without parsing descriptions.

@@ -2,7 +2,9 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"errors"
 	"sort"
 	"testing"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/google/uuid"
+	"github.com/lightninglabs/wavelength/baselib/actor"
 	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/lib/arkscript"
 	"github.com/lightninglabs/wavelength/lib/tree"
@@ -514,7 +517,9 @@ func TestRoundStoreFinalizeRound(t *testing.T) {
 			0xef,
 		},
 	}
-	err = store.FinalizeRound(ctx, testRound.RoundID, txid, confInfo)
+	err = store.FinalizeRound(
+		ctx, testRound.RoundID, txid, confInfo, nil,
+	)
 	require.NoError(t, err)
 
 	// List active rounds - should be empty now.
@@ -580,7 +585,7 @@ func TestRoundStoreListConfirmedRounds(t *testing.T) {
 			},
 		}
 		err = store.FinalizeRound(
-			ctx, rounds[i].RoundID, txid, confInfo,
+			ctx, rounds[i].RoundID, txid, confInfo, nil,
 		)
 		require.NoError(t, err)
 	}
@@ -1101,7 +1106,7 @@ func TestRoundStoreDecoupledVTXOStorage(t *testing.T) {
 		require.NoError(t, err)
 
 		err = boardingStore.InsertBoardingIntents(
-			ctx, fixtures[i].walletIntent,
+			ctx, nil, fixtures[i].walletIntent,
 		)
 		require.NoError(t, err)
 	}
@@ -1434,7 +1439,7 @@ func TestListRoundsPaginated(t *testing.T) {
 			0xab,
 		},
 	}
-	err = store.FinalizeRound(ctx, roundIDs[0], txid, confInfo)
+	err = store.FinalizeRound(ctx, roundIDs[0], txid, confInfo, nil)
 	require.NoError(t, err)
 
 	// Re-fetch all — the finalized round should show "confirmed".
@@ -1487,7 +1492,7 @@ func TestListRoundsPaginatedFiltersBeforeLimit(t *testing.T) {
 		round.ConfInfo{
 			Height:    999,
 			BlockHash: chainhash.Hash{0xbb},
-		},
+		}, nil,
 	)
 	require.NoError(t, err)
 
@@ -1560,7 +1565,7 @@ func TestRoundStoreWithBoardingGroup(t *testing.T) {
 		require.NoError(t, err)
 
 		err = boardingStore.InsertBoardingIntents(
-			ctx, fixtures[i].walletIntent,
+			ctx, nil, fixtures[i].walletIntent,
 		)
 		require.NoError(t, err)
 	}
@@ -2384,4 +2389,55 @@ func TestRoundStoreFailRoundLeavesConfirmedRoundAlone(t *testing.T) {
 		t, wallet.BoardingStatusAdopted, got.Status,
 		"retirement resurrected a deposit spent by a confirmed round",
 	)
+}
+
+// TestRoundStoreFinalizeRoundCallbackSharesTransaction proves the finalize
+// callback runs inside the round row's transaction: it sees the open
+// transaction on its context, and its failure rolls the round row back.
+func TestRoundStoreFinalizeRoundCallbackSharesTransaction(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newRoundStoreForTest(t)
+	ctx := t.Context()
+
+	testRound := createTestRound(t, testRoundIDDB("test-round-callback"))
+	state := &round.InputSigSentState{
+		RoundID:     testRound.RoundID,
+		ClientTrees: make(map[round.SignerKey]*tree.Tree),
+	}
+	require.NoError(t, store.CommitState(ctx, testRound, state))
+
+	var txid chainhash.Hash
+	testRound.CommitmentTx.WhenSome(func(packet *psbt.Packet) {
+		txid = packet.UnsignedTx.TxHash()
+	})
+	confInfo := round.ConfInfo{Height: 12345}
+
+	// A failing callback must leave the round active.
+	callbackErr := errors.New("ledger enqueue refused")
+	err := store.FinalizeRound(
+		ctx, testRound.RoundID, txid, confInfo,
+		func(context.Context) error { return callbackErr },
+	)
+	require.ErrorIs(t, err, callbackErr)
+	activeRounds, err := store.ListActiveRounds(ctx)
+	require.NoError(t, err)
+	require.Len(t, activeRounds, 1)
+
+	// A succeeding callback observes the transaction on its context and
+	// the round finalizes with it.
+	var sawTx bool
+	err = store.FinalizeRound(
+		ctx, testRound.RoundID, txid, confInfo,
+		func(txCtx context.Context) error {
+			_, sawTx = actor.TxFromContext(txCtx)
+
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, sawTx, "callback must run with the open transaction")
+	activeRounds, err = store.ListActiveRounds(ctx)
+	require.NoError(t, err)
+	require.Empty(t, activeRounds)
 }

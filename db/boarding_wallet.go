@@ -299,15 +299,29 @@ func (b *BoardingWalletStore) ListAllBoardingAddresses(ctx context.Context) (
 	return result, err
 }
 
-// InsertBoardingIntents persists one or more boarding intents. This operation
-// is idempotent, allowing the same intent to be saved multiple times as it
-// progresses through different states.
+// InsertBoardingIntents persists one or more boarding intents and runs then
+// inside the same write transaction. This operation is idempotent, allowing
+// the same intent to be saved multiple times as it progresses through
+// different states.
+//
+// The callback sees the open transaction on its context, so a durable enqueue
+// made with it commits with the intent rows or rolls back with them: the
+// deposit's accounting and the store's record of it are one durable fact. A
+// refused enqueue therefore leaves the UTXO unpersisted, and the next tip tick
+// re-detects it. A nil callback keeps the plain insert behaviour.
+//
+// then runs after every intent is written, and must be pure with respect to
+// in-memory state: ExecTxCtx re-runs the whole callback body when the commit
+// trips a serialization or busy error.
 func (b *BoardingWalletStore) InsertBoardingIntents(ctx context.Context,
+	then func(context.Context) error,
 	intents ...wallet.BoardingIntent) error {
 
 	writeTxOpts := WriteTxOption()
 
-	return b.db.ExecTx(ctx, writeTxOpts, func(q BoardingStore) error {
+	return b.db.ExecTxCtx(ctx, writeTxOpts, func(txCtx context.Context,
+		q BoardingStore) error {
+
 		for _, intent := range intents {
 			params, err := domainIntentToInsertParams(
 				intent, b.clock,
@@ -324,7 +338,11 @@ func (b *BoardingWalletStore) InsertBoardingIntents(ctx context.Context,
 			}
 		}
 
-		return nil
+		if then == nil {
+			return nil
+		}
+
+		return then(txCtx)
 	})
 }
 

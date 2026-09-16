@@ -457,9 +457,11 @@ type RoundStore interface {
 
 	// FinalizeRound marks a round as complete and archives it. The ConfInfo
 	// contains the block height and hash at which the commitment tx was
-	// confirmed.
+	// confirmed. When then is non-nil it runs inside the same write
+	// transaction with a context that carries it, so work such as
+	// durable ledger enqueues commits with the round row or not at all.
 	FinalizeRound(ctx context.Context, roundID RoundID, txid chainhash.Hash,
-		confInfo ConfInfo) error
+		confInfo ConfInfo, then func(context.Context) error) error
 
 	// FailRound retires a checkpointed round whose fate is known to be
 	// dead, and returns the boarding intents it adopted to the live pool.

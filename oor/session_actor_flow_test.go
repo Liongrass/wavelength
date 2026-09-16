@@ -1240,3 +1240,44 @@ func TestSessionActorMetadataQueryTransientErrorRetries(t *testing.T) {
 	require.NoError(t, err)
 	require.IsType(t, &ReceiveNotified{}, state)
 }
+
+// TestQueueVTXOsReceivedStampsSessionID proves every incoming
+// materialization reaches the ledger as a plain SourceOOR receive carrying
+// the session id. The ledger, not the session actor, decides whether that
+// session is the sender's own change coming back, so no registry lookup or
+// caller idempotency key takes part here.
+func TestQueueVTXOsReceivedStampsSessionID(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	descs := []*vtxo.Descriptor{{
+		Outpoint: wire.OutPoint{
+			Hash: chainhash.Hash{
+				0x91,
+			},
+			Index: 0,
+		},
+		Amount: btcutil.Amount(3_000),
+	}}
+
+	sid := oorSessionID(0x92)
+	b := &sessionBehavior{
+		cfg: SessionActorConfig{
+			LedgerSink: fn.Some[ledger.Sink](
+				&recordingLedgerSink{},
+			),
+		},
+		actorID:   ActorIDForSession(sid),
+		log:       btclog.Disabled,
+		sessionID: sid,
+		direction: clientdb.OORSessionDirectionIncoming,
+	}
+	require.NoError(t, b.queueVTXOsReceived(ctx, descs))
+	require.Len(t, b.pendingLedger, 1)
+	msg, ok := b.pendingLedger[0].(*ledger.VTXOReceivedMsg)
+	require.True(t, ok)
+	require.Equal(t, ledger.SourceOOR, msg.Source)
+	require.Equal(t, [32]byte(sid), msg.SessionID)
+	require.Equal(t, int64(3_000), msg.AmountSat)
+}

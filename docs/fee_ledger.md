@@ -95,10 +95,12 @@ replay dedup — see the [Replay safety](#replay-safety) section.
 | `VTXOReceivedMsg` | `SourceRoundRefresh` | `vtxo_balance` | `transfers_out` | Refresh or directed-send self-change output. Paired with `VTXOSentMsg` for the gross forfeit; the two cancel on `transfers_out` so only the fee moves `vtxo_balance`. |
 | `VTXOReceivedMsg` | `SourceRoundTransfer` | `vtxo_balance` | `transfers_in` | In-round receive from another participant's directed send. |
 | `VTXOReceivedMsg` | `SourceOOR` | `vtxo_balance` | `transfers_in` | Out-of-round receive from another participant. |
+| `VTXOReceivedMsg` | `SourceOOR` under a session with a booked `vtxo_sent` leg | `vtxo_balance` | `transfers_out` | The sender's own change from an outgoing OOR transfer, pushed back as a separate incoming session. The handler derives this from the ledger's own rows and books it as `SourceOORSelfChange`; it cancels the part of the companion `VTXOSentMsg` debit that never left. |
 | `VTXOSentMsg` | (any) | `transfers_out` | `vtxo_balance` | One message per sent VTXO. Outpoint stamps an idempotency key so multi-VTXO rounds don't collapse. |
 | `FeePaidMsg` | `FeeTypeBoarding` or `FeeTypeRefresh` | `fees_paid` | `vtxo_balance` | Operator fee for the round. |
 | `FeePaidMsg` | `FeeTypeOnchainSweep` | `onchain_fees` | `wallet_clearing` | Boarding sweep chain cost, keyed by sweep txid. Retained for direct callers; the boarding sweep producer now folds this leg into `BoardingSweepConfirmedMsg`. |
-| `ExitCostMsg` (send leg) | — | `transfers_out` | `vtxo_balance` | Net-of-fee value that left the VTXO layer. |
+| `ExitCostMsg` (send leg) | — | `transfers_out` | `vtxo_balance` | Net-of-fee value swept out of the VTXO. Booked the same way whatever the destination, so its dedup identity never depends on the flag. |
+| `ExitCostMsg` (proceeds leg) | `DestinationOwnWallet=true` | `wallet_balance` | `transfers_out` | Net-of-fee value that landed in an output the client's own wallet controls. Cancels the send leg on `transfers_out`: an internal asset transfer, not an outflow. |
 | `ExitCostMsg` (fee leg) | — | `onchain_fees` | `vtxo_balance` | Miner fee portion. |
 
 Rejected sources fail with `ErrInvalidMessage`; a caller typo
@@ -262,8 +264,8 @@ emitter (recipient side): oor.sessionBehavior.queueVTXOsReceived
                           (in notifyMaterialized)
 
 Sender event (vtxo_sent):
-  debit  transfers_out     += amount
-  credit vtxo_balance      += amount  (asset down)
+  debit  transfers_out     += Σ inputs
+  credit vtxo_balance      += Σ inputs  (asset down)
 
 Recipient event (vtxo_received, SourceOOR):
   debit  vtxo_balance      += amount
@@ -274,28 +276,89 @@ OOR rounds are currently fee-less on the wire (no `FeePaidMsg`
 is emitted). If that changes, a new emission site would add a
 third leg analogous to the refresh case.
 
+A payment with change produces a third event. The sender books the
+full input sum as `vtxo_sent`, and the operator pushes the sender's
+own change output back as a separate incoming session under the same
+session id:
+
+```
+Self-change event (vtxo_received, SourceOORSelfChange):
+  debit  vtxo_balance      += change
+  credit transfers_out     += change  (expense down)
+```
+
+This cancels the part of the sender's gross debit that never left, so
+`transfers_out` ends at what the recipient actually got — the same
+three-leg cancellation the refresh path uses, keyed by session instead
+of round. `queueVTXOsReceived` sends every materialization as a plain
+`SourceOOR` receive stamped with the session id, and
+`handleVTXOReceived` tells the two cases apart from the ledger's own
+rows: a `vtxo_sent` leg already booked under that session id means
+this daemon dispatched the outgoing transfer, so the receive is its
+change. The oracle is ordered by construction: the outgoing send leg
+is enqueued in the outgoing session's commit, the operator only admits
+the incoming self-transfer hint once that session is terminal, and the
+durable mailbox delivers in enqueue order. It needs no caller
+idempotency key and does not depend on the session row, which flips to
+the incoming direction, so it holds for unkeyed sends and survives a
+restart that re-drives materialization.
+
 ### Unilateral exit
 
-Client unilaterally broadcasts a VTXO exit tree. The value
-that actually leaves the VTXO layer plus the miner fee both
-reduce `vtxo_balance`.
+Client unilaterally broadcasts a VTXO exit tree. The swept value
+plus the miner fee both reduce `vtxo_balance`; the swept value
+reappears on `wallet_balance` because the sweep pays the client's
+own wallet.
 
 ```
 emitter: unroll.behavior.emitExitCostIfCompleted, after the
          final sweep confirms
 
 Send leg (vtxo_sent):
-  debit  transfers_out     += (amount - fee)
-  credit vtxo_balance      += (amount - fee)
+  debit  transfers_out    += (amount - fee)
+  credit vtxo_balance     += (amount - fee)
 
 Fee leg (onchain_fee_paid):
   debit  onchain_fees      += fee
   credit vtxo_balance      += fee
+
+Proceeds leg (vtxo_sent), only when DestinationOwnWallet=true:
+  debit  wallet_balance    += (amount - fee)
+  credit transfers_out     += (amount - fee)
 ```
 
-Both legs share an outpoint-derived `IdempotencyKey` so a
-redelivered `ExitCostMsg` resolves to a silent no-op against
-`idx_client_ledger_idempotent_key`.
+The unroll sweep pays a script the wallet handed out
+(`buildSweepTx` takes the destination from
+`SweepWallet.NewWalletPkScript`, and both exit-spend policies pay the
+request's `DestinationPkScript` verbatim), so `emitExitCostIfCompleted`
+stamps `DestinationOwnWallet=true` and the proceeds leg cancels the
+send leg on `transfers_out`, landing the net value on
+`wallet_balance`. The exit proceeds are an internal asset transfer:
+the client still owns them, they just moved across the on-chain /
+off-chain boundary. That sweep output pays a plain wallet script
+rather than a boarding address, so no `UTXOCreatedMsg` producer books
+it a second time.
+
+`DestinationOwnWallet=false` writes no proceeds leg, so the send leg
+stands as a real outflow for an exit whose destination is foreign,
+and a payload written before the field existed decodes to exactly
+that.
+
+The send leg's accounts are fixed rather than following the flag
+because the accounts are part of the dedup tuple in
+`idx_client_ledger_idempotent_key`. A send leg that switched debit
+account with the flag would land in a different tuple than its
+pre-flag twin, and a resumed unroll job re-emitting the exit after
+the upgrade would credit `vtxo_balance` twice. With the accounts
+fixed, every redelivery of the outpoint dedups against the row it
+wrote first, and the proceeds leg is the only row a flagged replay
+adds. All three legs share the outpoint-derived identity under
+distinct leg names (`send`, `fee`, `proceeds`), so a redelivered
+`ExitCostMsg` resolves to a silent no-op.
+
+The transaction history query lists the send leg as the exit and
+excludes the proceeds leg, which shares the send leg's chain identity
+and would otherwise list the same exit twice.
 
 `fee` here is the **final sweep transaction's** miner fee
 (`target output value − Σ sweep outputs`), not the cumulative
@@ -311,11 +374,30 @@ item.
 | Subsystem | File | Function | Messages emitted |
 |---|---|---|---|
 | wallet | `wallet/wallet.go` | `emitUTXOCreated` | `UTXOCreatedMsg` on every confirmed wallet UTXO |
-| wallet | `wallet/boarding_sweep_actor.go` | `emitSweepConfirmedLedger` | one `BoardingSweepConfirmedMsg` per confirmed boarding sweep |
+| wallet | `wallet/boarding_sweep_actor.go` | `commitFinalizedSweep` → `sweepConfirmedLedgerMsg` | one `BoardingSweepConfirmedMsg` per finalized boarding sweep |
 | round | `round/actor.go` | `emitVTXOsReceived` → `emitOwnedVTXOLedgerEntry` | `VTXOReceivedMsg` (all sources), `VTXOSentMsg` (refresh pair) |
 | round | `round/actor.go` | `emitRoundFee` | `FeePaidMsg` (`boarding` or `refresh`) |
-| oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR}` |
+| oor | `oor/session_actor_handlers.go` | `queueVTXOSent` / `queueVTXOsReceived` | `VTXOSentMsg` (session-keyed) / `VTXOReceivedMsg{Source=SourceOOR, SessionID}` |
 | unroll | `unroll/actor.go` | `emitExitCostIfCompleted` | `ExitCostMsg` after final sweep confirmation |
+
+The boarding sweep actor follows the same rule.
+`commitFinalizedSweep` builds the sweep's message, then marks every
+still-pending input spent and enqueues that message from inside
+`BoardingSweepStore.FinalizeBoardingSweepInputs`'s write transaction
+with the context that carries it. A refused enqueue rolls the
+reconcile back, the sweep row stays unresolved, and the next start
+re-drives its finalization, where the per-leg idempotency keys make
+the replay a no-op.
+
+The round actor does not Tell on emission. `emitVTXOsReceived` and
+`emitRoundFee` stage every message under the round, and
+`onRoundComplete` flushes the set from inside
+`RoundStore.FinalizeRound`'s transaction with a context that carries
+it, so the durable mailbox rows commit with the round row. A refused
+enqueue fails finalization, the round stays active, and the next start
+re-drives the confirmation; the idempotency keys then make the replay
+a no-op. OOR sessions already follow the same rule through their
+durable actor's commit transaction.
 
 The round actor's emission path carries the most complexity
 because a single round can mix boarding inputs, refresh inputs,
@@ -380,6 +462,39 @@ test runs.
   write double-entry wallet-clearing legs, but other direct
   wallet spends still need a classification-specific ledger
   producer before they can affect `wallet_balance`.
+- **Leave proceeds to an own-wallet destination.** A cooperative
+  leave books its outflow on `transfers_out`, which is right for a
+  foreign destination but understates the client's total when the
+  leave paid the client's own wallet (the facade's default
+  cooperative exit, which allocates a fresh backing-wallet address
+  when the caller supplies none). The unroll exit already books
+  this correctly via `ExitCostMsg.DestinationOwnWallet`, but no leave
+  producer can assert ownership today: leave destinations arrive as
+  caller-supplied addresses or pkScripts through the RPC surface, the
+  client has no script-ownership oracle across its three wallet
+  backends, and the one leave the wallet mints itself — the
+  boarding-limit change output — pays a boarding script whose later
+  `UTXOCreatedMsg` deposit leg already books the return, so flagging
+  it would double-count. Closing this needs either an ownership query
+  on the wallet backends or a destination flag on the leave RPC.
+- **Recycled exit proceeds.** A unilateral exit books its proceeds
+  into `wallet_balance` via `ExitCostMsg.DestinationOwnWallet`, and
+  nothing ever debits them again. The exit output pays a plain wallet
+  script rather than a boarding address, so it produces no boarding
+  intent and no later `UTXOCreatedMsg`; the credit simply stands. If
+  the user then spends those proceeds into a boarding address, that
+  deposit's own `UTXOCreatedMsg` credits `wallet_balance` a second
+  time for the same coins, and the total overstates the client by the
+  recycled amount. Closing this needs a `wallet_clearing`-style
+  close-out leg on the spend that funds the boarding address, the way
+  the boarding sweep already clears its inputs.
+- **Operator-swept VTXOs.** No producer books a VTXO whose batch
+  the operator swept after expiry. This is deliberate for now:
+  the server keeps honouring the claim, so the owner can still
+  reclaim it by refreshing, and the asset is real until the
+  operator's policy says otherwise. It does mean `vtxo_balance`
+  can include value that a long-offline client may never
+  recover.
 
 ## Related documents
 

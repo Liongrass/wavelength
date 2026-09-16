@@ -34,6 +34,14 @@ const (
 	// released only on an authoritative dead answer, never on the timeout
 	// alone.
 	TimeoutPhaseStatusReconcile TimeoutPhase = "status-reconcile"
+
+	// TimeoutPhaseFinalizeRetry re-drives a confirmed round's
+	// finalization after FinalizeRound failed. By then the FSM already
+	// sits in ConfirmedState and treats a redelivered confirmation as a
+	// self-loop, so nothing in the state machine would ever emit a
+	// second RoundCompletedNotification; the actor re-runs the
+	// finalization itself from the retained pendingFinalize entry.
+	TimeoutPhaseFinalizeRetry TimeoutPhase = "finalize-retry"
 )
 
 // cancelForfeitTimeout builds a single-element outbox slice that

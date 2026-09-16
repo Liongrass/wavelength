@@ -239,6 +239,44 @@ func sqlInt32Ptr(v *int32) sql.NullInt32 {
 	}
 }
 
+// HasSessionEntry reports whether a ledger leg with the given event type and
+// account pair is already booked under the OOR session id. It runs inside
+// any outer actor transaction on ctx, so a handler deciding a booking from
+// it reads the same snapshot its own insert commits against.
+func (s *LedgerStoreDB) HasSessionEntry(ctx context.Context, sessionID [32]byte,
+	eventType, debitAccount, creditAccount string) (bool, error) {
+
+	var found bool
+	err := s.ExecTx(
+		ctx, ReadTxOption(),
+		func(qtx *sqlc.Queries) error {
+			_, err := qtx.GetClientLedgerEntryBySessionID(
+				ctx, sqlc.GetClientLedgerEntryBySessionIDParams{
+					SessionID:     sessionID[:],
+					EventType:     eventType,
+					DebitAccount:  debitAccount,
+					CreditAccount: creditAccount,
+				},
+			)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				found = false
+
+				return nil
+
+			case err != nil:
+				return err
+			}
+
+			found = true
+
+			return nil
+		},
+	)
+
+	return found, err
+}
+
 // GetConfirmedExitCost returns the confirmed on-chain cost the ledger booked
 // for a unilateral exit of the given VTXO outpoint (the onchain_fee_paid leg
 // unroll emits after the final sweep confirms). Zero when no exit-cost leg

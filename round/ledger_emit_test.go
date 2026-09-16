@@ -1,6 +1,8 @@
 package round
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -9,9 +11,11 @@ import (
 	"github.com/btcsuite/btclog/v2"
 	"github.com/google/uuid"
 	"github.com/lightninglabs/wavelength/baselib/actor"
+	"github.com/lightninglabs/wavelength/baselib/protofsm"
 	"github.com/lightninglabs/wavelength/ledger"
 	"github.com/lightninglabs/wavelength/lib/types"
 	fn "github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,6 +32,18 @@ func newLedgerEmitActor(t *testing.T, sink ledger.Sink) *RoundClientActor {
 		},
 		log: btclog.Disabled,
 	}
+}
+
+// emitAndFlush stages the notification's ledger messages and flushes them
+// the way onRoundComplete does inside FinalizeRound, so the sink observes
+// exactly what a finalized round would have committed.
+func emitAndFlush(t *testing.T, a *RoundClientActor,
+	n *VTXOCreatedNotification) {
+
+	t.Helper()
+
+	a.emitVTXOsReceived(t.Context(), n)
+	require.NoError(t, a.flushStagedLedger(t.Context(), n.RoundID))
 }
 
 // drainLedgerMessages pulls every queued ledger message off the
@@ -71,7 +87,7 @@ func TestEmitVTXOsReceivedBoardingOrigin(t *testing.T) {
 		Index: 1,
 	}
 	roundUUID := uuid.New()
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID: roundUUID.String(),
 		VTXOs: []*ClientVTXO{{
 			Outpoint: outpoint,
@@ -107,7 +123,7 @@ func TestEmitVTXOsReceivedTransferOrigin(t *testing.T) {
 	)
 	a := newLedgerEmitActor(t, sink)
 
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID: uuid.New().String(),
 		VTXOs: []*ClientVTXO{{
 			Outpoint: wire.OutPoint{
@@ -151,7 +167,7 @@ func TestEmitVTXOsReceivedRefreshEmitsPair(t *testing.T) {
 		Index: 2,
 	}
 	roundUUID := uuid.New()
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID: roundUUID.String(),
 		VTXOs: []*ClientVTXO{{
 			Outpoint: outpoint,
@@ -198,7 +214,7 @@ func TestEmitVTXOsReceivedUnknownOriginIsNoOp(t *testing.T) {
 	)
 	a := newLedgerEmitActor(t, sink)
 
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID: uuid.New().String(),
 		VTXOs: []*ClientVTXO{{
 			Outpoint: wire.OutPoint{
@@ -232,7 +248,7 @@ func TestEmitVTXOsReceivedRefreshEmitsFeePaidMsg(t *testing.T) {
 	a := newLedgerEmitActor(t, sink)
 
 	roundUUID := uuid.New()
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID:        roundUUID.String(),
 		OperatorFeeSat: 850,
 		CreatedHeight:  800_111,
@@ -279,7 +295,7 @@ func TestEmitVTXOsReceivedNoFeeWhenZero(t *testing.T) {
 	)
 	a := newLedgerEmitActor(t, sink)
 
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID:        uuid.New().String(),
 		OperatorFeeSat: 0,
 		VTXOs: []*ClientVTXO{{
@@ -311,7 +327,7 @@ func TestEmitVTXOsReceivedBoardingFee(t *testing.T) {
 	)
 	a := newLedgerEmitActor(t, sink)
 
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID:         uuid.New().String(),
 		OperatorFeeSat:  500,
 		OperatorFeeType: ledger.FeeTypeBoarding,
@@ -350,7 +366,7 @@ func TestEmitVTXOsReceivedMixedBatch(t *testing.T) {
 	)
 	a := newLedgerEmitActor(t, sink)
 
-	a.emitVTXOsReceived(t.Context(), &VTXOCreatedNotification{
+	emitAndFlush(t, a, &VTXOCreatedNotification{
 		RoundID: uuid.New().String(),
 		VTXOs: []*ClientVTXO{
 			{
@@ -447,4 +463,347 @@ func TestRoundIDBytesInvalidReturnsZero(t *testing.T) {
 			require.Equal(t, zero, roundIDBytes(in))
 		})
 	}
+}
+
+// failingLedgerSink refuses every enqueue, standing in for a durable
+// mailbox whose insert fails inside the finalize transaction.
+type failingLedgerSink struct {
+	err error
+}
+
+// ID satisfies actor.BaseActorRef.
+func (f *failingLedgerSink) ID() string {
+	return "failing-ledger-sink"
+}
+
+// Tell returns the configured failure.
+func (f *failingLedgerSink) Tell(context.Context, ledger.LedgerMsg) error {
+	return f.err
+}
+
+// TryTell returns the configured failure.
+func (f *failingLedgerSink) TryTell(context.Context, ledger.LedgerMsg) error {
+	return f.err
+}
+
+// TestRoundCompleteCommitsStagedLedgerWithFinalize proves the staged
+// accounting is delivered from FinalizeRound's callback, that a refused
+// enqueue fails completion and keeps the staged set for the retry, and that
+// a successful flush drains it.
+func TestRoundCompleteCommitsStagedLedgerWithFinalize(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	roundID := testRoundID("staged-ledger-round")
+	txid := chainhash.Hash{0x42}
+	confInfo := ConfInfo{Height: 100}
+	notification := &VTXOCreatedNotification{
+		RoundID: roundID.String(),
+		VTXOs: []*ClientVTXO{{
+			Outpoint: wire.OutPoint{
+				Hash: chainhash.Hash{
+					0x11,
+				},
+			},
+			Amount: btcutil.Amount(50_000),
+			Origin: types.VTXOOriginRoundBoarding,
+		}},
+	}
+
+	enqueueErr := errors.New("mailbox insert refused")
+	store := &MockRoundStore{}
+	store.On(
+		"FinalizeRound", mock.Anything, roundID, txid, confInfo,
+	).Return(nil)
+	a := &RoundClientActor{
+		cfg: &RoundClientConfig{
+			LedgerSink: fn.Some[ledger.Sink](
+				&failingLedgerSink{
+					err: enqueueErr,
+				},
+			),
+			RoundStore: store,
+		},
+		log:               btclog.Disabled,
+		rounds:            make(map[RoundKeyStr]*RoundFSM),
+		commitmentTxIndex: make(map[chainhash.Hash]RoundKeyStr),
+	}
+
+	keyStr := RoundKeyStr(roundID.KeyString())
+	fsm := protofsm.NewStateMachine(ClientStateMachineCfg{})
+	a.rounds[keyStr] = &RoundFSM{
+		FSM:     &fsm,
+		RoundID: roundID,
+		TxID:    txid,
+	}
+	a.commitmentTxIndex[txid] = keyStr
+
+	a.emitVTXOsReceived(ctx, notification)
+	require.Len(t, a.stagedLedger[roundID.String()], 1)
+
+	err := a.onRoundComplete(ctx, roundID, txid, confInfo)
+	require.ErrorIs(t, err, enqueueErr)
+	require.Len(
+		t, a.stagedLedger[roundID.String()], 1,
+		"a refused enqueue must keep the staged accounting",
+	)
+
+	// Finalization is fallible, so a failed attempt must leave the round
+	// routable: the confirmation is re-driven later and has to find it.
+	require.Contains(
+		t, a.rounds, keyStr,
+		"a failed finalize must leave the round in the rounds map",
+	)
+	require.Contains(
+		t, a.commitmentTxIndex, txid,
+		"a failed finalize must leave the commitment tx routable",
+	)
+
+	sink := actor.NewChannelTellOnlyRef[ledger.LedgerMsg]("round-ledger", 8)
+	a.cfg.LedgerSink = fn.Some[ledger.Sink](sink)
+	require.NoError(t, a.onRoundComplete(ctx, roundID, txid, confInfo))
+	require.Empty(t, a.stagedLedger)
+	require.Len(t, drainLedgerMessages(t, sink), 1)
+	require.NotContains(t, a.rounds, keyStr)
+	require.NotContains(t, a.commitmentTxIndex, txid)
+}
+
+// TestRoundCompleteRetriesFinalizeInProcess proves a failed finalization is
+// re-driven by the actor rather than left to the next start: the outbox
+// failure arms a finalize-retry timeout, each further failure re-arms it with
+// a doubled delay, and the retry that succeeds tears the round down and
+// commits the staged accounting exactly once.
+func TestRoundCompleteRetriesFinalizeInProcess(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	roundID := testRoundID("retried-finalize-round")
+	txid := chainhash.Hash{0x43}
+	confInfo := ConfInfo{Height: 101}
+	notification := &VTXOCreatedNotification{
+		RoundID: roundID.String(),
+		VTXOs: []*ClientVTXO{{
+			Outpoint: wire.OutPoint{
+				Hash: chainhash.Hash{
+					0x12,
+				},
+			},
+			Amount: btcutil.Amount(40_000),
+			Origin: types.VTXOOriginRoundBoarding,
+		}},
+	}
+
+	enqueueErr := errors.New("mailbox insert refused")
+	store := &MockRoundStore{}
+	store.On(
+		"FinalizeRound", mock.Anything, roundID, txid, confInfo,
+	).Return(nil)
+	timeouts := newMockTimeoutActor(t)
+	a := &RoundClientActor{
+		cfg: &RoundClientConfig{
+			LedgerSink: fn.Some[ledger.Sink](
+				&failingLedgerSink{
+					err: enqueueErr,
+				},
+			),
+			RoundStore:   store,
+			TimeoutActor: timeouts,
+		},
+		log:               btclog.Disabled,
+		rounds:            make(map[RoundKeyStr]*RoundFSM),
+		commitmentTxIndex: make(map[chainhash.Hash]RoundKeyStr),
+	}
+
+	keyStr := RoundKeyStr(roundID.KeyString())
+	fsm := protofsm.NewStateMachine(ClientStateMachineCfg{})
+	a.rounds[keyStr] = &RoundFSM{
+		FSM:     &fsm,
+		RoundID: roundID,
+		TxID:    txid,
+	}
+	a.commitmentTxIndex[txid] = keyStr
+	a.emitVTXOsReceived(ctx, notification)
+
+	// The outbox failure still surfaces, and it arms the first retry.
+	err := a.processOutbox(ctx, []ClientOutMsg{
+		&RoundCompletedNotification{
+			RoundID:  roundID,
+			TxID:     txid,
+			ConfInfo: confInfo,
+		},
+	})
+	require.ErrorIs(t, err, enqueueErr)
+
+	retryID := makeTimeoutID(keyStr, TimeoutPhaseFinalizeRetry)
+	timeouts.assertTimeoutScheduled(t, retryID, finalizeRetryBaseDelay)
+	require.Equal(t, 1, a.pendingFinalize[keyStr].attempts)
+	require.Contains(t, a.rounds, keyStr)
+
+	// A retry that fails again re-arms with a doubled delay.
+	res := a.handleTimeout(ctx, &TimeoutMsg{TimeoutID: retryID})
+	require.True(t, res.IsOk())
+	timeouts.assertTimeoutScheduled(t, retryID, 2*finalizeRetryBaseDelay)
+	timeouts.assertTimeoutScheduleCount(t, retryID, 2)
+	require.Equal(t, 2, a.pendingFinalize[keyStr].attempts)
+	require.Len(t, a.stagedLedger[roundID.String()], 1)
+
+	// The retry that succeeds finalizes the round: accounting is
+	// enqueued once, the round leaves every map, and the pending entry
+	// is gone so a stray later expiry is ignored.
+	sink := actor.NewChannelTellOnlyRef[ledger.LedgerMsg]("round-ledger", 8)
+	a.cfg.LedgerSink = fn.Some[ledger.Sink](sink)
+	res = a.handleTimeout(ctx, &TimeoutMsg{TimeoutID: retryID})
+	require.True(t, res.IsOk())
+	require.Len(t, drainLedgerMessages(t, sink), 1)
+	require.Empty(t, a.stagedLedger)
+	require.NotContains(t, a.rounds, keyStr)
+	require.NotContains(t, a.commitmentTxIndex, txid)
+	require.NotContains(t, a.pendingFinalize, keyStr)
+	timeouts.assertTimeoutScheduleCount(t, retryID, 2)
+}
+
+// TestRoundCompleteFinalizeRetryIsBounded proves the in-process retry gives
+// up after maxFinalizeRetries failures: the pending entry is dropped, no
+// further timeout is armed, and the round stays routable for the next start.
+func TestRoundCompleteFinalizeRetryIsBounded(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	roundID := testRoundID("exhausted-finalize-round")
+	txid := chainhash.Hash{0x44}
+	confInfo := ConfInfo{Height: 102}
+
+	store := &MockRoundStore{}
+	store.On(
+		"FinalizeRound", mock.Anything, roundID, txid, confInfo,
+	).Return(errors.New("database unavailable"))
+	timeouts := newMockTimeoutActor(t)
+	a := &RoundClientActor{
+		cfg: &RoundClientConfig{
+			RoundStore:   store,
+			TimeoutActor: timeouts,
+		},
+		log:               btclog.Disabled,
+		rounds:            make(map[RoundKeyStr]*RoundFSM),
+		commitmentTxIndex: make(map[chainhash.Hash]RoundKeyStr),
+	}
+
+	keyStr := RoundKeyStr(roundID.KeyString())
+	fsm := protofsm.NewStateMachine(ClientStateMachineCfg{})
+	a.rounds[keyStr] = &RoundFSM{
+		FSM:     &fsm,
+		RoundID: roundID,
+		TxID:    txid,
+	}
+	a.commitmentTxIndex[txid] = keyStr
+
+	err := a.processOutbox(ctx, []ClientOutMsg{
+		&RoundCompletedNotification{
+			RoundID:  roundID,
+			TxID:     txid,
+			ConfInfo: confInfo,
+		},
+	})
+	require.Error(t, err)
+
+	retryID := makeTimeoutID(keyStr, TimeoutPhaseFinalizeRetry)
+	for range maxFinalizeRetries - 1 {
+		res := a.handleTimeout(ctx, &TimeoutMsg{TimeoutID: retryID})
+		require.True(t, res.IsOk())
+	}
+	timeouts.assertTimeoutScheduleCount(t, retryID, maxFinalizeRetries)
+	require.Equal(t, maxFinalizeRetries, a.pendingFinalize[keyStr].attempts)
+
+	// The final failure exhausts the budget: nothing is re-armed and the
+	// entry is dropped, but the round stays where the next start's
+	// re-driven confirmation can find it.
+	res := a.handleTimeout(ctx, &TimeoutMsg{TimeoutID: retryID})
+	require.True(t, res.IsOk())
+	timeouts.assertTimeoutScheduleCount(t, retryID, maxFinalizeRetries)
+	require.NotContains(t, a.pendingFinalize, keyStr)
+	require.Contains(t, a.rounds, keyStr)
+	require.Contains(t, a.commitmentTxIndex, txid)
+
+	// A stray expiry after exhaustion is a no-op.
+	res = a.handleTimeout(ctx, &TimeoutMsg{TimeoutID: retryID})
+	require.True(t, res.IsOk())
+	timeouts.assertTimeoutScheduleCount(t, retryID, maxFinalizeRetries)
+}
+
+// retryingRoundStore invokes FinalizeRound's callback twice, standing in for
+// db.ExecTxCtx re-running the whole callback body after a serialization or
+// busy error trips at commit time.
+type retryingRoundStore struct {
+	RoundStore
+
+	calls int
+}
+
+// FinalizeRound runs the callback twice, mirroring a retried transaction.
+func (r *retryingRoundStore) FinalizeRound(ctx context.Context, _ RoundID,
+	_ chainhash.Hash, _ ConfInfo, then func(context.Context) error) error {
+
+	for i := 0; i < 2; i++ {
+		r.calls++
+		if err := then(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// TestRoundCompleteStagedLedgerSurvivesTxRetry proves the finalize callback is
+// pure with respect to the staged set: db.ExecTxCtx re-runs the callback body
+// on a serialization or busy error, so a callback that consumed the staged
+// messages would finalize the retry with no accounting at all.
+func TestRoundCompleteStagedLedgerSurvivesTxRetry(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	roundID := testRoundID("retried-finalize-round")
+	txid := chainhash.Hash{0x43}
+	confInfo := ConfInfo{Height: 101}
+	notification := &VTXOCreatedNotification{
+		RoundID: roundID.String(),
+		VTXOs: []*ClientVTXO{{
+			Outpoint: wire.OutPoint{
+				Hash: chainhash.Hash{
+					0x12,
+				},
+			},
+			Amount: btcutil.Amount(50_000),
+			Origin: types.VTXOOriginRoundBoarding,
+		}},
+	}
+
+	sink := actor.NewChannelTellOnlyRef[ledger.LedgerMsg]("round-ledger", 8)
+	store := &retryingRoundStore{}
+	a := &RoundClientActor{
+		cfg: &RoundClientConfig{
+			LedgerSink: fn.Some[ledger.Sink](sink),
+			RoundStore: store,
+		},
+		log:               btclog.Disabled,
+		rounds:            make(map[RoundKeyStr]*RoundFSM),
+		commitmentTxIndex: make(map[chainhash.Hash]RoundKeyStr),
+	}
+
+	a.emitVTXOsReceived(ctx, notification)
+	require.Len(t, a.stagedLedger[roundID.String()], 1)
+
+	require.NoError(t, a.onRoundComplete(ctx, roundID, txid, confInfo))
+	require.Equal(t, 2, store.calls)
+
+	// Both invocations must have seen the staged messages: the first
+	// attempt's writes roll back with its transaction, so the retry is the
+	// one that actually commits the accounting.
+	require.Len(
+		t, drainLedgerMessages(t, sink), 2,
+		"every callback invocation must re-deliver the staged set",
+	)
+	require.Empty(
+		t, a.stagedLedger,
+		"the staged set is dropped once finalize returns nil",
+	)
 }

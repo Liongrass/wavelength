@@ -127,11 +127,19 @@ func (m *MockBoardingStore) ListAllBoardingAddresses(ctx context.Context) (
 }
 
 func (m *MockBoardingStore) InsertBoardingIntents(ctx context.Context,
-	intents ...BoardingIntent) error {
+	then func(context.Context) error, intents ...BoardingIntent) error {
 
 	args := m.Called(ctx, intents)
+	if err := args.Error(0); err != nil {
+		return err
+	}
+	if then == nil {
+		return nil
+	}
 
-	return args.Error(0)
+	// The mock has no transaction; run the callback with the caller's
+	// context so staged ledger work is still delivered in tests.
+	return then(ctx)
 }
 
 func (m *MockBoardingStore) FetchBoardingIntents(ctx context.Context) (

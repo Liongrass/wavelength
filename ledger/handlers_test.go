@@ -48,6 +48,41 @@ func (m *mockLedgerStore) getEntries() []LedgerEntry {
 	return append([]LedgerEntry{}, m.entries...)
 }
 
+// HasSessionEntry scans the recorded entries the way the session-keyed
+// query does.
+func (m *mockLedgerStore) HasSessionEntry(_ context.Context, sessionID [32]byte,
+	eventType, debitAccount, creditAccount string) (bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return hasSessionEntry(
+		m.entries, sessionID, eventType, debitAccount, creditAccount,
+	)
+}
+
+// hasSessionEntry mirrors GetClientLedgerEntryBySessionID over an in-memory
+// slice: a match needs the session id plus the full event/account tuple.
+func hasSessionEntry(entries []LedgerEntry, sessionID [32]byte, eventType,
+	debitAccount, creditAccount string) (bool, error) {
+
+	for _, entry := range entries {
+		if !bytes.Equal(entry.SessionID, sessionID[:]) {
+			continue
+		}
+		if entry.EventType != eventType ||
+			entry.DebitAccount != debitAccount ||
+			entry.CreditAccount != creditAccount {
+
+			continue
+		}
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // mockUTXOAuditStore records all InsertUTXOAuditEntry calls for
 // assertion.
 type mockUTXOAuditStore struct {
@@ -390,6 +425,165 @@ func TestHandleVTXOReceivedRoundBoarding(t *testing.T) {
 // TestHandleVTXOReceivedRoundTransfer verifies that an in-round
 // participant-to-participant VTXO receive is recorded the same
 // way as an OOR receive: transfers_in -> vtxo_balance.
+// TestHandleVTXOReceivedOORClassifiesSelfChangeBySession proves the ledger
+// derives the self-change booking from its own rows: a SourceOOR receive
+// under a session that already carries an outgoing send leg credits
+// transfers_out, while the same receive under an unknown session credits
+// transfers_in. No caller key or session-row state is consulted.
+func TestHandleVTXOReceivedOORClassifiesSelfChangeBySession(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	sent := &VTXOSentMsg{
+		SessionID: [32]byte{
+			0x77,
+		},
+		AmountSat: 50_000,
+	}
+	require.NoError(t, run(ctx, a, sent))
+
+	change := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0x78,
+		},
+		OutpointIndex: 1,
+		AmountSat:     20_000,
+		Source:        SourceOOR,
+		SessionID:     sent.SessionID,
+	}
+	require.NoError(t, run(ctx, a, change))
+
+	foreign := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0x79,
+		},
+		OutpointIndex: 0,
+		AmountSat:     30_000,
+		Source:        SourceOOR,
+		SessionID: [32]byte{
+			0x7a,
+		},
+	}
+	require.NoError(t, run(ctx, a, foreign))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 3)
+
+	// The change cancels on transfers_out and says so in its row.
+	require.Equal(t, AccountVTXOBalance, entries[1].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[1].CreditAccount)
+	require.Contains(t, entries[1].Description, SourceOORSelfChange)
+
+	// The foreign receive is a gross inflow.
+	require.Equal(t, AccountVTXOBalance, entries[2].DebitAccount)
+	require.Equal(t, AccountTransfersIn, entries[2].CreditAccount)
+
+	// transfers_out nets to what actually left; transfers_in carries
+	// only the foreign receive.
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(30_000), balances[AccountTransfersOut])
+	require.Equal(t, int64(-30_000), balances[AccountTransfersIn])
+}
+
+// TestVTXOReceivedMsgSessionIDRoundTrips proves the session id survives the
+// durable mailbox codec and that a payload written before the field existed
+// decodes to the zero session, which books as a plain receive.
+func TestVTXOReceivedMsgSessionIDRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	msg := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0x5f,
+		},
+		OutpointIndex: 2,
+		AmountSat:     7_000,
+		Source:        SourceOOR,
+		SessionID: [32]byte{
+			0x60,
+		},
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, msg.Encode(&buf))
+
+	var decoded VTXOReceivedMsg
+	require.NoError(t, decoded.Decode(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, msg.SessionID, decoded.SessionID)
+	require.Equal(t, msg.Source, decoded.Source)
+
+	var (
+		outpointHash  = bytes.Repeat([]byte{0x5f}, 32)
+		outpointIndex = uint32(2)
+		amountSat     = uint64(7_000)
+		source        = []byte(SourceOOR)
+		roundID       = make([]byte, 16)
+	)
+	legacyStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(
+			vtxoRecvOutpointHashType, &outpointHash,
+		),
+		tlv.MakePrimitiveRecord(
+			vtxoRecvOutpointIndexType, &outpointIndex,
+		),
+		tlv.MakePrimitiveRecord(vtxoRecvAmountSatType, &amountSat),
+		tlv.MakePrimitiveRecord(vtxoRecvSourceType, &source),
+		tlv.MakePrimitiveRecord(vtxoRecvRoundIDType, &roundID),
+	)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	require.NoError(t, legacyStream.Encode(&legacyBuf))
+
+	var legacy VTXOReceivedMsg
+	require.NoError(t, legacy.Decode(bytes.NewReader(legacyBuf.Bytes())))
+	require.Equal(t, [32]byte{}, legacy.SessionID)
+	require.Equal(t, int64(7_000), legacy.AmountSat)
+}
+
+// TestHandleVTXOReceivedOORSelfChange proves the sender's own OOR change
+// cancels on transfers_out rather than being booked as a gross receive: the
+// outgoing session already debited transfers_out for the whole input sum, so
+// crediting transfers_in here would inflate both gross directions by the
+// change amount even though vtxo_balance nets correctly either way.
+func TestHandleVTXOReceivedOORSelfChange(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	msg := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0x4d,
+		},
+		OutpointIndex: 1,
+		AmountSat:     12_000,
+		Source:        SourceOORSelfChange,
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountVTXOBalance, entries[0].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[0].CreditAccount)
+	require.Equal(t, int64(12_000), entries[0].AmountSat)
+	require.Equal(t, EventVTXOReceived, entries[0].EventType)
+
+	// The key is the per-outpoint one every receive uses, so the change
+	// leg dedups on redelivery exactly as a foreign receive does.
+	require.Equal(
+		t,
+		walletUTXOIdempotencyKey(msg.OutpointHash, msg.OutpointIndex),
+		entries[0].IdempotencyKey,
+	)
+}
+
 func TestHandleVTXOReceivedRoundTransfer(t *testing.T) {
 	t.Parallel()
 
@@ -812,6 +1006,180 @@ func TestHandleExitCost(t *testing.T) {
 	)
 }
 
+// TestHandleExitCostOwnWalletDestinationBooksWalletBalance proves an exit
+// that paid an output this client's own wallet controls books a third leg
+// that cancels the send leg on transfers_out and lands the net value on
+// wallet_balance, while the send and fee legs stay byte-for-byte what a
+// foreign-destination exit writes.
+func TestHandleExitCostOwnWalletDestinationBooksWalletBalance(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	msg := &ExitCostMsg{
+		OutpointHash: [32]byte{
+			0x3c,
+		},
+		OutpointIndex:        1,
+		AmountSat:            100_000,
+		ExitCostSat:          5_000,
+		BlockHeight:          800_600,
+		DestinationOwnWallet: true,
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 3)
+
+	// Send leg is unchanged by the flag: transfers_out <- vtxo_balance.
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(95_000), entries[0].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[0].EventType)
+
+	// Fee leg is unchanged: the miner still took the chain cost.
+	require.Equal(t, AccountOnchainFees, entries[1].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[1].CreditAccount)
+	require.Equal(t, int64(5_000), entries[1].AmountSat)
+
+	// Proceeds leg: wallet_balance <- transfers_out for the net amount,
+	// so the outflow nets to zero and the value reappears on-chain.
+	require.Equal(t, AccountWalletBalance, entries[2].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[2].CreditAccount)
+	require.Equal(t, int64(95_000), entries[2].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[2].EventType)
+
+	// The send and fee keys are the ones a foreign-destination exit
+	// writes; the proceeds leg has its own identity.
+	sendKey := exitSendIdempotencyKey(
+		msg.OutpointHash, msg.OutpointIndex,
+	)
+	feeKey := exitFeeIdempotencyKey(msg.OutpointHash, msg.OutpointIndex)
+	proceedsKey := exitProceedsIdempotencyKey(
+		msg.OutpointHash, msg.OutpointIndex,
+	)
+	require.Equal(t, sendKey, entries[0].IdempotencyKey)
+	require.Equal(t, feeKey, entries[1].IdempotencyKey)
+	require.Equal(t, proceedsKey, entries[2].IdempotencyKey)
+}
+
+// TestHandleExitCostReplayAcrossDestinationFlagDedups proves the reachable
+// upgrade replay: an exit booked before the destination flag existed is
+// re-emitted by a resumed unroll job with the flag set. The send leg must
+// dedup against the row it wrote first rather than book a second credit of
+// vtxo_balance, and the proceeds leg must appear exactly once.
+func TestHandleExitCostReplayAcrossDestinationFlagDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	msg := &ExitCostMsg{
+		OutpointHash: [32]byte{
+			0x4d,
+		},
+		OutpointIndex: 2,
+		AmountSat:     60_000,
+		ExitCostSat:   4_000,
+		BlockHeight:   800_650,
+	}
+
+	// Pre-flag delivery: send leg and fee leg only.
+	require.NoError(t, run(ctx, a, msg))
+	require.Len(t, store.getEntries(), 2)
+
+	// Post-upgrade re-emission of the same exit with the flag set.
+	flagged := *msg
+	flagged.DestinationOwnWallet = true
+	require.NoError(t, run(ctx, a, &flagged))
+	require.NoError(t, run(ctx, a, &flagged))
+
+	entries := store.getEntries()
+	require.Len(
+		t, entries, 3,
+		"replay across the flag must add only the proceeds leg",
+	)
+
+	// vtxo_balance is credited once for the net value and once for the
+	// fee; wallet_balance is debited once for the net value; and
+	// transfers_out nets to zero because the value never left.
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-60_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(56_000), balances[AccountWalletBalance])
+	require.Equal(t, int64(4_000), balances[AccountOnchainFees])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestExitCostMsgDestinationFlagRoundTrips proves the destination flag
+// survives the durable mailbox codec and that a payload written before the
+// flag existed decodes to the foreign-destination behaviour it was written
+// under, rather than silently re-booking old exits into wallet_balance.
+func TestExitCostMsgDestinationFlagRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for _, ownWallet := range []bool{false, true} {
+		msg := &ExitCostMsg{
+			OutpointHash: [32]byte{
+				0x5e,
+			},
+			OutpointIndex:        3,
+			AmountSat:            80_000,
+			ExitCostSat:          2_000,
+			BlockHeight:          800_700,
+			DestinationOwnWallet: ownWallet,
+		}
+
+		var buf bytes.Buffer
+		require.NoError(t, msg.Encode(&buf))
+
+		var decoded ExitCostMsg
+		require.NoError(t, decoded.Decode(bytes.NewReader(buf.Bytes())))
+		require.Equal(t, *msg, decoded)
+	}
+
+	// A payload written before the flag existed carries no destination
+	// record at all, so build the pre-flag stream by hand.
+	var (
+		outpointHash  = bytes.Repeat([]byte{0x6f}, 32)
+		outpointIndex = uint32(0)
+		amountSat     = uint64(40_000)
+		exitCostSat   = uint64(1_000)
+		blockHeight   = uint32(800_800)
+	)
+	legacyStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(
+			exitCostOutpointHashType, &outpointHash,
+		),
+		tlv.MakePrimitiveRecord(
+			exitCostOutpointIndexType, &outpointIndex,
+		),
+		tlv.MakePrimitiveRecord(exitCostAmountSatType, &amountSat),
+		tlv.MakePrimitiveRecord(exitCostCostSatType, &exitCostSat),
+		tlv.MakePrimitiveRecord(
+			exitCostBlockHeightType, &blockHeight,
+		),
+	)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	require.NoError(t, legacyStream.Encode(&legacyBuf))
+
+	var legacy ExitCostMsg
+	require.NoError(t, legacy.Decode(bytes.NewReader(legacyBuf.Bytes())))
+	require.Equal(t, int64(40_000), legacy.AmountSat)
+	require.False(
+		t, legacy.DestinationOwnWallet,
+		"a missing destination record must keep the old behaviour",
+	)
+}
+
 // TestHandleExitCostFeeExceedsValue verifies that an exit whose
 // fee meets or exceeds the VTXO amount is rejected rather than
 // silently producing a non-positive send leg.
@@ -892,6 +1260,19 @@ func (d *dedupLedgerStore) getEntries() []LedgerEntry {
 	return append([]LedgerEntry{}, d.entries...)
 }
 
+// HasSessionEntry scans the persisted entries for a session-keyed match.
+func (d *dedupLedgerStore) HasSessionEntry(_ context.Context,
+	sessionID [32]byte, eventType, debitAccount, creditAccount string) (
+	bool, error) {
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return hasSessionEntry(
+		d.entries, sessionID, eventType, debitAccount, creditAccount,
+	)
+}
+
 // TestHandleExitCostNamespacesBothLegs verifies that handleExitCost emits the
 // send and fee entries under distinct operation-and-leg identities. Both keys
 // retain the same outpoint payload, while the namespace prevents either leg
@@ -950,6 +1331,80 @@ func TestHandleExitCostNamespacesBothLegs(t *testing.T) {
 			t, int32(msg.BlockHeight), *entry.ConfirmationHeight,
 		)
 	}
+}
+
+// TestExitOfRefreshOriginVTXOKeepsSendLeg pins the operation namespacing end
+// to end: a VTXO minted by a refresh already carries a vtxo_sent row on
+// (transfers_out, vtxo_balance) under its own outpoint, and a later
+// unilateral exit of that same VTXO must still book its own value row
+// through the dedup store rather than be swallowed as a replay.
+func TestExitOfRefreshOriginVTXOKeepsSendLeg(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	var outpoint wire.OutPoint
+	outpoint.Hash[0] = 0xcd
+	outpoint.Index = 3
+
+	// Refresh pair: the forfeited claim is replaced by a 99,500 sat VTXO
+	// at the same outpoint. The pair nets to zero on vtxo_balance.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				Outpoint:  outpoint,
+				AmountSat: 99_500,
+				RoundID:   [16]byte{0x11},
+			},
+		),
+	)
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOReceivedMsg{
+				OutpointHash:  outpoint.Hash,
+				OutpointIndex: outpoint.Index,
+				AmountSat:     99_500,
+				RoundID:       [16]byte{0x11},
+				Source:        SourceRoundRefresh,
+			},
+		),
+	)
+	require.Len(t, store.getEntries(), 2)
+
+	// The refreshed VTXO is later exited on-chain with a 2,000 sat sweep
+	// fee. Both exit legs must land.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &ExitCostMsg{
+				OutpointHash:  outpoint.Hash,
+				OutpointIndex: outpoint.Index,
+				AmountSat:     99_500,
+				ExitCostSat:   2_000,
+				BlockHeight:   900_000,
+			},
+		),
+	)
+	entries := store.getEntries()
+	require.Len(t, entries, 4)
+
+	var balance int64
+	for _, entry := range entries {
+		if entry.DebitAccount == AccountVTXOBalance {
+			balance += entry.AmountSat
+		}
+		if entry.CreditAccount == AccountVTXOBalance {
+			balance -= entry.AmountSat
+		}
+	}
+	require.Equal(
+		t, int64(-99_500), balance,
+		"exit must retire the full VTXO value from vtxo_balance",
+	)
 }
 
 // TestHandleExitCostReplayIsIdempotent simulates an at-least-once
@@ -1040,10 +1495,13 @@ func TestLedgerIdempotencyKeysSeparateOperations(t *testing.T) {
 	refresh := refreshSendIdempotencyKey(hash, 7)
 	exitSend := exitSendIdempotencyKey(hash, 7)
 	exitFee := exitFeeIdempotencyKey(hash, 7)
+	exitProceeds := exitProceedsIdempotencyKey(hash, 7)
 
 	require.NotEqual(t, refresh, exitSend)
 	require.NotEqual(t, refresh, exitFee)
 	require.NotEqual(t, exitSend, exitFee)
+	require.NotEqual(t, exitSend, exitProceeds)
+	require.NotEqual(t, exitFee, exitProceeds)
 }
 
 // TestHandleExitCostInvalidAmounts verifies non-positive inputs
@@ -1150,6 +1608,12 @@ func (f *failingLedgerStore) InsertLedgerEntry(_ context.Context,
 	_ LedgerEntry) error {
 
 	return f.err
+}
+
+func (f *failingLedgerStore) HasSessionEntry(_ context.Context, _ [32]byte, _,
+	_, _ string) (bool, error) {
+
+	return false, f.err
 }
 
 // TestHandleFeePaidUnknownType verifies that an unknown fee type

@@ -867,12 +867,14 @@ func (s *RoundPersistenceStore) ListConfirmedRounds(ctx context.Context) (
 // FinalizeRound marks a round as complete and archives it. The confInfo
 // contains the block height and hash at which the commitment tx was confirmed.
 func (s *RoundPersistenceStore) FinalizeRound(ctx context.Context,
-	roundID round.RoundID, txid chainhash.Hash,
-	confInfo round.ConfInfo) error {
+	roundID round.RoundID, txid chainhash.Hash, confInfo round.ConfInfo,
+	then func(context.Context) error) error {
 
 	writeTxOpts := WriteTxOption()
 
-	return s.db.ExecTx(ctx, writeTxOpts, func(q RoundStore) error {
+	return s.db.ExecTxCtx(ctx, writeTxOpts, func(txCtx context.Context,
+		q RoundStore) error {
+
 		params := sqlc.FinalizeRoundParams{
 			RoundID:        roundID.String(),
 			CommitmentTxid: txid[:],
@@ -884,7 +886,17 @@ func (s *RoundPersistenceStore) FinalizeRound(ctx context.Context,
 			LastUpdateTime:        s.clock.Now().Unix(),
 		}
 
-		return q.FinalizeRound(ctx, params)
+		if err := q.FinalizeRound(ctx, params); err != nil {
+			return err
+		}
+		if then == nil {
+			return nil
+		}
+
+		// The callback sees the open transaction through txCtx, so
+		// its writes (ledger enqueues) commit with the round row or
+		// roll back with it.
+		return then(txCtx)
 	})
 }
 

@@ -87,13 +87,25 @@ const (
 //   - SourceRoundTransfer: VTXO was received from another round
 //     participant (in-round transfer). The offsetting leg credits
 //     transfers_in.
-//   - SourceOOR: VTXO was received out-of-round (OOR transfer from
-//     another participant). The offsetting leg credits transfers_in.
+//   - SourceOOR: VTXO was received out-of-round. The offsetting leg
+//     credits transfers_in for a receive from another participant.
+//     When the message carries a SessionID under which this ledger
+//     already booked an outgoing VTXOSentMsg, the VTXO is the sender's
+//     own change pushed back by the operator as a separate incoming
+//     session, and the handler books it as SourceOORSelfChange instead.
+//   - SourceOORSelfChange: VTXO is the sender's own change from an
+//     outgoing OOR transfer. The offsetting leg credits transfers_out so
+//     it cancels the part of the companion VTXOSentMsg's gross debit
+//     that never left. This is the OOR analogue of SourceRoundRefresh.
+//     Producers send SourceOOR with the session id and let the handler
+//     derive this from the ledger's own rows, so the classification
+//     never depends on a caller-supplied key or a mutable session row.
 const (
 	SourceRoundBoarding = "round_boarding"
 	SourceRoundRefresh  = "round_refresh"
 	SourceRoundTransfer = "round_transfer"
 	SourceOOR           = "oor"
+	SourceOORSelfChange = "oor_self_change"
 )
 
 // Canonical FeePaidMsg.FeeType values. A misspelled or missing
@@ -229,6 +241,14 @@ type LedgerStore interface {
 	InsertLedgerEntry(
 		ctx context.Context, entry LedgerEntry,
 	) error
+
+	// HasSessionEntry reports whether a ledger leg with the given event
+	// type and account pair is already booked under the OOR session id.
+	// It joins any outer actor transaction present in ctx, so a handler
+	// that keys a booking decision on it sees the same snapshot its
+	// insert commits against.
+	HasSessionEntry(ctx context.Context, sessionID [32]byte, eventType,
+		debitAccount, creditAccount string) (bool, error)
 }
 
 // UTXOAuditEntry is the domain-level representation of a wallet

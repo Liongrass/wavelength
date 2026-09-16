@@ -364,8 +364,12 @@ type BoardingStore interface {
 		error,
 	)
 
-	// InsertBoardingIntents persists one or more boarding intents.
+	// InsertBoardingIntents persists one or more boarding intents and runs
+	// then inside the same write transaction, so a durable enqueue made
+	// with the callback's context commits with the intent rows or rolls
+	// back with them. A nil callback is a plain insert.
 	InsertBoardingIntents(ctx context.Context,
+		then func(context.Context) error,
 		intents ...BoardingIntent) error
 
 	// FetchBoardingIntents returns all boarding intents that are currently

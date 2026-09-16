@@ -152,6 +152,34 @@ func (m *MockBoardingSweepStore) MarkBoardingSweepInputSpent(
 	return args.Bool(0), args.Error(1)
 }
 
+func (m *MockBoardingSweepStore) FinalizeBoardingSweepInputs(
+	ctx context.Context, outpoints []wire.OutPoint,
+	spendingTxid chainhash.Hash, spendingHeight int32,
+	then func(context.Context) error) error {
+
+	args := m.Called(ctx, outpoints, spendingTxid, spendingHeight)
+	if err := args.Error(0); err != nil {
+		return err
+	}
+	if then == nil {
+		return nil
+	}
+
+	// The real store runs the callback inside its write transaction and
+	// propagates its error, which rolls the reconcile back.
+	return then(ctx)
+}
+
+// expectFinalizeBoardingSweep arms the mock for the single finalize call a
+// txconfirm Finalized notification makes, running the ledger callback the way
+// the real store does.
+func expectFinalizeBoardingSweep(store *MockBoardingSweepStore) {
+	store.On(
+		"FinalizeBoardingSweepInputs", mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything,
+	).Return(nil)
+}
+
 func (m *MockBoardingSweepStore) ListBoardingSweeps(ctx context.Context,
 	status string, limit, offset int32) ([]BoardingSweepRecord, error) {
 
@@ -618,6 +646,7 @@ func TestSweepTxNotificationFinalizedEmitsLedger(t *testing.T) {
 	store.On(
 		"GetBoardingSweep", mock.Anything, swept,
 	).Return(walletDerivedRecord, nil)
+	expectFinalizeBoardingSweep(store)
 
 	chainSource := newMockSweepChainSource(t, 0, 0)
 	sink, drain := newCapturingLedgerSink(t)
@@ -738,6 +767,7 @@ func TestSweepTxNotificationFinalizedExternalDestSkipsCreated(t *testing.T) {
 	store.On(
 		"GetBoardingSweep", mock.Anything, swept,
 	).Return(externalDestRecord, nil)
+	expectFinalizeBoardingSweep(store)
 
 	chainSource := newMockSweepChainSource(t, 0, 0)
 	sink, drain := newCapturingLedgerSink(t)
@@ -874,6 +904,7 @@ func TestSweepLedgerClearingNetsToZero(t *testing.T) {
 			store.On(
 				"GetBoardingSweep", mock.Anything, swept,
 			).Return(record, nil)
+			expectFinalizeBoardingSweep(store)
 
 			chainSource := newMockSweepChainSource(t, 0, 0)
 			sink, drain := newCapturingLedgerSink(t)
@@ -954,6 +985,7 @@ func TestSweepTxNotificationMissingTxSkipsLegs(t *testing.T) {
 	store.On(
 		"GetBoardingSweep", mock.Anything, swept,
 	).Return(record, nil)
+	expectFinalizeBoardingSweep(store)
 
 	chainSource := newMockSweepChainSource(t, 0, 0)
 	sink, drain := newCapturingLedgerSink(t)
@@ -1075,10 +1107,14 @@ func TestSweepTxNotificationFinalizedCommitsAndCleansUp(t *testing.T) {
 	finalizedTxid := chainhash.Hash{0xa2}
 	op := wire.OutPoint{Hash: chainhash.Hash{0xb2}, Index: 0}
 	store := &MockBoardingSweepStore{}
+
+	// Pin the exact reconcile arguments: commitFinalizedSweep assembles
+	// the outpoint list from the pending entry, and a wrong or empty
+	// list here would silently leave the input unreconciled.
 	store.On(
-		"MarkBoardingSweepInputSpent", mock.Anything, op,
-		finalizedTxid, int32(800_750),
-	).Return(true, nil)
+		"FinalizeBoardingSweepInputs", mock.Anything,
+		[]wire.OutPoint{op}, finalizedTxid, int32(800_750),
+	).Return(nil)
 
 	a := newSweepTestArk(t, store, nil, 0, 0)
 	pending := &pendingSweepState{
@@ -1104,6 +1140,111 @@ func TestSweepTxNotificationFinalizedCommitsAndCleansUp(t *testing.T) {
 	require.Empty(t, a.pendingSweepInputs)
 
 	store.AssertExpectations(t)
+}
+
+// failingLedgerSink refuses every enqueue, standing in for a durable mailbox
+// whose insert fails inside the finalize transaction.
+type failingLedgerSink struct {
+	err error
+}
+
+// ID satisfies actor.BaseActorRef.
+func (f *failingLedgerSink) ID() string {
+	return "failing-ledger-sink"
+}
+
+// Tell returns the configured failure.
+func (f *failingLedgerSink) Tell(context.Context, ledger.LedgerMsg) error {
+	return f.err
+}
+
+// TryTell returns the configured failure.
+func (f *failingLedgerSink) TryTell(context.Context, ledger.LedgerMsg) error {
+	return f.err
+}
+
+// TestSweepTxNotificationFinalizedRefusedEnqueueRollsBack proves the sweep's
+// accounting and its store transition are one durable fact: a refused ledger
+// enqueue fails the reconcile, so the in-memory watches survive for the
+// restart that re-drives the finalized sweep rather than leaving
+// wallet_balance overstated by the swept inputs forever.
+func TestSweepTxNotificationFinalizedRefusedEnqueueRollsBack(t *testing.T) {
+	t.Parallel()
+
+	swept := chainhash.Hash{0x7d}
+	in1 := wire.OutPoint{Hash: chainhash.Hash{0x8e}, Index: 0}
+
+	const (
+		inputSat  = int64(70_000)
+		feeSat    = int64(300)
+		anchorSat = int64(330)
+	)
+	sweepTx := wire.NewMsgTx(arktx.TxVersion)
+	sweepTx.AddTxOut(&wire.TxOut{
+		Value:    inputSat - feeSat - anchorSat,
+		PkScript: []byte{txscript.OP_TRUE},
+	})
+	sweepTx.AddTxOut(
+		arkscript.AnchorOutput(
+			arkscript.WithAnchorValue(anchorSat),
+		),
+	)
+
+	store := &MockBoardingSweepStore{}
+	store.On("GetBoardingSweep", mock.Anything, swept).Return(
+		&BoardingSweepRecord{
+			Txid:        swept,
+			Tx:          sweepTx,
+			TotalAmount: btcutil.Amount(inputSat),
+			FeeAmount:   btcutil.Amount(feeSat),
+			Status:      "confirmed",
+			Inputs: []BoardingSweepInputRecord{
+				spentSweepInput(swept, in1, inputSat),
+			},
+		}, nil,
+	)
+	expectFinalizeBoardingSweep(store)
+
+	enqueueErr := errors.New("mailbox insert refused")
+	chainSource := newMockSweepChainSource(t, 0, 0)
+	a := NewArk(
+		&MockBoardingBackend{}, &MockBoardingStore{}, nil, chainSource,
+		nil,
+		fn.Some[ledger.Sink](
+			&failingLedgerSink{
+				err: enqueueErr,
+			},
+		),
+		btclog.Disabled,
+		WithBoardingSweep(
+			store, &testBoardingSweepWallet{},
+			&chaincfg.RegressionNetParams,
+		),
+	)
+
+	pending := &pendingSweepState{
+		txid: swept,
+		inputs: map[wire.OutPoint]string{
+			in1: boardingSweepCallerID(in1),
+		},
+	}
+	a.pendingSweeps[swept] = pending
+	a.pendingSweepInputs[in1] = swept
+
+	result := a.handleSweepTxNotification(
+		t.Context(), BoardingSweepTxNotification{
+			Status:      BoardingSweepTxStatusFinalized,
+			Txid:        swept,
+			BlockHeight: 801_000,
+		},
+	)
+	require.True(t, result.IsOk())
+
+	require.Same(
+		t, pending, a.pendingSweeps[swept],
+		"a refused enqueue must leave the sweep re-drivable",
+	)
+	require.Equal(t, swept, a.pendingSweepInputs[in1])
 }
 
 // TestSweepTxNotificationConfirmedRemainsProvisional verifies that the first

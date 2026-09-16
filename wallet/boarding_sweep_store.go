@@ -192,6 +192,17 @@ type BoardingSweepStore interface {
 	MarkBoardingSweepInputSpent(ctx context.Context, outpoint wire.OutPoint,
 		spendingTxid chainhash.Hash, spendingHeight int32) (bool, error)
 
+	// FinalizeBoardingSweepInputs marks every supplied input of a
+	// finalized sweep spent and runs then inside the same write
+	// transaction, with a context that carries it. A durable enqueue
+	// made with that context commits with the input rows or rolls back
+	// with them, so a refused enqueue leaves the sweep unresolved and
+	// the next start re-drives it. Inputs already past
+	// pending/published are benign no-ops.
+	FinalizeBoardingSweepInputs(ctx context.Context,
+		outpoints []wire.OutPoint, spendingTxid chainhash.Hash,
+		spendingHeight int32, then func(context.Context) error) error
+
 	// ListBoardingSweeps returns persisted aggregate sweeps. If status
 	// is non-empty, only sweeps in that lifecycle status are returned.
 	ListBoardingSweeps(ctx context.Context, status string, limit,
