@@ -302,13 +302,21 @@ of round. `queueVTXOsReceived` sends every materialization as a plain
 `handleVTXOReceived` tells the two cases apart from the ledger's own
 rows: a `vtxo_sent` leg already booked under that session id means
 this daemon dispatched the outgoing transfer, so the receive is its
-change. The oracle is ordered by construction: the outgoing send leg
-is enqueued in the outgoing session's commit, the operator only admits
-the incoming self-transfer hint once that session is terminal, and the
-durable mailbox delivers in enqueue order. It needs no caller
-idempotency key and does not depend on the session row, which flips to
-the incoming direction, so it holds for unkeyed sends and survives a
-restart that re-drives materialization.
+change. It needs no caller idempotency key and does not depend on the session
+row, which flips to the incoming direction, so it holds for unkeyed
+sends and survives a restart that re-drives materialization.
+
+What orders the oracle is a correlation key, not the mailbox's global
+claim order. That order is `(priority, available_at, created_at)` with
+no session correlation and second-granularity timestamps, so a send
+that gets nacked once — a busy writer is enough — has its
+`available_at` pushed past the receive and would be overtaken, booking
+the receive as `transfers_in` with nothing left to repair it. Both
+messages therefore return a `CorrelationKey` derived from the session
+id, and the claim SQL never hands out a keyed message while an earlier
+same-key message is still queued, retry backoff included. A message
+that exhausts its attempts is passed over rather than wedging its
+lane, so a poisoned send cannot block its session's receives forever.
 
 ### Cooperative leave
 

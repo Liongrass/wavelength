@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -481,6 +482,14 @@ func (m *VTXOReceivedMsg) MessageType() string {
 	return "VTXOReceivedMsg"
 }
 
+// CorrelationKey puts this message in its OOR session's FIFO lane. See
+// sessionCorrelationKey: the self-change classification in handleVTXOReceived
+// depends on the session's send having been booked first, and the lane is
+// what guarantees it.
+func (m *VTXOReceivedMsg) CorrelationKey() string {
+	return sessionCorrelationKey(m.SessionID)
+}
+
 // TLVType returns the TLV type tag for codec registration.
 func (m *VTXOReceivedMsg) TLVType() tlv.Type {
 	return vtxoReceivedTLVType
@@ -649,6 +658,36 @@ type VTXOSentMsg struct {
 // MessageType returns the message type name for routing.
 func (m *VTXOSentMsg) MessageType() string {
 	return "VTXOSentMsg"
+}
+
+// CorrelationKey puts this message in its OOR session's FIFO lane. In-round
+// sends carry no session id and stay unkeyed.
+func (m *VTXOSentMsg) CorrelationKey() string {
+	return sessionCorrelationKey(m.SessionID)
+}
+
+// sessionCorrelationKey names the durable-mailbox lane an OOR session's
+// ledger messages share.
+//
+// The send and the receive of one session describe two halves of one
+// movement, and handleVTXOReceived can only recognise the receive as the
+// sender's own change if the send's leg is already committed. The mailbox's
+// ordinary claim order cannot promise that: it sorts by priority, then
+// available_at and created_at at whole-second granularity, with no session
+// correlation, so a single nack on the send is enough for the receive to
+// overtake it. A shared key makes the claim SQL's per-key anti-join apply
+// instead, which never hands out a keyed message while an earlier same-key
+// message is still in the queue.
+//
+// A zero session id means an in-round send or a round receipt, which has no
+// lane to join and returns the empty string -- the unkeyed default, which
+// participates in the global order exactly as before.
+func sessionCorrelationKey(sessionID [32]byte) string {
+	if sessionID == zeroSessionID {
+		return ""
+	}
+
+	return "ledger:session:" + hex.EncodeToString(sessionID[:])
 }
 
 // TLVType returns the TLV type tag for codec registration.
