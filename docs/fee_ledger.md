@@ -456,6 +456,40 @@ and assert on timestamps without wall-clock races. The
 same clock source, so per-round event ordering is stable across
 test runs.
 
+## Reconciliation
+
+The invariants this document describes are checkable. The
+accounting command's `check` subcommand evaluates all of them
+against one read-only snapshot and exits non-zero on any
+violation:
+
+```shell
+go run ./internal/cmd/tools/accounting check \
+    --backend sqlite --sqlite.dbfile ~/.waved/data/waved.db
+```
+
+Each invariant is a named check that prints the offending rows,
+and each one maps to a rule stated above: double-entry closure
+and the `wallet_clearing` transit account, `vtxo_balance` against
+the VTXO table, the ledger's wallet-UTXO legs against the
+`wallet_utxo_log` audit trail, the three partial unique indexes
+from [Idempotency and replay safety](#idempotency-and-replay-safety),
+the amount agreement between an operation's cancelling legs, and
+non-duplication in the transaction-history view. Three further
+checks are anomaly detectors for the exact row shapes earlier
+producers wrote and current ones no longer do; the fixes stopped
+new rows appearing but did not rewrite history, so an older
+database can still hold them.
+
+The check is report-only. It never writes, and there is no
+correction-plan mode: a client ledger is not an operator's book of
+record, and a repair to rows this repository's own producers wrote
+belongs in `db/post_migration_checks.go`, where it runs once per
+database alongside the schema upgrade that motivated it. See
+[accounting_report.md](accounting_report.md) for the full check
+list, the wallet reconciliation caveat, and how the checks line up
+with the operator-side accounting tool.
+
 ## Deferred items
 
 - **Non-boarding wallet spends.** Boarding sweep spends now
