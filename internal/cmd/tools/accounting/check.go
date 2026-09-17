@@ -1013,28 +1013,26 @@ func checkAuditLedgerPairing(snap *checkSnapshot) checkResult {
 }
 
 // checkHistoryIsDistinct verifies that ListTransactionHistory returns no two
-// rows with the same (txid, output_index, round_id, session_id, amount_sat,
+// chain-identified rows with the same (txid, output_index, amount_sat,
 // subtype). The history query unions the ledger with OOR bindings and
 // boarding sweeps, and it excludes the own-wallet contra legs that share a
 // send leg's chain identity; a duplicate here means a consumer would show the
-// same movement twice.
+// same on-chain movement twice.
 //
-// Round and session ids are part of the key because a round-level row carries
-// no chain identity at all: its txid is empty and its output index is the -1
-// sentinel. Two equal-amount directed sends of the same subtype in different
-// rounds are independent movements, and keying on the chain columns alone
-// would collide them into a false duplicate on a healthy ledger.
-//
-// A row with neither a chain identity nor a round or session id is skipped.
-// Nothing distinguishes two such rows from each other, so the checker cannot
-// tell a genuine duplicate from two legitimate equal movements, and reporting
-// the guess would be worse than reporting nothing.
+// Only rows carrying a txid and a non-negative output index are examined. A
+// chain outpoint is a real identity: one output confirms once, so two rows
+// naming it with the same subtype describe one movement. Round-level rows
+// have no such identity. Their txid is empty and their output index is the
+// -1 sentinel, and the projected columns cannot tell two legitimate
+// equal-amount recipients in one round apart from a leg booked twice.
+// Reporting the guess would fail healthy journals, so those rows are left to
+// the ledger-level checks, which see the idempotency keys.
 func checkHistoryIsDistinct(snap *checkSnapshot) checkResult {
 	result := checkResult{
 		Name: checkHistoryDistinct,
-		Description: "transaction history holds no two rows with the " +
-			"same txid, output index, round, session, amount " +
-			"and subtype",
+		Description: "transaction history holds no two " +
+			"chain-identified rows with the same txid, output " +
+			"index, amount and subtype",
 		Passed: true,
 	}
 
@@ -1051,14 +1049,11 @@ func checkHistoryIsDistinct(snap *checkSnapshot) checkResult {
 
 	seen := make(map[string]int, len(snap.history))
 	for _, row := range snap.history {
-		hasChain := len(row.Txid) > 0 && row.OutputIndex >= 0
-		hasRound := len(row.RoundID) > 0 || len(row.SessionID) > 0
-		if !hasChain && !hasRound {
+		if len(row.Txid) == 0 || row.OutputIndex < 0 {
 			continue
 		}
 
-		id := fmt.Sprintf("%x|%d|%x|%x|%d|%s", row.Txid,
-			row.OutputIndex, row.RoundID, row.SessionID,
+		id := fmt.Sprintf("%x|%d|%d|%s", row.Txid, row.OutputIndex,
 			row.AmountSat, row.Subtype)
 		seen[id]++
 		if seen[id] != 2 {
@@ -1071,12 +1066,8 @@ func checkHistoryIsDistinct(snap *checkSnapshot) checkResult {
 			Fields: map[string]string{
 				"txid":         hex.EncodeToString(row.Txid),
 				"output_index": itoa64(int64(row.OutputIndex)),
-				"round_id":     hex.EncodeToString(row.RoundID),
-				"session_id": hex.EncodeToString(
-					row.SessionID,
-				),
-				"amount_sat": itoa64(row.AmountSat),
-				"subtype":    row.Subtype,
+				"amount_sat":   itoa64(row.AmountSat),
+				"subtype":      row.Subtype,
 			},
 		})
 	}

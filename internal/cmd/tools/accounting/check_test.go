@@ -836,22 +836,25 @@ func roundSendEntry(roundID []byte, amount int64,
 	}
 }
 
-// TestCheckHistoryDistinctSeparatesRounds proves two equal-amount directed
-// sends of the same subtype in different rounds are not reported as a
-// duplicate. Round-level history rows share an empty txid and the -1 output
-// index sentinel, so a key built from the chain columns alone would collide
-// two independent movements and fail a healthy ledger.
-func TestCheckHistoryDistinctSeparatesRounds(t *testing.T) {
+// TestCheckHistoryDistinctSkipsRoundLevelRows proves that round-level rows,
+// which carry no chain identity, are never reported as duplicates. Two
+// equal-amount recipients in one round and two equal-amount sends in two
+// rounds are both legitimate, and the projected history columns cannot tell
+// either apart from a leg booked twice, so the check must not guess.
+func TestCheckHistoryDistinctSkipsRoundLevelRows(t *testing.T) {
 	store, cfg := newCheckStore(t)
 
+	sameRound := bytes.Repeat([]byte{0x01}, 32)
 	insertEntry(
 		t, store,
 		roundSendEntry(
-			bytes.Repeat(
-				[]byte{0x01}, 32,
-			),
-			5_000,
-			[]byte("send-round-1"),
+			sameRound, 5_000, []byte("recipient-a"),
+		),
+	)
+	insertEntry(
+		t, store,
+		roundSendEntry(
+			sameRound, 5_000, []byte("recipient-b"),
 		),
 	)
 	insertEntry(
@@ -870,15 +873,19 @@ func TestCheckHistoryDistinctSeparatesRounds(t *testing.T) {
 	require.Empty(t, result.Findings)
 }
 
-// TestCheckHistoryDistinctFlagsARepeatedRound proves the check still catches
-// a real duplicate: two identically shaped sends inside one round, which a
-// consumer would render as the same movement twice.
-func TestCheckHistoryDistinctFlagsARepeatedRound(t *testing.T) {
+// TestCheckHistoryDistinctFlagsARepeatedOutpoint proves the check catches a
+// real duplicate: two legs of the same subtype naming one chain outpoint,
+// which a consumer would render as the same on-chain movement twice.
+func TestCheckHistoryDistinctFlagsARepeatedOutpoint(t *testing.T) {
 	store, cfg := newCheckStore(t)
 
-	roundID := bytes.Repeat([]byte{0x03}, 32)
-	insertEntry(t, store, roundSendEntry(roundID, 5_000, []byte("dup-a")))
-	insertEntry(t, store, roundSendEntry(roundID, 5_000, []byte("dup-b")))
+	txid := bytes.Repeat([]byte{0x03}, 32)
+	for _, key := range []string{"dup-a", "dup-b"} {
+		entry := roundSendEntry(nil, 5_000, []byte(key))
+		entry.ChainTxid = txid
+		entry.ChainVout = sql.NullInt32{Int32: 1, Valid: true}
+		insertEntry(t, store, entry)
+	}
 
 	result := runChecks(t, store, cfg)[checkHistoryDistinct]
 	require.False(t, result.Passed)
