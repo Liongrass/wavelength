@@ -9,12 +9,14 @@ INSERT INTO ledger_deposit_funding_inputs (
 ON CONFLICT (input_hash, input_index, deposit_hash, deposit_index)
 DO NOTHING;
 
--- name: CountDepositFundingInput :one
--- CountDepositFundingInput reports whether an outpoint is recorded as the
--- funding input of any boarding deposit. An own-wallet proceeds row arriving
--- after the deposit it funded uses this to discover that it must reverse its
--- own credit.
-SELECT CAST(COUNT(*) AS BIGINT) AS input_count
+-- name: ListDepositsFundedByInput :many
+-- ListDepositsFundedByInput returns the boarding deposits an outpoint is
+-- recorded as funding. An own-wallet proceeds row arriving after the deposit
+-- it funded uses this to discover that it must reverse its own credit, and to
+-- find the deposit whose confirmation height stamps that reversal, so the leg
+-- is byte-identical whichever message books it.
+SELECT deposit_hash, deposit_index
 FROM ledger_deposit_funding_inputs
 WHERE input_hash = $1
-  AND input_index = $2;
+  AND input_index = $2
+ORDER BY deposit_hash, deposit_index;

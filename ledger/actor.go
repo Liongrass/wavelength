@@ -366,12 +366,13 @@ type UTXOAuditStore interface {
 	InsertDepositFundingInput(ctx context.Context,
 		input, deposit wire.OutPoint, createdAt int64) error
 
-	// IsDepositFundingInput reports whether an outpoint is recorded as
-	// the funding input of any boarding deposit. An own-wallet proceeds
-	// row arriving after the deposit it funded uses this to discover that
-	// it owes a reversing leg.
-	IsDepositFundingInput(ctx context.Context,
-		outpoint wire.OutPoint) (bool, error)
+	// DepositsFundedByInput returns the boarding deposits an outpoint is
+	// recorded as funding, in a stable order, or an empty list. An
+	// own-wallet proceeds row arriving after the deposit it funded uses
+	// this to discover that it owes a reversing leg, and to find the
+	// deposit whose confirmation height stamps that leg.
+	DepositsFundedByInput(ctx context.Context,
+		outpoint wire.OutPoint) ([]wire.OutPoint, error)
 }
 
 // ActorConfig configures the client-side LedgerActor.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/db/sqlc"
 	"github.com/lightninglabs/wavelength/ledger"
@@ -222,15 +223,16 @@ func (s *UTXOAuditStoreDB) InsertDepositFundingInput(ctx context.Context,
 	})
 }
 
-// IsDepositFundingInput reports whether an outpoint is recorded as the
-// funding input of any boarding deposit.
-func (s *UTXOAuditStoreDB) IsDepositFundingInput(ctx context.Context,
-	outpoint wire.OutPoint) (bool, error) {
+// DepositsFundedByInput returns the boarding deposits an outpoint is recorded
+// as funding, in a stable order. The list is empty for an outpoint that
+// funded no deposit, which is not an error.
+func (s *UTXOAuditStoreDB) DepositsFundedByInput(ctx context.Context,
+	outpoint wire.OutPoint) ([]wire.OutPoint, error) {
 
-	var found bool
+	var deposits []wire.OutPoint
 	err := s.ExecTx(ctx, ReadTxOption(), func(q *sqlc.Queries) error {
-		count, err := q.CountDepositFundingInput(
-			ctx, sqlc.CountDepositFundingInputParams{
+		rows, err := q.ListDepositsFundedByInput(
+			ctx, sqlc.ListDepositsFundedByInputParams{
 				InputHash:  outpoint.Hash[:],
 				InputIndex: int32(outpoint.Index),
 			},
@@ -239,13 +241,21 @@ func (s *UTXOAuditStoreDB) IsDepositFundingInput(ctx context.Context,
 			return err
 		}
 
-		found = count > 0
+		deposits = make([]wire.OutPoint, 0, len(rows))
+		for _, row := range rows {
+			var hash chainhash.Hash
+			copy(hash[:], row.DepositHash)
+			deposits = append(deposits, wire.OutPoint{
+				Hash:  hash,
+				Index: uint32(row.DepositIndex),
+			})
+		}
 
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
-	return found, nil
+	return deposits, nil
 }

@@ -952,8 +952,7 @@ func (a *LedgerActor) handleUTXOCreated(ctx context.Context,
 
 		if IsOwnWalletProceeds(msg.Classification) {
 			return a.reverseIfDepositFunded(
-				ctx, q, outpoint, msg.AmountSat,
-				int32(msg.BlockHeight), now,
+				ctx, q, outpoint, msg.AmountSat, now,
 			)
 		}
 
@@ -1046,24 +1045,43 @@ func (a *LedgerActor) bookDepositFunding(ctx context.Context, q ledgerTx,
 // this side.
 //
 // Whichever of the two messages commits second performs the reversal, and the
-// leg's idempotency key is the same either way, so the two attempts collapse
-// into one row rather than racing. Neither side reads the other's in-flight
-// state: each reads only what the other has already committed.
+// leg must be byte-identical either way: the durable mailbox may redeliver
+// either message after both have committed, and a replay whose payload differs
+// from the persisted row is an idempotency conflict, not a no-op. The deposit
+// side stamps the leg with the deposit's confirmation height, which is the
+// height the proceeds were actually spent at, so this side reads that height
+// back from the deposit's own audit row rather than using the proceeds'
+// creation height. A funding transaction paying several boarding addresses
+// records one deposit per output, all at the same height, so the first is as
+// good as any. Neither side reads the other's in-flight state: each reads
+// only what the other has already committed.
 func (a *LedgerActor) reverseIfDepositFunded(ctx context.Context, q ledgerTx,
-	outpoint wire.OutPoint, amountSat int64, blockHeight int32,
-	now int64) error {
+	outpoint wire.OutPoint, amountSat int64, now int64) error {
 
-	funded, err := q.audit.IsDepositFundingInput(ctx, outpoint)
+	deposits, err := q.audit.DepositsFundedByInput(ctx, outpoint)
 	if err != nil {
 		return fmt.Errorf("look up deposit funding for %v: %w",
 			outpoint, err)
 	}
-	if !funded {
+	if len(deposits) == 0 {
 		return nil
 	}
 
+	deposit, found, err := q.audit.LookupCreatedUTXO(ctx, deposits[0])
+	if err != nil {
+		return fmt.Errorf("look up deposit %v: %w", deposits[0], err)
+	}
+	if !found {
+
+		// The funding index and the deposit's audit row commit in one
+		// transaction, so an index entry without its deposit is a
+		// broken invariant rather than a race to wait out.
+		return fmt.Errorf("deposit %v funded by %v has no audit row",
+			deposits[0], outpoint)
+	}
+
 	if err := a.bookProceedsReversal(
-		ctx, q, outpoint, amountSat, blockHeight, now,
+		ctx, q, outpoint, amountSat, deposit.BlockHeight, now,
 	); err != nil {
 		return err
 	}
@@ -1071,6 +1089,7 @@ func (a *LedgerActor) reverseIfDepositFunded(ctx context.Context, q ledgerTx,
 	a.log.InfoS(ctx, "Reversing own-wallet proceeds credit for a "+
 		"boarding deposit already booked",
 		slog.String("outpoint", outpoint.String()),
+		slog.String("deposit", deposits[0].String()),
 		slog.Int64("amount_sat", amountSat),
 	)
 
@@ -1349,8 +1368,7 @@ func (a *LedgerActor) handleBoardingSweepConfirmed(ctx context.Context,
 		}
 
 		return a.reverseIfDepositFunded(
-			ctx, q, returnPoint, msg.DestinationSat,
-			int32(msg.BlockHeight), now,
+			ctx, q, returnPoint, msg.DestinationSat, now,
 		)
 	})
 }

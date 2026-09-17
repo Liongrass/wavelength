@@ -9,29 +9,6 @@ import (
 	"context"
 )
 
-const CountDepositFundingInput = `-- name: CountDepositFundingInput :one
-SELECT CAST(COUNT(*) AS BIGINT) AS input_count
-FROM ledger_deposit_funding_inputs
-WHERE input_hash = $1
-  AND input_index = $2
-`
-
-type CountDepositFundingInputParams struct {
-	InputHash  []byte
-	InputIndex int32
-}
-
-// CountDepositFundingInput reports whether an outpoint is recorded as the
-// funding input of any boarding deposit. An own-wallet proceeds row arriving
-// after the deposit it funded uses this to discover that it must reverse its
-// own credit.
-func (q *Queries) CountDepositFundingInput(ctx context.Context, arg CountDepositFundingInputParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, CountDepositFundingInput, arg.InputHash, arg.InputIndex)
-	var input_count int64
-	err := row.Scan(&input_count)
-	return input_count, err
-}
-
 const InsertDepositFundingInput = `-- name: InsertDepositFundingInput :exec
 INSERT INTO ledger_deposit_funding_inputs (
     input_hash, input_index, deposit_hash, deposit_index, created_at
@@ -61,4 +38,50 @@ func (q *Queries) InsertDepositFundingInput(ctx context.Context, arg InsertDepos
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const ListDepositsFundedByInput = `-- name: ListDepositsFundedByInput :many
+SELECT deposit_hash, deposit_index
+FROM ledger_deposit_funding_inputs
+WHERE input_hash = $1
+  AND input_index = $2
+ORDER BY deposit_hash, deposit_index
+`
+
+type ListDepositsFundedByInputParams struct {
+	InputHash  []byte
+	InputIndex int32
+}
+
+type ListDepositsFundedByInputRow struct {
+	DepositHash  []byte
+	DepositIndex int32
+}
+
+// ListDepositsFundedByInput returns the boarding deposits an outpoint is
+// recorded as funding. An own-wallet proceeds row arriving after the deposit
+// it funded uses this to discover that it must reverse its own credit, and to
+// find the deposit whose confirmation height stamps that reversal, so the leg
+// is byte-identical whichever message books it.
+func (q *Queries) ListDepositsFundedByInput(ctx context.Context, arg ListDepositsFundedByInputParams) ([]ListDepositsFundedByInputRow, error) {
+	rows, err := q.db.QueryContext(ctx, ListDepositsFundedByInput, arg.InputHash, arg.InputIndex)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDepositsFundedByInputRow
+	for rows.Next() {
+		var i ListDepositsFundedByInputRow
+		if err := rows.Scan(&i.DepositHash, &i.DepositIndex); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

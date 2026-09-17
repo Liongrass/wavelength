@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 
@@ -114,9 +115,10 @@ type mockUTXOAuditStore struct {
 	mu      sync.Mutex
 	entries []UTXOAuditEntry
 
-	// fundingInputs records the outpoints reported as funding a boarding
-	// deposit, so a test can pre-seed the deposit-arrived-first ordering.
-	fundingInputs map[wire.OutPoint]struct{}
+	// fundingInputs records, per funding outpoint, the boarding deposits
+	// it was reported as funding, so a test can pre-seed the
+	// deposit-arrived-first ordering.
+	fundingInputs map[wire.OutPoint][]wire.OutPoint
 }
 
 func (m *mockUTXOAuditStore) InsertUTXOAuditEntry(_ context.Context,
@@ -153,29 +155,30 @@ func (m *mockUTXOAuditStore) LookupCreatedUTXO(_ context.Context,
 
 // InsertDepositFundingInput records a deposit's funding input.
 func (m *mockUTXOAuditStore) InsertDepositFundingInput(_ context.Context,
-	input, _ wire.OutPoint, _ int64) error {
+	input, deposit wire.OutPoint, _ int64) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.fundingInputs == nil {
-		m.fundingInputs = make(map[wire.OutPoint]struct{})
+		m.fundingInputs = make(map[wire.OutPoint][]wire.OutPoint)
 	}
-	m.fundingInputs[input] = struct{}{}
+	if slices.Contains(m.fundingInputs[input], deposit) {
+		return nil
+	}
+	m.fundingInputs[input] = append(m.fundingInputs[input], deposit)
 
 	return nil
 }
 
-// IsDepositFundingInput reports whether an outpoint funded a deposit.
-func (m *mockUTXOAuditStore) IsDepositFundingInput(_ context.Context,
-	outpoint wire.OutPoint) (bool, error) {
+// DepositsFundedByInput returns the deposits an outpoint funded.
+func (m *mockUTXOAuditStore) DepositsFundedByInput(_ context.Context,
+	outpoint wire.OutPoint) ([]wire.OutPoint, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	_, ok := m.fundingInputs[outpoint]
-
-	return ok, nil
+	return slices.Clone(m.fundingInputs[outpoint]), nil
 }
 
 func (m *mockUTXOAuditStore) getEntries() []UTXOAuditEntry {
@@ -1293,21 +1296,24 @@ func TestHandleExitCostFeeExceedsValue(t *testing.T) {
 type dedupLedgerStore struct {
 	mu      sync.Mutex
 	entries []LedgerEntry
-	keys    map[string]struct{}
+	keys    map[string]LedgerEntry
 }
 
 // newDedupLedgerStore constructs a fresh dedupLedgerStore.
 func newDedupLedgerStore() *dedupLedgerStore {
 	return &dedupLedgerStore{
-		keys: make(map[string]struct{}),
+		keys: make(map[string]LedgerEntry),
 	}
 }
 
 // InsertLedgerEntry appends the entry unless a previous insert
-// already covered the same idempotency_key + account/event tuple,
-// in which case the call is a silent no-op. Mirrors the
-// idx_client_ledger_idempotent_key partial unique index plus the
-// ON CONFLICT DO NOTHING clause on InsertClientLedgerEntry.
+// already covered the same idempotency_key + account/event tuple.
+// An identical replay is a silent no-op; a replay whose durable payload
+// differs returns ErrIdempotencyConflict. Mirrors the
+// idx_client_ledger_idempotent_key partial unique index, the ON CONFLICT
+// DO NOTHING clause on InsertClientLedgerEntry, and the winner comparison
+// the real store performs afterwards, so a handler that builds the same leg
+// differently on two paths fails here the way it fails in production.
 func (d *dedupLedgerStore) InsertLedgerEntry(_ context.Context,
 	entry LedgerEntry) error {
 
@@ -1318,15 +1324,47 @@ func (d *dedupLedgerStore) InsertLedgerEntry(_ context.Context,
 		k := fmt.Sprintf("%x|%s|%s|%s", entry.IdempotencyKey,
 			entry.EventType, entry.DebitAccount,
 			entry.CreditAccount)
-		if _, seen := d.keys[k]; seen {
-			return nil
+		if winner, seen := d.keys[k]; seen {
+			if durablePayloadEqual(winner, entry) {
+				return nil
+			}
+
+			return fmt.Errorf("%w: event=%s debit=%s credit=%s",
+				ErrIdempotencyConflict, entry.EventType,
+				entry.DebitAccount, entry.CreditAccount)
 		}
-		d.keys[k] = struct{}{}
+		d.keys[k] = entry
 	}
 
 	d.entries = append(d.entries, entry)
 
 	return nil
+}
+
+// durablePayloadEqual compares every field the real store compares on a
+// replay, which is everything but CreatedAt.
+func durablePayloadEqual(got, want LedgerEntry) bool {
+	return got.DebitAccount == want.DebitAccount &&
+		got.CreditAccount == want.CreditAccount &&
+		got.AmountSat == want.AmountSat &&
+		bytes.Equal(got.RoundID, want.RoundID) &&
+		bytes.Equal(got.SessionID, want.SessionID) &&
+		bytes.Equal(got.IdempotencyKey, want.IdempotencyKey) &&
+		got.EventType == want.EventType &&
+		got.Description == want.Description &&
+		bytes.Equal(got.ChainTxid, want.ChainTxid) &&
+		int32PtrEqual(got.ChainVout, want.ChainVout) &&
+		int32PtrEqual(got.ConfirmationHeight, want.ConfirmationHeight)
+}
+
+// int32PtrEqual treats two nil pointers as equal and otherwise compares
+// the pointed-to values.
+func int32PtrEqual(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return *a == *b
 }
 
 // getEntries returns a snapshot of the persisted entries.

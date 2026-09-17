@@ -36,11 +36,6 @@ type Querier interface {
 	// know that *some* leg already exists at this chain identity, not that a leg
 	// with the accounts it happens to have chosen this time exists.
 	CountClientLedgerEntriesForKey(ctx context.Context, arg CountClientLedgerEntriesForKeyParams) (int64, error)
-	// CountDepositFundingInput reports whether an outpoint is recorded as the
-	// funding input of any boarding deposit. An own-wallet proceeds row arriving
-	// after the deposit it funded uses this to discover that it must reverse its
-	// own credit.
-	CountDepositFundingInput(ctx context.Context, arg CountDepositFundingInputParams) (int64, error)
 	// CountOwnedWalletScript reports whether a pkScript is in the registry.
 	// Absent means "not known to be ours", which is the conservative answer.
 	CountOwnedWalletScript(ctx context.Context, pkScript []byte) (int64, error)
@@ -285,6 +280,12 @@ type Querier interface {
 	// has no boarding intent. Only the 'deposit' classification is checked;
 	// change and sweep-return deposits legitimately have no intent.
 	ListDepositLegsWithoutBoardingIntent(ctx context.Context) ([]ListDepositLegsWithoutBoardingIntentRow, error)
+	// ListDepositsFundedByInput returns the boarding deposits an outpoint is
+	// recorded as funding. An own-wallet proceeds row arriving after the deposit
+	// it funded uses this to discover that it must reverse its own credit, and to
+	// find the deposit whose confirmation height stamps that reversal, so the leg
+	// is byte-identical whichever message books it.
+	ListDepositsFundedByInput(ctx context.Context, arg ListDepositsFundedByInputParams) ([]ListDepositsFundedByInputRow, error)
 	// ListEntriesByKindStatus returns entries of the given kind and status, paged
 	// by the unique canonical_id ascending. It backs the startup rehydration of
 	// the wallet-local pending map: filtering in SQL keeps that scan O(matching
