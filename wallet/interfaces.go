@@ -404,3 +404,19 @@ type BoardingStore interface {
 	LookupIntentByScript(ctx context.Context,
 		pkScript []byte) (*BoardingIntent, error)
 }
+
+// OwnedWalletScriptChecker answers whether an on-chain pkScript belongs to
+// this daemon's backing wallet. The three supported wallet backends answer
+// script ownership differently or not at all, so the answer comes from a
+// durable registry the daemon writes when it mints a script rather than from
+// a backend query.
+//
+// A script the registry has never seen returns false, which is the
+// conservative answer: the accounting books the destination as a genuine
+// outflow rather than as an internal transfer between two accounts the client
+// owns. Overstating ownership would understate what the client paid out.
+type OwnedWalletScriptChecker interface {
+	// IsOwnedWalletScript reports whether pkScript is a backing-wallet
+	// script this daemon minted.
+	IsOwnedWalletScript(ctx context.Context, pkScript []byte) (bool, error)
+}

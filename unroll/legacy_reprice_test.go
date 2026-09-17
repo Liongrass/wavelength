@@ -131,3 +131,28 @@ func (s *readmissionFailStore) UpsertRecord(_ context.Context,
 
 	return errors.New("readmission write unavailable")
 }
+
+// TestBuildSweepTxSingleOutput pins the invariant the exit-proceeds audit row
+// rests on: the sweep pays exactly one output, so the value of the output
+// exitProceedsMsg selects equals the sum of outputs exitCostMsg credits as
+// proceeds. Adding an anchor output would split the two apart, making the
+// credited proceeds exceed the audit row and the later reversal under-reverse
+// by the anchor value. Break this test rather than the ledger.
+func TestBuildSweepTxSingleOutput(t *testing.T) {
+	t.Parallel()
+
+	proof := buildLinearProof(t)
+	target := proof.TargetOutpoint()
+	desc := testDescriptor(t, target, proof.CSVDelay())
+
+	tx, err := buildSweepTx(
+		t.Context(), &fakeSweepWallet{}, &fakeChainSourceRef{}, proof,
+		desc, 0, 0, 104, NewStandardVTXOExitSpendPolicy(desc),
+	)
+	require.NoError(t, err)
+
+	require.Len(
+		t, tx.TxOut, 1,
+		"the exit-proceeds audit amount assumes a single sweep output",
+	)
+}

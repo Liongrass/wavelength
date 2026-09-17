@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -136,17 +137,53 @@ func (s CoinGeckoPriceSource) Price(ctx context.Context, currency string) (
 	return price, nil
 }
 
-// main runs the accounting report command.
+// main runs the accounting command. A violated invariant exits non-zero
+// without an extra error line, because runCheck has already written the
+// report that explains which rows are at fault.
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
+	err := run(context.Background(), os.Args[1:])
+	switch {
+	case err == nil:
+	case errors.Is(err, errCheckFailed):
+		os.Exit(1)
+
+	default:
 		fmt.Fprintf(os.Stderr, "accounting: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// run parses flags, reads the ledger DB, and writes the report.
+// Subcommand names. "report" is the historical behaviour and stays the
+// default when no subcommand is given, so existing invocations that pass only
+// flags keep working.
+const (
+	subcommandReport = "report"
+	subcommandCheck  = "check"
+)
+
+// splitSubcommand peels an optional leading subcommand off the argument list.
+// A leading argument starting with "-" is a flag, so the caller asked for the
+// default report.
+func splitSubcommand(args []string) (string, []string) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return subcommandReport, args
+	}
+
+	return args[0], args[1:]
+}
+
+// run parses the subcommand and flags, reads the ledger DB, and writes either
+// the accounting report or the invariant check result.
 func run(ctx context.Context, args []string) error {
-	cfg, err := parseFlags(args)
+	subcommand, rest := splitSubcommand(args)
+	switch subcommand {
+	case subcommandReport, subcommandCheck:
+	default:
+		return fmt.Errorf("unknown subcommand %q (want %s or %s)",
+			subcommand, subcommandReport, subcommandCheck)
+	}
+
+	cfg, err := parseFlags(rest)
 	if err != nil {
 		return err
 	}
@@ -164,6 +201,10 @@ func run(ctx context.Context, args []string) error {
 	defer func() {
 		_ = store.Close()
 	}()
+
+	if subcommand == subcommandCheck {
+		return runCheck(ctx, store, cfg, os.Stdout)
+	}
 
 	var price *float64
 	if cfg.priceSource != "none" {

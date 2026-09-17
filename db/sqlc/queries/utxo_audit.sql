@@ -32,3 +32,15 @@ FROM wallet_utxo_log
 WHERE classified_as = $1
 ORDER BY created_at DESC, entry_id DESC
 LIMIT $2 OFFSET $3;
+
+-- name: GetWalletUTXOLogCreatedByOutpoint :one
+-- GetWalletUTXOLogCreatedByOutpoint returns the 'created' audit row at an
+-- outpoint, if any. idx_utxo_log_outpoint_event makes it at most one row.
+-- The ledger actor uses it to recognise a boarding deposit's funding input as
+-- a UTXO whose value it already credited to wallet_balance.
+SELECT entry_id, outpoint_hash, outpoint_index, amount_sat,
+       event, block_height, classified_as, created_at
+FROM wallet_utxo_log
+WHERE outpoint_hash = $1
+  AND outpoint_index = $2
+  AND event = 'created';

@@ -684,9 +684,30 @@ func (a *RoundClientActor) emitVTXOsReceived(ctx context.Context,
 		}
 
 		a.stageLedger(&ledger.VTXOSentMsg{
+			AmountSat:         outflow.AmountSat,
+			RoundID:           roundID,
+			IdempotencyKey:    outflow.IdempotencyKey,
+			ProceedsOwnWallet: outflow.ProceedsOwnWallet,
+		}, n.RoundID)
+
+		if !outflow.ProceedsOwnWallet {
+			continue
+		}
+
+		// Give those proceeds an on-chain identity. The send message
+		// above already credits wallet_balance for them, so this row
+		// books no leg of its own -- handleUTXOCreated treats
+		// leave_proceeds as audit-only. What it buys is recognition:
+		// a leave pays a plain wallet script, not a boarding address,
+		// so without this row nothing in the client would know those
+		// coins had been booked, and boarding them later would credit
+		// the same satoshis a second time.
+		a.stageLedger(&ledger.UTXOCreatedMsg{
+			OutpointHash:   [32]byte(n.CommitmentTxID),
+			OutpointIndex:  outflow.ProceedsVout,
 			AmountSat:      outflow.AmountSat,
-			RoundID:        roundID,
-			IdempotencyKey: outflow.IdempotencyKey,
+			BlockHeight:    blockHeight(n.CreatedHeight),
+			Classification: ledger.ClassificationLeaveProceeds,
 		}, n.RoundID)
 	}
 
@@ -699,6 +720,23 @@ func (a *RoundClientActor) emitVTXOsReceived(ctx context.Context,
 	}
 
 	a.emitRoundFee(roundID, n)
+}
+
+// blockHeight clamps a signed chain height to the unsigned field the ledger
+// messages carry. A height that is not yet known reads as zero rather than
+// wrapping to a height near the top of the range.
+//
+// Zero is a sentinel, not a height. The round notification is the only source
+// of a height here and it can arrive before the commitment transaction has
+// confirmed, so there is no real height to substitute. Readers that reason
+// about when the ledger era began must exclude zero rather than treat it as
+// block 0 -- see ListBoardingIntentsWithoutDepositLeg.
+func blockHeight(height int32) uint32 {
+	if height <= 0 {
+		return 0
+	}
+
+	return uint32(height)
 }
 
 // emitRoundCompleted reports a terminal round outcome to the metrics

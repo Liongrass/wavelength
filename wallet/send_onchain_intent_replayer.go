@@ -32,6 +32,11 @@ const replayRoundRegisterTimeout = 30 * time.Second
 // intent's original derivation never reached a round (the outbox row would
 // have been cleared otherwise), so deriving a fresh key only costs a small
 // amount of keychain gap, never funds.
+//
+// The leave's own-wallet flag is resolved here rather than persisted for the
+// same reason it is not on the wire: it is a property of the destination
+// script and the registry that records it, both of which outlive a restart,
+// so re-deriving it gives the same answer the live path got.
 func (a *Ark) buildSendOnChainIntentPackage(ctx context.Context,
 	p SendOnChainIntentPayload, selectedOutpoints []wire.OutPoint,
 	selectedAmounts []btcutil.Amount, change btcutil.Amount) (
@@ -78,6 +83,9 @@ func (a *Ark) buildSendOnChainIntentPackage(ctx context.Context,
 					Value:    int64(totalInput),
 				},
 				IsChange: true,
+				DestinationOwnWallet: a.destinationIsOwnWallet(
+					ctx, p.DestinationPkScript,
+				),
 			},
 		}
 
@@ -95,6 +103,9 @@ func (a *Ark) buildSendOnChainIntentPackage(ctx context.Context,
 				Value:    int64(p.TargetAmountSat),
 			},
 			IsChange: false,
+			DestinationOwnWallet: a.destinationIsOwnWallet(
+				ctx, p.DestinationPkScript,
+			),
 		},
 	}
 

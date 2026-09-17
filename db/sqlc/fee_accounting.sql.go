@@ -42,6 +42,29 @@ func (q *Queries) CountClientLedgerEntries(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const CountClientLedgerEntriesForKey = `-- name: CountClientLedgerEntriesForKey :one
+SELECT COUNT(*)
+FROM ledger_entries
+WHERE idempotency_key = $1
+  AND event_type = $2
+`
+
+type CountClientLedgerEntriesForKeyParams struct {
+	IdempotencyKey []byte
+	EventType      string
+}
+
+// Counts the legs booked at one idempotency key and event type, ignoring the
+// account pair. A handler that picks its accounts from mutable state needs to
+// know that *some* leg already exists at this chain identity, not that a leg
+// with the accounts it happens to have chosen this time exists.
+func (q *Queries) CountClientLedgerEntriesForKey(ctx context.Context, arg CountClientLedgerEntriesForKeyParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, CountClientLedgerEntriesForKey, arg.IdempotencyKey, arg.EventType)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const GetClientAccountBalance = `-- name: GetClientAccountBalance :one
 SELECT CAST(COALESCE(
     (SELECT SUM(le1.amount_sat) FROM ledger_entries le1

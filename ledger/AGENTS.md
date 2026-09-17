@@ -186,6 +186,11 @@ or balance reconciliation. Required emission pairs:
 | OOR self-change | `VTXOReceivedMsg{SourceOOR, SessionID}` for the sender's own change coming back as an incoming session; the handler sees the session's earlier `vtxo_sent` leg and credits `transfers_out` so it cancels the part of the companion `VTXOSentMsg` that never left. |
 | OOR send | `VTXOSentMsg{SessionID}` net. No `FeePaidMsg`. |
 | In-round send | `VTXOSentMsg{RoundID}` net. Recipient/leave sends without outpoints must set `IdempotencyKey`. `SessionID`/`RoundID` are mutually exclusive. |
+| Exit proceeds | `UTXOCreatedMsg{Classification=exit_proceeds}` from the unroll sweep, at the output the owned-script registry identifies as ours. Audit row only, no ledger leg: the `ExitCostMsg` proceeds leg already credited `wallet_balance`. |
+| Leave proceeds | `UTXOCreatedMsg{Classification=leave_proceeds}` from the round actor at `(commitment txid, ProceedsVout)`, staged alongside the flagged `VTXOSentMsg`. Audit row only, for the same reason. |
+| Recycled change | `UTXOCreatedMsg{Classification=recycled_change}` from the wallet for the change of a partial spend of either. Books its own credit leg: no earlier message described it. |
+| Boarding deposit | `UTXOCreatedMsg{Classification=deposit, FundingInputs}` — the funding transaction's previous outpoints. The handler indexes them and reverses the credit of any that is already a recorded own-wallet proceeds UTXO, booking `opening_balance <- wallet_balance` and a `deposit_funding` audit row. |
+| Own-wallet leave | `VTXOSentMsg{RoundID, ProceedsOwnWallet=true}` for a leave paying a backing-wallet script this daemon minted. The send leg is unchanged; a second leg `wallet_balance <- transfers_out`, keyed by the send key scoped under the `proceeds` leg name, cancels it. A flagged send with no `IdempotencyKey` books no proceeds leg, since it has no distinct identity for one. |
 | Unilateral exit | `ExitCostMsg{AmountSat=gross, ExitCostSat=fee, DestinationOwnWallet}`. Handler expands to send-leg + fee-leg internally; the flag adds a separately keyed proceeds leg that moves the net value from `transfers_out` onto `wallet_balance`. |
 
 ## Invariants

@@ -277,6 +277,31 @@ func (s *LedgerStoreDB) HasSessionEntry(ctx context.Context, sessionID [32]byte,
 	return found, err
 }
 
+// HasEntryForKey reports whether any ledger leg is already booked at this
+// idempotency key and event type, regardless of the account pair it was
+// booked with. It joins any outer actor transaction present in ctx.
+func (s *LedgerStoreDB) HasEntryForKey(ctx context.Context, key []byte,
+	eventType string) (bool, error) {
+
+	var count int64
+	err := s.ExecTx(
+		ctx, ReadTxOption(),
+		func(qtx *sqlc.Queries) error {
+			var err error
+			count, err = qtx.CountClientLedgerEntriesForKey(
+				ctx, sqlc.CountClientLedgerEntriesForKeyParams{
+					IdempotencyKey: key,
+					EventType:      eventType,
+				},
+			)
+
+			return err
+		},
+	)
+
+	return count > 0, err
+}
+
 // GetConfirmedExitCost returns the confirmed on-chain cost the ledger booked
 // for a unilateral exit of the given VTXO outpoint (the onchain_fee_paid leg
 // unroll emits after the final sweep confirms). Zero when no exit-cost leg

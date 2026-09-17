@@ -171,6 +171,7 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/unroll.<
   before declaring fatal gaps — a checkpoint whose earliest parent is
   a tree node is correctly accepted.
 - `SweepWallet` — `NewWalletPkScript`, `SignTaprootSpend`.
+- `OwnedWalletScriptChecker` — `IsOwnedWalletScript`. Optional; identifies which sweep output paid our own wallet so `exitProceedsMsg` can record the exit's proceeds at a real outpoint instead of assuming an index. Selection fails closed on no registry, no match, or more than one match, and records nothing.
 - `safeTxOutPkScript(tx, index)` — bounds-checking helper used at
   every `tx.TxOut[i].PkScript` site; surfaces retryable errors for
   malformed proof artifacts instead of panicking the actor.

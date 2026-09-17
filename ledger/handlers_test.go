@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 
@@ -61,6 +62,31 @@ func (m *mockLedgerStore) HasSessionEntry(_ context.Context, sessionID [32]byte,
 	)
 }
 
+// HasEntryForKey scans the recorded entries ignoring the account pair.
+func (m *mockLedgerStore) HasEntryForKey(_ context.Context, key []byte,
+	eventType string) (bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return hasEntryForKey(m.entries, key, eventType)
+}
+
+// hasEntryForKey mirrors CountClientLedgerEntriesForKey over an in-memory
+// slice: key plus event type, accounts ignored.
+func hasEntryForKey(entries []LedgerEntry, key []byte,
+	eventType string) (bool, error) {
+
+	for _, entry := range entries {
+		if entry.EventType == eventType &&
+			bytes.Equal(entry.IdempotencyKey, key) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // hasSessionEntry mirrors GetClientLedgerEntryBySessionID over an in-memory
 // slice: a match needs the session id plus the full event/account tuple.
 func hasSessionEntry(entries []LedgerEntry, sessionID [32]byte, eventType,
@@ -88,6 +114,11 @@ func hasSessionEntry(entries []LedgerEntry, sessionID [32]byte, eventType,
 type mockUTXOAuditStore struct {
 	mu      sync.Mutex
 	entries []UTXOAuditEntry
+
+	// fundingInputs records, per funding outpoint, the boarding deposits
+	// it was reported as funding, so a test can pre-seed the
+	// deposit-arrived-first ordering.
+	fundingInputs map[wire.OutPoint][]wire.OutPoint
 }
 
 func (m *mockUTXOAuditStore) InsertUTXOAuditEntry(_ context.Context,
@@ -99,6 +130,55 @@ func (m *mockUTXOAuditStore) InsertUTXOAuditEntry(_ context.Context,
 	m.entries = append(m.entries, entry)
 
 	return nil
+}
+
+// LookupCreatedUTXO returns the recorded 'created' row at an outpoint.
+func (m *mockUTXOAuditStore) LookupCreatedUTXO(_ context.Context,
+	outpoint wire.OutPoint) (UTXOAuditEntry, bool, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, entry := range m.entries {
+		if entry.Event != "created" ||
+			entry.OutpointIndex != int32(outpoint.Index) ||
+			!bytes.Equal(entry.OutpointHash, outpoint.Hash[:]) {
+
+			continue
+		}
+
+		return entry, true, nil
+	}
+
+	return UTXOAuditEntry{}, false, nil
+}
+
+// InsertDepositFundingInput records a deposit's funding input.
+func (m *mockUTXOAuditStore) InsertDepositFundingInput(_ context.Context,
+	input, deposit wire.OutPoint, _ int64) error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.fundingInputs == nil {
+		m.fundingInputs = make(map[wire.OutPoint][]wire.OutPoint)
+	}
+	if slices.Contains(m.fundingInputs[input], deposit) {
+		return nil
+	}
+	m.fundingInputs[input] = append(m.fundingInputs[input], deposit)
+
+	return nil
+}
+
+// DepositsFundedByInput returns the deposits an outpoint funded.
+func (m *mockUTXOAuditStore) DepositsFundedByInput(_ context.Context,
+	outpoint wire.OutPoint) ([]wire.OutPoint, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.fundingInputs[outpoint]), nil
 }
 
 func (m *mockUTXOAuditStore) getEntries() []UTXOAuditEntry {
@@ -1216,21 +1296,24 @@ func TestHandleExitCostFeeExceedsValue(t *testing.T) {
 type dedupLedgerStore struct {
 	mu      sync.Mutex
 	entries []LedgerEntry
-	keys    map[string]struct{}
+	keys    map[string]LedgerEntry
 }
 
 // newDedupLedgerStore constructs a fresh dedupLedgerStore.
 func newDedupLedgerStore() *dedupLedgerStore {
 	return &dedupLedgerStore{
-		keys: make(map[string]struct{}),
+		keys: make(map[string]LedgerEntry),
 	}
 }
 
 // InsertLedgerEntry appends the entry unless a previous insert
-// already covered the same idempotency_key + account/event tuple,
-// in which case the call is a silent no-op. Mirrors the
-// idx_client_ledger_idempotent_key partial unique index plus the
-// ON CONFLICT DO NOTHING clause on InsertClientLedgerEntry.
+// already covered the same idempotency_key + account/event tuple.
+// An identical replay is a silent no-op; a replay whose durable payload
+// differs returns ErrIdempotencyConflict. Mirrors the
+// idx_client_ledger_idempotent_key partial unique index, the ON CONFLICT
+// DO NOTHING clause on InsertClientLedgerEntry, and the winner comparison
+// the real store performs afterwards, so a handler that builds the same leg
+// differently on two paths fails here the way it fails in production.
 func (d *dedupLedgerStore) InsertLedgerEntry(_ context.Context,
 	entry LedgerEntry) error {
 
@@ -1241,15 +1324,47 @@ func (d *dedupLedgerStore) InsertLedgerEntry(_ context.Context,
 		k := fmt.Sprintf("%x|%s|%s|%s", entry.IdempotencyKey,
 			entry.EventType, entry.DebitAccount,
 			entry.CreditAccount)
-		if _, seen := d.keys[k]; seen {
-			return nil
+		if winner, seen := d.keys[k]; seen {
+			if durablePayloadEqual(winner, entry) {
+				return nil
+			}
+
+			return fmt.Errorf("%w: event=%s debit=%s credit=%s",
+				ErrIdempotencyConflict, entry.EventType,
+				entry.DebitAccount, entry.CreditAccount)
 		}
-		d.keys[k] = struct{}{}
+		d.keys[k] = entry
 	}
 
 	d.entries = append(d.entries, entry)
 
 	return nil
+}
+
+// durablePayloadEqual compares every field the real store compares on a
+// replay, which is everything but CreatedAt.
+func durablePayloadEqual(got, want LedgerEntry) bool {
+	return got.DebitAccount == want.DebitAccount &&
+		got.CreditAccount == want.CreditAccount &&
+		got.AmountSat == want.AmountSat &&
+		bytes.Equal(got.RoundID, want.RoundID) &&
+		bytes.Equal(got.SessionID, want.SessionID) &&
+		bytes.Equal(got.IdempotencyKey, want.IdempotencyKey) &&
+		got.EventType == want.EventType &&
+		got.Description == want.Description &&
+		bytes.Equal(got.ChainTxid, want.ChainTxid) &&
+		int32PtrEqual(got.ChainVout, want.ChainVout) &&
+		int32PtrEqual(got.ConfirmationHeight, want.ConfirmationHeight)
+}
+
+// int32PtrEqual treats two nil pointers as equal and otherwise compares
+// the pointed-to values.
+func int32PtrEqual(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return *a == *b
 }
 
 // getEntries returns a snapshot of the persisted entries.
@@ -1271,6 +1386,16 @@ func (d *dedupLedgerStore) HasSessionEntry(_ context.Context,
 	return hasSessionEntry(
 		d.entries, sessionID, eventType, debitAccount, creditAccount,
 	)
+}
+
+// HasEntryForKey scans the persisted entries ignoring the account pair.
+func (d *dedupLedgerStore) HasEntryForKey(_ context.Context, key []byte,
+	eventType string) (bool, error) {
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return hasEntryForKey(d.entries, key, eventType)
 }
 
 // TestHandleExitCostNamespacesBothLegs verifies that handleExitCost emits the
@@ -1612,6 +1737,12 @@ func (f *failingLedgerStore) InsertLedgerEntry(_ context.Context,
 
 func (f *failingLedgerStore) HasSessionEntry(_ context.Context, _ [32]byte, _,
 	_, _ string) (bool, error) {
+
+	return false, f.err
+}
+
+func (f *failingLedgerStore) HasEntryForKey(_ context.Context, _ []byte,
+	_ string) (bool, error) {
 
 	return false, f.err
 }
@@ -2494,4 +2625,799 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 	r.off += n
 
 	return n, nil
+}
+
+// TestHandleVTXOSentOwnWalletProceedsBooksWalletBalance proves a cooperative
+// leave that paid a script the daemon's own backing wallet minted books a
+// second leg cancelling the send leg on transfers_out, while the send leg's
+// accounts and identity stay exactly what a foreign-destination leave writes.
+func TestHandleVTXOSentOwnWalletProceedsBooksWalletBalance(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	sendKey := []byte("round-outflow:round-a:leave:0")
+	msg := &VTXOSentMsg{
+		RoundID: [16]byte{
+			0x7a,
+		},
+		AmountSat:         50_000,
+		IdempotencyKey:    sendKey,
+		ProceedsOwnWallet: true,
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 2)
+
+	// Send leg: unchanged by the flag, because its accounts are part of
+	// the dedup tuple.
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+	require.Equal(t, AccountVTXOBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(50_000), entries[0].AmountSat)
+	require.Equal(t, sendKey, entries[0].IdempotencyKey)
+
+	// Proceeds leg: wallet_balance <- transfers_out, separately keyed.
+	require.Equal(t, AccountWalletBalance, entries[1].DebitAccount)
+	require.Equal(t, AccountTransfersOut, entries[1].CreditAccount)
+	require.Equal(t, int64(50_000), entries[1].AmountSat)
+	require.Equal(t, EventVTXOSent, entries[1].EventType)
+	require.Equal(
+		t, sendProceedsIdempotencyKey(sendKey),
+		entries[1].IdempotencyKey,
+	)
+	require.NotEqual(
+		t, entries[0].IdempotencyKey, entries[1].IdempotencyKey,
+	)
+
+	// The leave nets to an internal transfer: vtxo_balance down,
+	// wallet_balance up, transfers_out flat.
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-50_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(50_000), balances[AccountWalletBalance])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestHandleVTXOSentForeignDestinationWritesNoProceedsLeg proves the default
+// stays a real outflow: without the flag the send leg stands alone.
+func TestHandleVTXOSentForeignDestinationWritesNoProceedsLeg(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				RoundID:   [16]byte{0x7b},
+				AmountSat: 50_000,
+				IdempotencyKey: []byte(
+					"round-outflow:round-b:leave:0",
+				),
+			},
+		),
+	)
+
+	entries := store.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountTransfersOut, entries[0].DebitAccount)
+}
+
+// TestHandleVTXOSentProceedsReplayDedups proves the reachable upgrade replay:
+// a leave booked before the flag existed, re-emitted with the flag set, must
+// add only the proceeds leg rather than credit vtxo_balance a second time.
+func TestHandleVTXOSentProceedsReplayDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	msg := &VTXOSentMsg{
+		RoundID: [16]byte{
+			0x7c,
+		},
+		AmountSat:      30_000,
+		IdempotencyKey: []byte("round-outflow:round-c:leave:0"),
+	}
+
+	require.NoError(t, run(ctx, a, msg))
+	require.Len(t, store.getEntries(), 1)
+
+	flagged := *msg
+	flagged.ProceedsOwnWallet = true
+	require.NoError(t, run(ctx, a, &flagged))
+	require.NoError(t, run(ctx, a, &flagged))
+
+	entries := store.getEntries()
+	require.Len(
+		t, entries, 2,
+		"replay across the flag must add only the proceeds leg",
+	)
+
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+	require.Equal(t, int64(-30_000), balances[AccountVTXOBalance])
+	require.Equal(t, int64(30_000), balances[AccountWalletBalance])
+	require.Zero(t, balances[AccountTransfersOut])
+}
+
+// TestHandleVTXOSentProceedsNeedsAKey proves a flagged send with no
+// idempotency key is rejected rather than quietly booking only the send leg.
+// The proceeds leg is keyed off the send's key, and the paired leave_proceeds
+// audit row suppresses the deposit credit on the strength of that leg
+// existing, so dropping it would strand the value uncredited in both places.
+func TestHandleVTXOSentProceedsNeedsAKey(t *testing.T) {
+	t.Parallel()
+
+	a, store := newTestActor(t)
+	ctx := t.Context()
+
+	err := run(
+		ctx, a, &VTXOSentMsg{
+			SessionID:         [32]byte{0x7d},
+			AmountSat:         10_000,
+			ProceedsOwnWallet: true,
+		},
+	)
+	require.ErrorIs(t, err, ErrInvalidMessage)
+	require.Empty(t, store.getEntries())
+}
+
+// TestVTXOSentMsgProceedsFlagRoundTrips proves the flag survives the durable
+// mailbox codec and that a payload written before it existed decodes to the
+// foreign-destination booking it was written under.
+func TestVTXOSentMsgProceedsFlagRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for _, ownWallet := range []bool{false, true} {
+		msg := &VTXOSentMsg{
+			RoundID: [16]byte{
+				0x8a,
+			},
+			AmountSat:         70_000,
+			IdempotencyKey:    []byte("leave-key"),
+			ProceedsOwnWallet: ownWallet,
+		}
+
+		var buf bytes.Buffer
+		require.NoError(t, msg.Encode(&buf))
+
+		var decoded VTXOSentMsg
+		require.NoError(t, decoded.Decode(bytes.NewReader(buf.Bytes())))
+		require.Equal(t, *msg, decoded)
+	}
+
+	// A payload written before the flag existed carries no proceeds
+	// record at all, so build the pre-flag stream by hand.
+	var (
+		sessionID      = make([]byte, 32)
+		amountSat      = uint64(20_000)
+		roundID        = make([]byte, 16)
+		outpoint       = outpointRecord{}
+		idempotencyKey = []byte("legacy-leave-key")
+	)
+	roundID[0] = 0x8b
+
+	legacyStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(vtxoSentSessionIDType, &sessionID),
+		tlv.MakePrimitiveRecord(vtxoSentAmountSatType, &amountSat),
+		tlv.MakePrimitiveRecord(vtxoSentRoundIDType, &roundID),
+		makeOutpointRecord(vtxoSentOutpointType, &outpoint),
+		tlv.MakePrimitiveRecord(
+			vtxoSentIdempotencyType, &idempotencyKey,
+		),
+	)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	require.NoError(t, legacyStream.Encode(&legacyBuf))
+
+	var legacy VTXOSentMsg
+	require.NoError(t, legacy.Decode(bytes.NewReader(legacyBuf.Bytes())))
+	require.Equal(t, int64(20_000), legacy.AmountSat)
+	require.False(
+		t, legacy.ProceedsOwnWallet,
+		"a missing proceeds record must keep the old behaviour",
+	)
+}
+
+// TestHandleUTXOCreatedExitProceedsIsAuditOnly proves the sweep output a
+// unilateral exit paid to the wallet is recorded in the audit log but books
+// no ledger leg. The ExitCostMsg proceeds leg already credited wallet_balance
+// for exactly this value; a deposit leg here would credit it twice.
+func TestHandleUTXOCreatedExitProceedsIsAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a, &UTXOCreatedMsg{
+				OutpointHash:   [32]byte{0x91},
+				OutpointIndex:  0,
+				AmountSat:      95_000,
+				BlockHeight:    900_000,
+				Classification: ClassificationExitProceeds,
+			},
+		),
+	)
+
+	require.Empty(
+		t, ledgerStore.getEntries(),
+		"exit proceeds must not book a second wallet_balance credit",
+	)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(t, "created", audits[0].Event)
+	require.Equal(t, ClassificationExitProceeds, audits[0].ClassifiedAs)
+	require.Equal(t, int64(95_000), audits[0].AmountSat)
+}
+
+// proceedsOutpoint is a convenient outpoint built from a one-byte hash seed.
+func proceedsOutpoint(seed byte, index uint32) wire.OutPoint {
+	var hash chainhash.Hash
+	hash[0] = seed
+
+	return wire.OutPoint{Hash: hash, Index: index}
+}
+
+// depositMsg builds a boarding-deposit UTXOCreatedMsg funded by the given
+// previous outpoints.
+func depositMsg(seed byte, amount int64,
+	inputs ...wire.OutPoint) *UTXOCreatedMsg {
+
+	return &UTXOCreatedMsg{
+		OutpointHash: [32]byte{
+			seed,
+		},
+		OutpointIndex:  0,
+		AmountSat:      amount,
+		BlockHeight:    900_100,
+		Classification: ClassificationDeposit,
+		FundingInputs:  inputs,
+	}
+}
+
+// proceedsMsg builds an own-wallet proceeds UTXOCreatedMsg at an outpoint.
+func proceedsMsg(outpoint wire.OutPoint, amount int64,
+	classification string) *UTXOCreatedMsg {
+
+	return &UTXOCreatedMsg{
+		OutpointHash:   [32]byte(outpoint.Hash),
+		OutpointIndex:  outpoint.Index,
+		AmountSat:      amount,
+		BlockHeight:    900_000,
+		Classification: classification,
+	}
+}
+
+// netBalances folds a ledger entry list into a per-account signed total.
+func netBalances(entries []LedgerEntry) map[string]int64 {
+	balances := make(map[string]int64)
+	for _, entry := range entries {
+		balances[entry.DebitAccount] += entry.AmountSat
+		balances[entry.CreditAccount] -= entry.AmountSat
+	}
+
+	return balances
+}
+
+// TestRecycledProceedsReverseInEitherOrder is the core property of the
+// recycled-proceeds design: the reversing leg is booked by whichever of the
+// two messages commits second, so the outcome does not depend on the order
+// two independent producers happen to reach the ledger in.
+//
+// The same table covers all three proceeds classifications, because the whole
+// point of the family is that the reversal does not care which one produced
+// the credit.
+func TestRecycledProceedsReverseInEitherOrder(t *testing.T) {
+	t.Parallel()
+
+	classifications := []string{
+		ClassificationExitProceeds,
+		ClassificationLeaveProceeds,
+		ClassificationRecycledChange,
+	}
+
+	orders := []struct {
+		name         string
+		proceedsLast bool
+	}{
+		{
+			name:         "proceeds first",
+			proceedsLast: false,
+		},
+		{
+			name:         "deposit first",
+			proceedsLast: true,
+		},
+	}
+
+	for _, classification := range classifications {
+		for _, order := range orders {
+			name := classification + "/" + order.name
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				assertReversal(
+					t, classification, order.proceedsLast,
+				)
+			})
+		}
+	}
+}
+
+// assertReversal runs one proceeds/deposit pair in the requested order and
+// checks that wallet_balance ends up crediting the coins exactly once.
+func assertReversal(t *testing.T, classification string, proceedsLast bool) {
+	t.Helper()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	const amount = 90_000
+	input := proceedsOutpoint(0x92, 0)
+	proceeds := proceedsMsg(input, amount, classification)
+	deposit := depositMsg(0x93, amount, input)
+
+	msgs := []*UTXOCreatedMsg{proceeds, deposit}
+	if proceedsLast {
+		msgs = []*UTXOCreatedMsg{deposit, proceeds}
+	}
+	for _, msg := range msgs {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	entries := store.getEntries()
+	balances := netBalances(entries)
+
+	// Exactly one credit of these coins survives, whichever order the two
+	// messages arrived in.
+	//
+	// For exit and leave proceeds the credit was booked by an earlier
+	// message outside this handler, so the deposit's credit and the
+	// reversal cancel and the net here is zero. Recycled change books its
+	// own credit in this handler, so its net is one amount. Either way
+	// the coins are counted once and never twice.
+	want := int64(0)
+	if classification == ClassificationRecycledChange {
+		want = amount
+	}
+	require.Equal(
+		t, want, balances[AccountWalletBalance],
+		"recycled proceeds must be credited exactly once",
+	)
+
+	var reversals int
+	for _, entry := range entries {
+		if entry.DebitAccount != AccountOpeningBalance ||
+			entry.CreditAccount != AccountWalletBalance {
+
+			continue
+		}
+
+		reversals++
+		require.Equal(t, int64(amount), entry.AmountSat)
+		require.Equal(t, EventWalletUTXOSpent, entry.EventType)
+
+		// The reversing leg's key is namespaced by classification, so
+		// it can never collide with the boarding-sweep input leg that
+		// keys on the bare outpoint and books different accounts.
+		hash := [32]byte(input.Hash)
+		require.NotEqual(
+			t, walletUTXOIdempotencyKey(hash, input.Index),
+			entry.IdempotencyKey,
+		)
+		require.Equal(
+			t, classifiedUTXOIdempotencyKey(
+				ClassificationDepositFunding, hash, input.Index,
+			),
+			entry.IdempotencyKey,
+		)
+	}
+	require.Equal(t, 1, reversals)
+
+	// The spend is recorded in the audit log under the classification the
+	// reversal booked, with the real amount.
+	var spends int
+	for _, entry := range audit.getEntries() {
+		if entry.Event != "spent" {
+			continue
+		}
+
+		spends++
+		require.Equal(
+			t, ClassificationDepositFunding, entry.ClassifiedAs,
+		)
+		require.Equal(t, int64(amount), entry.AmountSat)
+	}
+	require.Equal(t, 1, spends)
+}
+
+// TestRecycledProceedsReplayDedups proves the reversing leg survives
+// at-least-once delivery: replaying either message books no second reversal,
+// and a boarding-sweep input spend naming the same outpoint still books its
+// own distinct leg.
+func TestRecycledProceedsReplayDedups(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	a.cfg.UTXOAuditStore = &mockUTXOAuditStore{}
+	ctx := t.Context()
+
+	input := proceedsOutpoint(0x94, 1)
+	proceeds := proceedsMsg(input, 40_000, ClassificationExitProceeds)
+	deposit := depositMsg(0x95, 40_000, input)
+
+	for _, msg := range []*UTXOCreatedMsg{
+		proceeds, deposit, proceeds, deposit,
+	} {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	before := store.getEntries()
+	require.Equal(
+		t, int64(0), netBalances(before)[AccountWalletBalance],
+		"replay must not re-credit or re-reverse",
+	)
+
+	sweepClass := ClassificationBoardingSweepInput
+	sweepInput := &UTXOSpentMsg{
+		OutpointHash:   [32]byte(input.Hash),
+		OutpointIndex:  input.Index,
+		AmountSat:      40_000,
+		BlockHeight:    900_200,
+		Classification: sweepClass,
+	}
+	require.NoError(t, run(ctx, a, sweepInput))
+
+	require.Len(
+		t, store.getEntries(), len(before)+1,
+		"the two classifications book distinct legs for one outpoint",
+	)
+}
+
+// TestPartialSpendChangeIsCreditedBack proves the arithmetic of a partial
+// spend. Boarding part of a proceeds UTXO reverses the whole input, so the
+// change that came straight back must be credited again or the client is
+// understated by it -- and boarding that change a generation later must
+// reverse it in turn rather than counting it twice.
+func TestPartialSpendChangeIsCreditedBack(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	a.cfg.UTXOAuditStore = &mockUTXOAuditStore{}
+	ctx := t.Context()
+
+	const (
+		proceedsSat = 100_000
+		boardedSat  = 60_000
+		changeSat   = 39_000
+	)
+
+	// Generation one: exit proceeds, partly boarded.
+	exit := proceedsOutpoint(0x96, 0)
+	require.NoError(
+		t,
+		run(
+			ctx, a, proceedsMsg(
+				exit, proceedsSat, ClassificationExitProceeds,
+			),
+		),
+	)
+	require.NoError(t, run(ctx, a, depositMsg(0x97, boardedSat, exit)))
+
+	change := proceedsOutpoint(0x97, 1)
+	require.NoError(
+		t,
+		run(
+			ctx, a, proceedsMsg(
+				change, changeSat, ClassificationRecycledChange,
+			),
+		),
+	)
+
+	// The exit's proceeds leg credited wallet_balance outside this
+	// handler, so here the net is the boarded deposit plus the change,
+	// minus the reversal of the whole input.
+	balances := netBalances(store.getEntries())
+	require.Equal(
+		t, int64(boardedSat+changeSat-proceedsSat),
+		balances[AccountWalletBalance],
+	)
+
+	// Generation two: the change is boarded in turn.
+	require.NoError(t, run(ctx, a, depositMsg(0x98, changeSat, change)))
+
+	balances = netBalances(store.getEntries())
+	require.Equal(
+		t, int64(boardedSat+changeSat-proceedsSat),
+		balances[AccountWalletBalance],
+		"boarding the change must reverse its credit, not add one",
+	)
+}
+
+// TestDepositIgnoresForeignFundingInputs proves a deposit funded by coins the
+// client never credited books nothing extra: no reversal, and no audit row
+// that would make a stranger's outpoint look like one of ours.
+func TestDepositIgnoresForeignFundingInputs(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	foreign := proceedsOutpoint(0x99, 3)
+	require.NoError(t, run(ctx, a, depositMsg(0x9a, 70_000, foreign)))
+
+	entries := store.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountWalletBalance, entries[0].DebitAccount)
+
+	for _, entry := range audit.getEntries() {
+		require.Equal(
+			t, "created", entry.Event, "a foreign funding "+
+				"input must not produce an audit row of "+
+				"its own",
+		)
+	}
+}
+
+// TestHandleUTXOCreatedRecycledChangeBooksItsCredit proves recycled change is
+// not audit-only: no earlier message described it, so it books the credit leg
+// every other wallet UTXO books.
+func TestHandleUTXOCreatedRecycledChangeBooksItsCredit(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a,
+			proceedsMsg(
+				proceedsOutpoint(0x9b, 1), 12_000,
+				ClassificationRecycledChange,
+			),
+		),
+	)
+
+	entries := ledgerStore.getEntries()
+	require.Len(t, entries, 1)
+	require.Equal(t, AccountWalletBalance, entries[0].DebitAccount)
+	require.Equal(t, AccountOpeningBalance, entries[0].CreditAccount)
+	require.Equal(t, int64(12_000), entries[0].AmountSat)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(
+		t, ClassificationRecycledChange, audits[0].ClassifiedAs,
+	)
+}
+
+// TestHandleUTXOCreatedLeaveProceedsIsAuditOnly proves the leave's on-chain
+// output writes an audit row and no ledger leg. The VTXOSentMsg proceeds leg
+// already credited wallet_balance for exactly this value.
+func TestHandleUTXOCreatedLeaveProceedsIsAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	a, ledgerStore, auditStore := newTestActorWithAudit(t)
+	ctx := t.Context()
+
+	require.NoError(
+		t,
+		run(
+			ctx, a,
+			proceedsMsg(
+				proceedsOutpoint(0x9c, 2), 55_000,
+				ClassificationLeaveProceeds,
+			),
+		),
+	)
+
+	require.Empty(
+		t, ledgerStore.getEntries(),
+		"leave proceeds must not book a second wallet_balance credit",
+	)
+
+	audits := auditStore.getEntries()
+	require.Len(t, audits, 1)
+	require.Equal(t, ClassificationLeaveProceeds, audits[0].ClassifiedAs)
+}
+
+// TestBoardingSweepReturnReversesOnReboard covers the coin a client gets back
+// when it boards, never joins a round, and the boarding sweep returns the
+// funds to its wallet. That return output is credited to wallet_balance like
+// any other own-wallet proceeds, so boarding it a second time must reverse the
+// first credit rather than count the same satoshis twice.
+//
+// Both arrival orders are exercised: the deposit can reach the ledger before
+// or after the sweep confirmation that produced its input, and either side
+// books the reversal when it commits second.
+func TestBoardingSweepReturnReversesOnReboard(t *testing.T) {
+	t.Parallel()
+
+	orders := []struct {
+		name       string
+		sweepFirst bool
+	}{
+		{
+			name:       "sweep return first",
+			sweepFirst: true,
+		},
+		{
+			name:       "deposit first",
+			sweepFirst: false,
+		},
+	}
+
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+
+			assertSweepReturnReversal(t, order.sweepFirst)
+		})
+	}
+}
+
+// assertSweepReturnReversal runs one sweep-return/re-board pair in the
+// requested order and asserts the coins are credited exactly once.
+func assertSweepReturnReversal(t *testing.T, sweepFirst bool) {
+	t.Helper()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	audit := &mockUTXOAuditStore{}
+	a.cfg.UTXOAuditStore = audit
+	ctx := t.Context()
+
+	const (
+		boarded   = int64(100_000)
+		chainCost = int64(1_000)
+		returned  = boarded - chainCost
+	)
+
+	sweepTxid := [32]byte{0xa1}
+	returnPoint := wire.OutPoint{
+		Hash:  chainhash.Hash(sweepTxid),
+		Index: 0,
+	}
+
+	sweep := &BoardingSweepConfirmedMsg{
+		Txid:         sweepTxid,
+		BlockHeight:  900_000,
+		ChainCostSat: chainCost,
+		Inputs: []SweepInput{
+			{
+				Outpoint:  proceedsOutpoint(0xa0, 0),
+				AmountSat: boarded,
+			},
+		},
+		DestinationSat: returned,
+	}
+	deposit := depositMsg(0xa2, returned, returnPoint)
+
+	msgs := []LedgerMsg{sweep, deposit}
+	if !sweepFirst {
+		msgs = []LedgerMsg{deposit, sweep}
+	}
+	for _, msg := range msgs {
+		require.NoError(t, run(ctx, a, msg))
+	}
+
+	entries := store.getEntries()
+
+	// Over the whole story the only value that should leave wallet_balance
+	// is the sweep's chain cost: the boarded coin moves out through
+	// clearing, the return credits it back, and the re-board's credit and
+	// the reversal cancel. Without the reversal this reads as the returned
+	// value credited twice.
+	balances := netBalances(entries)
+	require.Equal(
+		t, returned-boarded, balances[AccountWalletBalance],
+		"a re-boarded sweep return must be credited exactly once",
+	)
+
+	var reversals int
+	for _, entry := range entries {
+		if entry.DebitAccount != AccountOpeningBalance ||
+			entry.CreditAccount != AccountWalletBalance {
+
+			continue
+		}
+
+		reversals++
+		require.Equal(t, returned, entry.AmountSat)
+		require.Equal(t, EventWalletUTXOSpent, entry.EventType)
+		require.Equal(
+			t, classifiedUTXOIdempotencyKey(
+				ClassificationDepositFunding, sweepTxid, 0,
+			),
+			entry.IdempotencyKey,
+		)
+	}
+	require.Equal(t, 1, reversals)
+}
+
+// TestVTXOReceiveBooksOnceAcrossProducers pins the rule that a receive is
+// booked at most once per outpoint, whatever accounts a later producer would
+// pick for it.
+//
+// The live path books an OOR receive as transfers_in while the session has no
+// send leg yet. Wallet recovery can re-emit the same descriptor afterwards,
+// by which time the session does carry a send leg and the receive classifies
+// as self-change -- a different account pair, and therefore a different row
+// under the insert's unique index. Chain identity is what must not be booked
+// twice.
+func TestVTXOReceiveBooksOnceAcrossProducers(t *testing.T) {
+	t.Parallel()
+
+	store := newDedupLedgerStore()
+	a := newTestActorWithStore(t, store)
+	ctx := t.Context()
+
+	sessionID := [32]byte{0xc1}
+	receive := &VTXOReceivedMsg{
+		OutpointHash: [32]byte{
+			0xc2,
+		},
+		OutpointIndex: 1,
+		AmountSat:     25_000,
+		Source:        SourceOOR,
+		SessionID:     sessionID,
+	}
+
+	// The live receive lands first, with nothing in the session to make it
+	// self-change.
+	require.NoError(t, run(ctx, a, receive))
+
+	// The session then gains its outgoing send leg.
+	require.NoError(
+		t,
+		run(
+			ctx, a, &VTXOSentMsg{
+				Outpoint:  proceedsOutpoint(0xc3, 0),
+				AmountSat: 30_000,
+				SessionID: sessionID,
+			},
+		),
+	)
+
+	// Recovery re-emits the same receive. It would now classify as
+	// self-change and land in a different account pair, so only the
+	// chain-identity check keeps it from booking a second credit.
+	require.NoError(t, run(ctx, a, receive))
+
+	var received int
+	for _, entry := range store.getEntries() {
+		if entry.EventType == EventVTXOReceived {
+			received++
+		}
+	}
+	require.Equal(
+		t, 1, received,
+		"one outpoint must carry exactly one receive leg",
+	)
 }

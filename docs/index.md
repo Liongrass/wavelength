@@ -60,7 +60,7 @@ into specific topics below.
 |----------|-------------|
 | [daemon_cli_guide.md](daemon_cli_guide.md) | waved/wavecli installation, configuration, CLI reference |
 | [signet.md](signet.md) | Public testnet3, testnet4, and signet Ark/swap endpoints, transport selection, and local overrides |
-| [accounting_report.md](accounting_report.md) | Accounting report command: reading the fee ledger from SQLite or Postgres, text/JSON/CSV output, fiat conversion, read-only behavior |
+| [accounting_report.md](accounting_report.md) | Accounting report and invariant check: reading the fee ledger from SQLite or Postgres, text/JSON/CSV output, fiat conversion, the named ledger invariants and how they line up with the operator-side tool, read-only behavior |
 
 ## Plans
 

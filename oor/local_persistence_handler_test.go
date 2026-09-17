@@ -14,11 +14,13 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
+	"github.com/lightninglabs/wavelength/ledger"
 	"github.com/lightninglabs/wavelength/lib/arkscript"
 	lib_tree "github.com/lightninglabs/wavelength/lib/tree"
 	oortx "github.com/lightninglabs/wavelength/lib/tx/oor"
 	libtypes "github.com/lightninglabs/wavelength/lib/types"
 	"github.com/lightninglabs/wavelength/vtxo"
+	fn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/stretchr/testify/require"
@@ -1415,4 +1417,107 @@ func validTestIncomingAncestry(commit chainhash.Hash) []vtxo.Ancestry {
 		},
 		TreeDepth: 1,
 	}}
+}
+
+// TestMaterializeIncomingBooksTheReceive proves the non-actor materialization
+// path books its receives.
+//
+// Wallet recovery replays indexed OOR events through this handler directly,
+// bypassing the session actor whose behaviour normally stages one
+// VTXOReceivedMsg per descriptor. Without the handler emitting them itself, a
+// recovered daemon would hold VTXOs its ledger never saw arrive and
+// vtxo_balance would understate the wallet by their value permanently.
+func TestMaterializeIncomingBooksTheReceive(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	arkPSBT, finalCheckpoints, recipients, parentCommitment, recipientKey,
+		operatorKey :=
+		buildTestIncomingMaterialization(t)
+
+	sessionID := SessionID(arkPSBT.UnsignedTx.TxHash())
+	sink := actor.NewChannelTellOnlyRef[ledger.LedgerMsg](
+		"ledger-capture", 8,
+	)
+
+	handler := &LocalPersistenceOutboxHandler{
+		Store:        newTestVTXOStore(),
+		PackageStore: &testPackageStore{},
+		OperatorKey:  operatorKey,
+		ExitDelay:    10,
+		LedgerSink:   fn.Some[ledger.Sink](sink),
+		AuthenticateIncomingExpiry: func(context.Context,
+			[]vtxo.Ancestry) (int32, error) {
+
+			return 1000, nil
+		},
+		NotifyIncomingVTXOs: func(context.Context,
+			[]*vtxo.Descriptor) error {
+
+			return nil
+		},
+		ResolveIncomingClientKey: func(context.Context,
+			ArkRecipientOutput) (keychain.KeyDescriptor, error) {
+
+			return keychain.KeyDescriptor{
+				PubKey: recipientKey.PubKey(),
+			}, nil
+		},
+		ResolveIncomingMetadata: func(context.Context, SessionID,
+			ArkRecipientOutput, *psbt.Packet, []*psbt.Packet) (
+			IncomingVTXOMetadata, error) {
+
+			return IncomingVTXOMetadata{
+				RoundID:        "round-incoming",
+				CommitmentTxID: parentCommitment,
+				Ancestry: validTestIncomingAncestry(
+					parentCommitment,
+				),
+				CreatedHeight: 700,
+			}, nil
+		},
+	}
+
+	events, err := handler.Handle(
+		ctx, sessionID, &MaterializeIncomingVTXOsRequest{
+			SessionID:            sessionID,
+			ArkPSBT:              arkPSBT,
+			FinalCheckpointPSBTs: finalCheckpoints,
+			Recipients:           recipients,
+		},
+	)
+	require.NoError(t, err)
+
+	handled, ok := events[0].(*IncomingHandledEvent)
+	require.True(t, ok)
+	require.Len(t, handled.MaterializedVTXOs, 1)
+	desc := handled.MaterializedVTXOs[0]
+
+	var msgs []ledger.LedgerMsg
+	for len(msgs) < 1 {
+		select {
+		case msg := <-sink.Messages():
+			msgs = append(msgs, msg)
+
+		default:
+			t.Fatal("no ledger message was emitted")
+		}
+	}
+
+	received, ok := msgs[0].(*ledger.VTXOReceivedMsg)
+	require.True(t, ok)
+	require.Equal(
+		t, desc.Outpoint.Hash, chainhash.Hash(
+			received.OutpointHash,
+		),
+	)
+	require.Equal(t, desc.Outpoint.Index, received.OutpointIndex)
+	require.Equal(t, int64(desc.Amount), received.AmountSat)
+	require.Equal(t, ledger.SourceOOR, received.Source)
+
+	// The session id rides along so the ledger can still recognise the
+	// sender's own change coming back, exactly as it does on the live
+	// path.
+	require.Equal(t, [32]byte(sessionID), received.SessionID)
 }

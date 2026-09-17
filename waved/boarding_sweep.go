@@ -48,6 +48,7 @@ func (s *Server) newSweepWallet() (unroll.SweepWallet, error) {
 		return &lndUnrollWallet{
 			ClientWallet:    clientWallet,
 			boardingBackend: boardingBackend,
+			scripts:         s.ownedWalletScripts(),
 		}, nil
 
 	case WalletTypeLwwallet:
@@ -57,7 +58,8 @@ func (s *Server) newSweepWallet() (unroll.SweepWallet, error) {
 		}
 
 		return &lwUnrollWallet{
-			Wallet: s.lwWallet.UnsafeFromSome(),
+			Wallet:  s.lwWallet.UnsafeFromSome(),
+			scripts: s.ownedWalletScripts(),
 		}, nil
 
 	case WalletTypeBtcwallet:
@@ -66,7 +68,8 @@ func (s *Server) newSweepWallet() (unroll.SweepWallet, error) {
 		}
 
 		return &btcwUnrollWallet{
-			Wallet: s.btcwWallet.UnsafeFromSome(),
+			Wallet:  s.btcwWallet.UnsafeFromSome(),
+			scripts: s.ownedWalletScripts(),
 		}, nil
 
 	default:

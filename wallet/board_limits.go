@@ -468,10 +468,29 @@ func (a *Ark) boardingChangeLeave(ctx context.Context, change btcutil.Amount,
 		return nil, fmt.Errorf("change address pkScript: %w", err)
 	}
 
+	// This leave pays a boarding script, so DestinationOwnWallet stays
+	// false even though the funds come straight back to us. The return is
+	// already booked: the change re-confirms as a boarding intent and its
+	// UTXOCreatedMsg writes the deposit leg. Flagging it here would book
+	// the same satoshis onto wallet_balance twice.
+	//
+	// That reasoning depends entirely on the destination being a boarding
+	// script, so verify it rather than trusting the call above to keep
+	// deriving one. A refactor that switched this to a plain wallet
+	// address would silently lose the deposit leg and leave the change
+	// unbooked; failing the board is the recoverable outcome.
+	if _, err := a.store.LookupBoardingAddress(
+		ctx, pkScript,
+	); err != nil {
+		return nil, fmt.Errorf("boarding change leave must pay a "+
+			"registered boarding address: %w", err)
+	}
+
 	return &types.LeaveRequest{
 		Output: &wire.TxOut{
 			Value:    int64(change),
 			PkScript: pkScript,
 		},
+		DestinationOwnWallet: false,
 	}, nil
 }

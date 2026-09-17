@@ -13,6 +13,12 @@ import (
 
 // NewWalletAddress returns a fresh backing-wallet receive address for tests
 // and harness helpers, regardless of the active wallet backend.
+//
+// Every backend routes through here, so this is also where a minted receive
+// address enters the owned-script registry. Without that, a leave paying an
+// address the daemon itself handed out would be indistinguishable from one
+// paying a stranger, and the ledger would book the client's own funds as
+// having left.
 func (s *Server) NewWalletAddress(ctx context.Context) (string, error) {
 	if !s.isWalletReady() {
 		return "", fmt.Errorf("wallet is not ready")
@@ -29,6 +35,8 @@ func (s *Server) NewWalletAddress(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("LND NextAddr: %w", err)
 		}
 
+		s.recordOwnedWalletAddress(ctx, addr)
+
 		return addr.String(), nil
 	}
 
@@ -39,6 +47,8 @@ func (s *Server) NewWalletAddress(ctx context.Context) (string, error) {
 				"address: %w", err)
 		}
 
+		s.recordOwnedWalletAddress(ctx, addr)
+
 		return addr.String(), nil
 	}
 
@@ -47,6 +57,8 @@ func (s *Server) NewWalletAddress(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("btcwallet new address: %w", err)
 		}
+
+		s.recordOwnedWalletAddress(ctx, addr)
 
 		return addr.String(), nil
 	}

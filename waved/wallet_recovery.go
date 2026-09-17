@@ -19,6 +19,7 @@ import (
 	"github.com/lightninglabs/wavelength/build"
 	"github.com/lightninglabs/wavelength/db"
 	"github.com/lightninglabs/wavelength/indexer"
+	"github.com/lightninglabs/wavelength/ledger"
 	"github.com/lightninglabs/wavelength/lib/arkscript"
 	libtypes "github.com/lightninglabs/wavelength/lib/types"
 	mailboxrpc "github.com/lightninglabs/wavelength/mailbox/rpc"
@@ -713,6 +714,13 @@ func (r *RPCServer) recoveryOORHandler(
 		OperatorKey:                terms.PubKey,
 		ExitDelay:                  terms.VTXOExitDelay,
 		AuthenticateIncomingExpiry: r.server.expiryAuthenticator,
+
+		// Recovery materializes receives without going through the
+		// session actor, so the ledger emission the session behaviour
+		// normally stages has to come from the handler itself. Without
+		// it a recovered wallet holds VTXOs its ledger never saw
+		// arrive.
+		LedgerSink: fn.Some(ledger.NewSink(r.server.actorSystem)),
 		NotifyIncomingVTXOs: func(ctx context.Context,
 			descs []*vtxo.Descriptor) error {
 

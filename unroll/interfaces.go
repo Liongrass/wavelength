@@ -168,3 +168,18 @@ type TxConfirmRef = txconfirm.Msg
 
 // VTXOStore is the descriptor store the actor uses to load its target input.
 type VTXOStore = vtxo.VTXOStore
+
+// OwnedWalletScriptChecker answers whether an on-chain pkScript belongs to
+// this daemon's backing wallet. The answer comes from a durable registry the
+// daemon writes when it mints a script, because the supported wallet backends
+// answer script ownership differently or not at all.
+//
+// A script the registry has never seen returns false. For the exit-proceeds
+// record that means the sweep output is not identified and no proceeds row is
+// written, which loses the ability to reverse a later credit -- an
+// overstatement -- rather than mis-naming somebody else's output as ours.
+type OwnedWalletScriptChecker interface {
+	// IsOwnedWalletScript reports whether pkScript is a backing-wallet
+	// script this daemon minted.
+	IsOwnedWalletScript(ctx context.Context, pkScript []byte) (bool, error)
+}

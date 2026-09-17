@@ -2,7 +2,10 @@
 
 ## Purpose
 
-Standalone admin reporting command for the client-side accounting ledger. It
+Standalone admin command for the client-side accounting ledger, with two
+subcommands: `report` (the default when only flags are passed) and `check`.
+
+`report`
 opens the daemon database — SQLite or Postgres — through the shared `db`
 package, reads generated sqlc accounting projections, and emits a text, JSON,
 or CSV report with optional BTC fiat conversion.
@@ -21,6 +24,20 @@ missing path instead of reporting against an empty database it just made.
 - `CoinGeckoPriceSource` — current-price implementation using CoinGecko's
   public simple-price endpoint.
 - `report`, `accountBalance`, `eventTotal` — JSON/CSV output shapes.
+- `checkReport`, `checkResult`, `checkFinding` — output shapes for the
+  invariant checker; check names are stable identifiers that admin scripts
+  key on.
+- `checkSnapshot` — every row the checks run against, read in one read-only
+  transaction so no two checks can disagree about the ledger's state.
+
+## Invariant check
+
+`check` evaluates the ledger invariants documented in
+[docs/fee_ledger.md](../../../../docs/fee_ledger.md) against one snapshot,
+prints a named `PASS`/`FAIL` result per invariant with the offending rows, and
+returns `errCheckFailed` so the process exits non-zero. Every run prints a
+content-only journal fingerprint (`journalHash`), which names no database,
+host or file, alongside the entry count and maximum entry ID.
 
 ## Flags
 
@@ -58,7 +75,12 @@ missing path instead of reporting against an empty database it just made.
   rests on `SkipMigrations` plus the report issuing only SELECTs.
 - Do not import Faraday. Add new price providers behind `PriceSource`.
 - Keep output stable enough for admin scripts: add fields rather than
-  renaming existing JSON/CSV keys.
+  renaming existing JSON/CSV keys. Check names are part of that contract.
+- The checker is report-only and stays that way. Corrections to rows this
+  repository's own producers wrote belong in `db/post_migration_checks.go`,
+  not in a hand-reviewed correction-plan mode here.
+- A new invariant is a new named check with its own test: one seeded
+  violation and one clean case.
 
 ## Deep Docs
 

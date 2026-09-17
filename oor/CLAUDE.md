@@ -27,7 +27,12 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/oor.<Sym
 - `OutboxHandler` / `LocalPersistenceOutboxHandler` — handles the local
   persistence outbox events (mark-inputs-spent, incoming metadata query,
   VTXO materialization, ack); everything else is handled inline by the
-  session actor.
+  session actor. Its optional `LedgerSink` books the receives it
+  materializes for callers that are not the durable session actor —
+  wallet recovery is the one such caller in production, and without it a
+  recovered daemon holds VTXOs its ledger never saw arrive. Inside the
+  actor the session behaviour stages its own `VTXOReceivedMsg`, so the
+  sink fires only on the `notifyIncoming` path.
 - `ReceiveLimits` / `DefaultReceiveLimits` — defense-in-depth bounds on
   incoming receive (`MaxCheckpoints`, `MaxVTXOMatches`, `MaxMailboxItems`,
   `MaxMailboxScriptBytes`, `MaxConcurrentIncomingSessions`).

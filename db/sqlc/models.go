@@ -169,6 +169,14 @@ type InternalKey struct {
 	CreatedAt int64
 }
 
+type LedgerDepositFundingInput struct {
+	InputHash    []byte
+	InputIndex   int32
+	DepositHash  []byte
+	DepositIndex int32
+	CreatedAt    int64
+}
+
 type LedgerEntry struct {
 	EntryID            int64
 	DebitAccount       string
@@ -277,6 +285,12 @@ type OwnedReceiveScript struct {
 type OwnedReceiveScriptSource struct {
 	Source int64
 	Name   string
+}
+
+type OwnedWalletScript struct {
+	PkScript  []byte
+	Source    string
+	CreatedAt int64
 }
 
 type PendingBoardIntent struct {

@@ -199,6 +199,12 @@ type Ark struct {
 	// kept in lockstep with each pendingSweepState.inputs entry.
 	pendingSweepInputs map[wire.OutPoint]chainhash.Hash
 
+	// ownedScripts answers whether a leave destination is a backing-wallet
+	// script this daemon minted. nil means the registry is not wired, in
+	// which case every destination is treated as foreign -- the
+	// conservative answer, and the behaviour that predates the registry.
+	ownedScripts OwnedWalletScriptChecker
+
 	// clk is the clock used to stamp persistence timestamps. Tests pass
 	// a deterministic clock via WithClock; production wires the
 	// server-wide clock instance so all stores share one source of time.
@@ -418,6 +424,15 @@ func WithClock(clk clock.Clock) ArkOption {
 	}
 }
 
+// WithOwnedWalletScripts wires the owned-script registry so the wallet can
+// tell a leave that pays its own backing wallet from one that pays a
+// stranger. When omitted, every leave destination is treated as foreign.
+func WithOwnedWalletScripts(checker OwnedWalletScriptChecker) ArkOption {
+	return func(a *Ark) {
+		a.ownedScripts = checker
+	}
+}
+
 // WithEagerRoundJoin makes the wallet drive round-joining without waiting
 // for a follow-up Board or LeaveVTXOs RPC handshake. Freshly confirmed
 // boarding UTXOs run the standard handleBoard path inline, and
@@ -582,7 +597,8 @@ func (a *Ark) emitBackgroundTaskError(ctx context.Context, task string) {
 // records the UTXO, so the two either commit together or the detection is
 // retried on the next tip tick.
 func (a *Ark) emitUTXOCreated(ctx context.Context, utxo *Utxo,
-	blockHeight int32, classification string) error {
+	blockHeight int32, classification string,
+	fundingInputs []wire.OutPoint) error {
 
 	if a.ledgerSink.IsNone() || utxo == nil {
 		return nil
@@ -600,6 +616,7 @@ func (a *Ark) emitUTXOCreated(ctx context.Context, utxo *Utxo,
 		AmountSat:      int64(utxo.Amount),
 		BlockHeight:    height,
 		Classification: classification,
+		FundingInputs:  fundingInputs,
 	}
 
 	if err := sink.Tell(ctx, msg); err != nil {
@@ -1410,6 +1427,18 @@ func (a *Ark) processUtxo(ctx context.Context, epoch chainsource.BlockEpoch,
 		blockHeight = txInfo.BlockHeight
 	}
 
+	// A backend that hands back confirmation metadata without the raw
+	// transaction costs us both the funding-input index and the recycled
+	// change credit below, and neither has another producer. Say so: the
+	// loss is silent otherwise.
+	if txInfo.Tx == nil {
+		a.logger(ctx).DebugS(ctx, "Boarding tx fetch returned no raw "+
+			"transaction; recording no funding inputs and no "+
+			"recycled change for this deposit",
+			btclog.Fmt("txid", "%v", utxo.Outpoint.Hash),
+		)
+	}
+
 	// Build the SPV TxProof so the server can verify the boarding
 	// UTXO without querying its own chain source.
 	txProof := a.buildBoardingTxProof(
@@ -1443,7 +1472,6 @@ func (a *Ark) processUtxo(ctx context.Context, epoch chainsource.BlockEpoch,
 	// for the next tip tick.
 	err = a.store.InsertBoardingIntents(
 		ctx, func(txCtx context.Context) error {
-
 			// Mirror the confirmation into the client ledger so
 			// the UTXO audit log has a deposit row alongside the
 			// double-entry bookkeeping. Classification is
@@ -1452,9 +1480,31 @@ func (a *Ark) processUtxo(ctx context.Context, epoch chainsource.BlockEpoch,
 			// address -- other classifications (change,
 			// sweep_return) belong to different emission sites
 			// and are not applicable here.
-			return a.emitUTXOCreated(
+			//
+			// The message carries the funding transaction's
+			// previous outpoints, because some of them may be
+			// coins the client already credited to wallet_balance
+			// as the proceeds of an exit or a leave. The ledger
+			// actor recognises those and reverses the earlier
+			// credit; the wallet only reports which outpoints
+			// were spent.
+			err := a.emitUTXOCreated(
 				txCtx, utxo, blockHeight,
 				ledger.ClassificationDeposit,
+				fundingInputs(txInfo.Tx),
+			)
+			if err != nil {
+				return err
+			}
+
+			// A partial spend of those proceeds paid its change
+			// back to us, and the reversal above removes the whole
+			// input. Crediting the change belongs in this same
+			// transaction as the deposit leg, or a crash between
+			// them would leave the client understated with no
+			// producer left to correct it.
+			return a.emitRecycledProceedsChange(
+				txCtx, txInfo.Tx, utxo.Outpoint, blockHeight,
 			)
 		}, intent,
 	)
@@ -2132,6 +2182,9 @@ func (a *Ark) handleLeaveVTXOs(ctx context.Context,
 				PkScript: leaveOutput.PkScript,
 				Value:    int64(vtxo.Amount),
 			},
+			DestinationOwnWallet: a.destinationIsOwnWallet(
+				ctx, leaveOutput.PkScript,
+			),
 		})
 	}
 
@@ -3499,4 +3552,36 @@ func buildBoardingTapscript(clientKey, operatorKey *btcec.PublicKey,
 	}
 
 	return tapscript, nil
+}
+
+// destinationIsOwnWallet reports whether a leave destination is a
+// backing-wallet script this daemon minted, which decides whether the ledger
+// books the leave's value as an outflow or as an internal transfer onto
+// wallet_balance.
+//
+// Every failure answers false. The registry being unwired, a lookup error, or
+// a script the registry has never seen all mean the same thing for
+// accounting: we cannot assert ownership, so the value is treated as having
+// genuinely left. Overstating ownership would understate what the client paid
+// out, and a leave is a funds-moving operation that must not fail because an
+// accounting flag could not be resolved.
+func (a *Ark) destinationIsOwnWallet(ctx context.Context,
+	pkScript []byte) bool {
+
+	if a.ownedScripts == nil || len(pkScript) == 0 {
+		return false
+	}
+
+	owned, err := a.ownedScripts.IsOwnedWalletScript(ctx, pkScript)
+	if err != nil {
+		// A safe fallback, not an actionable failure: the leave still
+		// proceeds and the value is booked the conservative way.
+		a.logger(ctx).InfoS(ctx, "Failed to resolve leave destination "+
+			"ownership; booking it as an outflow",
+			slog.String("error", err.Error()))
+
+		return false
+	}
+
+	return owned
 }

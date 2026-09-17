@@ -836,6 +836,27 @@ type RoundLedgerOutflow struct {
 	// ledger actor persist multiple recipient/leave outflows
 	// without colliding on the round-level idempotency index.
 	IdempotencyKey []byte
+
+	// ProceedsOwnWallet reports that this outflow paid a backing-wallet
+	// script the daemon minted itself, so the ledger books a cancelling
+	// proceeds leg onto wallet_balance instead of leaving the value on
+	// transfers_out. Only cooperative leaves can set it; a foreign
+	// directed-send recipient output is by definition not ours.
+	ProceedsOwnWallet bool
+
+	// ProceedsVout is the commitment-transaction output index this
+	// outflow paid, meaningful only when ProceedsOwnWallet is true. It is
+	// what gives those proceeds an on-chain identity: the ledger records
+	// a 'created' audit row at (commitment txid, ProceedsVout) so a later
+	// boarding deposit funded by that output can recognise it as coins it
+	// already credited, instead of crediting them a second time.
+	//
+	// Resolution fails closed. An outflow whose output cannot be located
+	// unambiguously in the commitment transaction keeps ProceedsOwnWallet
+	// false, because a proceeds leg with no on-chain identity is worse
+	// than none: it would credit wallet_balance with nothing able to
+	// reverse it.
+	ProceedsVout uint32
 }
 
 // MessageType returns the message type identifier for logging and debugging.

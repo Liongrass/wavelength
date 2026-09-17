@@ -2258,3 +2258,50 @@ func TestLedgerStoreMultipleAccountBalances(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(6000), total)
 }
+
+// TestLedgerStoreTransactionHistoryHidesLeaveProceedsLeg verifies the
+// own-wallet leave proceeds leg is excluded from the history by the same
+// condition that hides the exit's. Both are contra legs on
+// wallet_balance <- transfers_out that cancel a send leg, so the history
+// query excludes the account pair rather than enumerating the producers; a
+// new own-wallet producer inherits the exclusion instead of needing its own
+// clause.
+func TestLedgerStoreTransactionHistoryHidesLeaveProceedsLeg(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, _ := newLedgerStoreAndDBForTest(t)
+	roundID := testBytes(16, 0x61)
+	sendKey := []byte("round-outflow:round-x:leave:0")
+
+	legs := []ledger.LedgerEntry{
+		{
+			DebitAccount:   ledger.AccountTransfersOut,
+			CreditAccount:  ledger.AccountVTXOBalance,
+			AmountSat:      7_000,
+			RoundID:        roundID,
+			EventType:      ledger.EventVTXOSent,
+			Description:    "VTXO sent in round",
+			IdempotencyKey: sendKey,
+			CreatedAt:      200,
+		},
+		{
+			DebitAccount:   ledger.AccountWalletBalance,
+			CreditAccount:  ledger.AccountTransfersOut,
+			AmountSat:      7_000,
+			RoundID:        roundID,
+			EventType:      ledger.EventVTXOSent,
+			Description:    "VTXO sent in round (own-wallet)",
+			IdempotencyKey: testBytes(36, 0x62),
+			CreatedAt:      200,
+		},
+	}
+	for _, leg := range legs {
+		require.NoError(t, store.InsertLedgerEntry(ctx, leg))
+	}
+
+	rows, err := store.ListTransactionHistory(ctx, "", 0, 0, 10, 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "only the send leg is listed")
+	require.Equal(t, ledger.AccountTransfersOut, rows[0].DebitAccount)
+}

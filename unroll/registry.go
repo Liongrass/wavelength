@@ -146,6 +146,13 @@ type RegistryConfig struct {
 	// actors.
 	LedgerSink fn.Option[ledger.Sink]
 
+	// OwnedWalletScripts answers whether a sweep output pays a script this
+	// daemon's backing wallet minted. It is what lets a completed exit
+	// name its own proceeds output instead of assuming an index. When
+	// None, no proceeds row is recorded and a later board of those coins
+	// credits them a second time.
+	OwnedWalletScripts fn.Option[OwnedWalletScriptChecker]
+
 	// Log is an optional logger.
 	Log fn.Option[btclog.Logger]
 
@@ -1548,6 +1555,7 @@ func (r *registryBehavior) childConfig(target wire.OutPoint) Config {
 		ChainSource:                r.cfg.ChainSource,
 		Wallet:                     r.cfg.Wallet,
 		LedgerSink:                 r.cfg.LedgerSink,
+		OwnedWalletScripts:         r.cfg.OwnedWalletScripts,
 		Log:                        r.cfg.Log,
 		MaxSweepFeeRateSatPerVByte: r.cfg.MaxSweepFeeRateSatPerVByte,
 		SweepFeeRateFallbackSatPerVByte: r.cfg.
