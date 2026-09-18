@@ -64,12 +64,6 @@ service DaemonService {
     rpc ReceiveAuthECDH (ReceiveAuthECDHRequest)
         returns (ReceiveAuthECDHResponse);
 
-    // RegisterPolicyReceiveScript proves this daemon participates in a custom
-    // Taproot policy and durably registers it with the operator. A retry
-    // updates the same principal/script binding. No funding is performed.
-    rpc RegisterPolicyReceiveScript (RegisterPolicyReceiveScriptRequest)
-        returns (RegisterPolicyReceiveScriptResponse);
-
     // GetIndexedVTXOByPkScript queries the authoritative indexer for the
     // first VTXO matching the given script and status filter.
     rpc GetIndexedVTXOByPkScript (GetIndexedVTXOByPkScriptRequest)
@@ -921,11 +915,21 @@ message GetIndexedVTXOByPkScriptRequest {
     // status_filter restricts the indexer query to matching lifecycle
     // states. If empty, all statuses are considered.
     repeated VTXOStatus status_filter = 2;
+
+    // policy_template optionally authorizes an exact custom output without
+    // allocating a receive-script registration. The daemon signs the policy
+    // and script; the operator verifies participant ownership on each query.
+    bytes policy_template = 3;
 }
 
 message GetIndexedVTXOByPkScriptResponse {
     // vtxo is the first matching VTXO, when found.
     VTXO vtxo = 1;
+
+    // policy_authorized confirms the operator accepted the supplied policy
+    // proof. Callers providing a policy must require this even on an empty
+    // result, so an older daemon cannot silently ignore the request field.
+    bool policy_authorized = 2;
 }
 
 // GetVTXOExpiryInfoRequest identifies one VTXO whose expiry posture should be
@@ -2949,17 +2953,4 @@ message ListPermissionsResponse {
     // method_permissions maps full RPC method URIs to their required
     // entity/action operations.
     map<string, MacaroonPermissionList> method_permissions = 1;
-}
-
-message RegisterPolicyReceiveScriptRequest {
-    // pk_script is the exact output the policy must reconstruct.
-    bytes pk_script = 1;
-
-    // policy_template is the canonical encoded Ark policy.
-    bytes policy_template = 2;
-}
-
-message RegisterPolicyReceiveScriptResponse {
-    // expires_at_unix_s is the bounded registration retention deadline.
-    uint64 expires_at_unix_s = 1;
 }

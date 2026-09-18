@@ -23,12 +23,10 @@ proofs for proof-of-control.
 - `RegisterReceiveScriptTaproot` / `UnregisterReceiveScript` /
   `ListMyReceiveScripts` — Register, unregister, and enumerate the caller's
   receive scripts on the server.
-- `RegisterReceiveScriptPolicy` — Registers a custom Taproot output together
-  with its canonical encoded policy template, so the operator can reconstruct
-  the script and check that the signer holds an operator-backed settlement
-  path. An empty template is rejected locally. Both registration entry points
-  share `registerReceiveScript`; repeating either upserts the same
-  principal/script binding, so a lost response is safe to retry.
+- `TaprootScriptScope.PolicyTemplate` selects an exact-policy proof for
+  `ListVTXOsByScripts`. `newPolicyScope` signs the script and canonical policy
+  under the explicit `policy_script_scope` type. It creates no registration.
+  Legacy `script_scope` proofs keep their original wire format.
 - `BuildListVTXOsByScriptsTaprootRequest(ctx, scopes, afterCursor []byte, limit, statusFilter)` / `ListVTXOsByScriptsTaproot(ctx, scopes, afterCursor []byte, limit, statusFilter)` — Build and execute taproot-scope-proofed `ListVTXOsByScripts` queries. `afterCursor` is an opaque `[]byte` keyset cursor passed through unchanged. The proof covers each pkScript using owner-key signatures gated on script scope.
 - `BuildGetOORSessionByTxidTaprootRequest` / `GetOORSessionByTxidTaproot` — Build and execute a taproot-proofed OOR session lookup by Ark txid.
 - `BuildListOORRecipientEventsByScriptTaprootRequest` / `ListOORRecipientEventsByScriptTaproot` — Build and execute a taproot-proofed listing of OOR receive events for a given pkScript.

@@ -48,8 +48,6 @@ type DaemonServiceMailboxServer interface {
 	SignReceiveAuthMessageCompact(ctx context.Context, req *SignReceiveAuthMessageCompactRequest) (*SignReceiveAuthMessageCompactResponse, error)
 	// ReceiveAuthECDH handles ReceiveAuthECDH.
 	ReceiveAuthECDH(ctx context.Context, req *ReceiveAuthECDHRequest) (*ReceiveAuthECDHResponse, error)
-	// RegisterPolicyReceiveScript handles RegisterPolicyReceiveScript.
-	RegisterPolicyReceiveScript(ctx context.Context, req *RegisterPolicyReceiveScriptRequest) (*RegisterPolicyReceiveScriptResponse, error)
 	// GetIndexedVTXOByPkScript handles GetIndexedVTXOByPkScript.
 	GetIndexedVTXOByPkScript(ctx context.Context, req *GetIndexedVTXOByPkScriptRequest) (*GetIndexedVTXOByPkScriptResponse, error)
 	// GetVTXOExpiryInfo handles GetVTXOExpiryInfo.
@@ -243,16 +241,6 @@ func RegisterDaemonServiceMailboxServer(r rpc.Router, impl DaemonServiceMailboxS
 		}
 
 		return impl.ReceiveAuthECDH(ctx, req)
-	})
-	r.Handle("waverpc.DaemonService", "RegisterPolicyReceiveScript", func() proto.Message {
-		return &RegisterPolicyReceiveScriptRequest{}
-	}, func(ctx context.Context, msg proto.Message) (proto.Message, error) {
-		req, ok := msg.(*RegisterPolicyReceiveScriptRequest)
-		if !ok {
-			return nil, fmt.Errorf("unexpected request type: %T", msg)
-		}
-
-		return impl.RegisterPolicyReceiveScript(ctx, req)
 	})
 	r.Handle("waverpc.DaemonService", "GetIndexedVTXOByPkScript", func() proto.Message {
 		return &GetIndexedVTXOByPkScriptRequest{}
@@ -875,29 +863,6 @@ func (c *DaemonServiceMailboxClient) ReceiveAuthECDH(ctx context.Context, req *R
 	}
 
 	resp := new(ReceiveAuthECDHResponse)
-	if err := c.C.AwaitRPC(ctx, result.CorrelationID, resp); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// RegisterPolicyReceiveScript calls the RegisterPolicyReceiveScript RPC.
-func (c *DaemonServiceMailboxClient) RegisterPolicyReceiveScript(ctx context.Context, req *RegisterPolicyReceiveScriptRequest, opts ...rpc.RPCOptions) (*RegisterPolicyReceiveScriptResponse, error) {
-	var opt rpc.RPCOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	result, err := c.C.SendRPC(ctx, rpc.ServiceMethod{
-		Service: "waverpc.DaemonService",
-		Method:  "RegisterPolicyReceiveScript",
-	}, req, opt)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := new(RegisterPolicyReceiveScriptResponse)
 	if err := c.C.AwaitRPC(ctx, result.CorrelationID, resp); err != nil {
 		return nil, err
 	}

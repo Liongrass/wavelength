@@ -125,8 +125,7 @@ func newWavedRPCPermissions() map[string][]bakery.Op {
 	)
 	grant(
 		daemon, entityAddress, "write", "NewAddress",
-		"NewReceiveScript", "RegisterPolicyReceiveScript",
-		"ReceiveAuthKey", "SignReceiveAuthMessage",
+		"NewReceiveScript", "ReceiveAuthKey", "SignReceiveAuthMessage",
 		"SignReceiveAuthMessageCompact", "ReceiveAuthECDH",
 	)
 	grant(

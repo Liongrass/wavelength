@@ -309,22 +309,11 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/waved.<S
   once; the entry is dropped when its last holder or waiter leaves.
   `NewReceiveScriptResponse.expires_at_unix_s` reports the absolute indexer
   registration expiry on both fresh and replayed paths.
-- `RegisterPolicyReceiveScript` (`rpc_policy_receive.go`) registers an *exact*
-  custom output under the daemon identity's policy-participant proof. It
-  decodes `policy_template` through `arkscript.DecodePolicyTemplate` and
-  requires `MatchesPkScript(req.PkScript)` before signing, so a mismatched or
-  malformed request is rejected locally as `InvalidArgument` rather than
-  signing a proof over an output this daemon cannot reconstruct. The operator
-  still verifies membership against its own operator key; the local check only
-  moves that rejection earlier. Registration is an observation binding — it
-  never authorizes a spend and never funds the output. The binding is upserted
-  on the principal/script pair, so a retry or a daemon restart cannot allocate
-  a duplicate. `policyReceiveRetention` (28 days) is deliberately shorter than
-  the operator's 30-day retention cap: funded outputs stay queryable through
-  their persisted policy after the binding expires, but a caller relying on
-  *negative* observations must renew before the returned
-  `expires_at_unix_s`. Granted under the `address:write` macaroon entity
-  alongside `NewReceiveScript`.
+- `GetIndexedVTXOByPkScript` validates an optional canonical policy against
+  the exact output, then signs the query with the daemon identity key. The
+  operator checks non-operator settlement participation. Only an accepted
+  query sets `policy_authorized`; transport or pending-funding failures remain
+  errors. The read creates no receive-script registration and needs no renewal.
 - `SignCreditAccountAuthorization` (and the internal
   `RPCServer.SignCreditAccountAuth` behind it) signs a canonical swap
   credit-account request digest with the daemon identity key. It validates
@@ -386,7 +375,6 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/waved.<S
 
 - [docs/daemon_cli_guide.md](../docs/daemon_cli_guide.md) — Installation,
   configuration, CLI reference.
-- [docs/custom-receive-registration.md](../docs/custom-receive-registration.md)
-  — `RegisterPolicyReceiveScript`: proof contents, operator-side verification,
-  binding persistence, and retention lifetime.
+- [docs/custom-policy-queries.md](../docs/custom-policy-queries.md)
+  — Exact-policy query proofs, capability checks, and negative observations.
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — System-wide package map.

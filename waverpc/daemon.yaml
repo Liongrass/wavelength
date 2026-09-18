@@ -50,9 +50,6 @@ http:
     - selector: waverpc.DaemonService.SignCreditAccountAuthorization
       post: /v1/daemon/sign-credit-account-authorization
       body: "*"
-    - selector: waverpc.DaemonService.RegisterPolicyReceiveScript
-      post: /v1/daemon/register-policy-receive-script
-      body: "*"
     - selector: waverpc.DaemonService.GetIndexedVTXOByPkScript
       post: /v1/daemon/get-indexed-vtxo-by-pk-script
       body: "*"

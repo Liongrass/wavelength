@@ -15,6 +15,7 @@ import (
 	"github.com/lightninglabs/wavelength/arkrpc"
 	"github.com/lightninglabs/wavelength/build"
 	"github.com/lightninglabs/wavelength/internal/indexerlimits"
+	"github.com/lightninglabs/wavelength/lib/arkscript"
 	mailboxrpc "github.com/lightninglabs/wavelength/mailbox/rpc"
 	fn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -82,6 +83,10 @@ const (
 	// scriptScopeMessageType is the canonical proof "type" string used
 	// for script-scoped queries.
 	scriptScopeMessageType = "script_scope"
+
+	// policyScopeMessageType binds a custom policy and exact output to a
+	// query, without granting a durable receive-script registration.
+	policyScopeMessageType = "policy_script_scope"
 
 	// purposeListVTXOsByScripts is the canonical purpose string expected
 	// by the server when verifying script-scope proofs for
@@ -533,6 +538,11 @@ type TaprootScriptScope struct {
 	// PkScript is the raw P2TR output script to query. Must be
 	// a valid pay-to-taproot script (OP_1 <32-byte key>).
 	PkScript []byte
+
+	// PolicyTemplate optionally carries the canonical policy for a
+	// registration-free funding query. The proof commits to this exact
+	// policy and output; empty preserves the existing scoped proof.
+	PolicyTemplate []byte
 }
 
 // newTaprootScope builds a ScriptScope proto with a TLV-encoded
@@ -593,6 +603,61 @@ func (c *Client) newTaprootScope(ctx context.Context, pkScript []byte,
 	}, nil
 }
 
+// newPolicyScope signs an exact policy/output query. This proof type cannot
+// be replayed as an existing registration or pkScript-less scoped proof.
+func (c *Client) newPolicyScope(ctx context.Context, scope TaprootScriptScope,
+	purpose string) (*arkrpc.ScriptScope, error) {
+
+	if purpose != purposeListVTXOsByScripts {
+		return nil, fmt.Errorf("policy proof is only supported for " +
+			"VTXO queries")
+	}
+	policy, err := arkscript.DecodePolicyTemplate(scope.PolicyTemplate)
+	if err != nil || !policy.MatchesPkScript(scope.PkScript) {
+		return nil, fmt.Errorf("policy does not match pkScript")
+	}
+	key, err := proofOwnerPubKey(scope.PkScript, c.signer)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) == 0 {
+		return nil, fmt.Errorf("policy signer pubkey not configured")
+	}
+	nonce, err := randomNonce(registrationNonceBytes)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	message, err := encodeProofTLVWithPolicy(
+		policyScopeMessageType, c.serverID, c.principal, purpose,
+		scope.PkScript, key, scope.PolicyTemplate, nonce,
+		uint64(
+			now.Unix(),
+		),
+		uint64(
+			now.Add(offlineReceiveProofTTL).Unix(),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := schnorrSigOverMessage(
+		ctx, message, scope.PkScript, c.signer,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &arkrpc.ScriptScope{
+		PkScript: append([]byte(nil), scope.PkScript...),
+		Proof: &arkrpc.ScriptScope_TaprootSchnorr{
+			TaprootSchnorr: &arkrpc.TaprootSchnorrProof{
+				Message: message, Sig64: sig,
+			},
+		},
+	}, nil
+}
+
 // buildTaprootScopes converts a slice of TaprootScriptScope into
 // proto ScriptScope messages, constructing a signed proof for each
 // entry under the given purpose.
@@ -602,9 +667,15 @@ func (c *Client) buildTaprootScopes(ctx context.Context,
 
 	out := make([]*arkrpc.ScriptScope, 0, len(scopes))
 	for _, scope := range scopes {
-		ss, err := c.newTaprootScope(
-			ctx, scope.PkScript, purpose,
-		)
+		var ss *arkrpc.ScriptScope
+		var err error
+		if len(scope.PolicyTemplate) != 0 {
+			ss, err = c.newPolicyScope(ctx, scope, purpose)
+		} else {
+			ss, err = c.newTaprootScope(
+				ctx, scope.PkScript, purpose,
+			)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -779,36 +850,6 @@ func (c *Client) RegisterReceiveScriptTaproot(ctx context.Context,
 	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
 	error) {
 
-	return c.registerReceiveScript(
-		ctx, pkScript, nil, expiresAt, label, opts...,
-	)
-}
-
-// RegisterReceiveScriptPolicy registers a custom Taproot output with a signed
-// policy template. The operator must reconstruct the output and verify that
-// the signer has an operator-backed settlement path. Repeating the call upserts
-// the same principal/script binding; a lost response is safe to retry.
-func (c *Client) RegisterReceiveScriptPolicy(ctx context.Context, pkScript,
-	policyTemplate []byte, expiresAt time.Time, label string,
-	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
-	error) {
-
-	if len(policyTemplate) == 0 {
-		return nil, fmt.Errorf("policy template is required")
-	}
-
-	return c.registerReceiveScript(
-		ctx, pkScript, policyTemplate, expiresAt, label, opts...,
-	)
-}
-
-// registerReceiveScript signs a short-lived ownership proof and asks the
-// operator to persist a separately bounded receive-script registration.
-func (c *Client) registerReceiveScript(ctx context.Context, pkScript,
-	policyTemplate []byte, expiresAt time.Time, label string,
-	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
-	error) {
-
 	if err := validateTaprootPkScript(pkScript); err != nil {
 		return nil, err
 	}
@@ -840,10 +881,9 @@ func (c *Client) registerReceiveScript(ctx context.Context, pkScript,
 		return nil, err
 	}
 
-	msgBytes, err := encodeProofTLVWithPolicy(
+	msgBytes, err := encodeProofTLVWithOwner(
 		registrationMessageType, c.serverID, c.principal,
-		purposeRegisterReceiveScript, pkScript, ownerPubKey,
-		policyTemplate, nonce,
+		purposeRegisterReceiveScript, pkScript, ownerPubKey, nonce,
 		uint64(
 			now.Unix(),
 		),
