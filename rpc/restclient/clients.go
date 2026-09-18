@@ -1194,3 +1194,17 @@ func (c *WalletServiceClient) SubscribeWallet(ctx context.Context,
 		},
 	), nil
 }
+
+// RegisterPolicyReceiveScript registers an exact custom output through the
+// authenticated daemon API and returns the bounded operator retention time.
+func (c *DaemonServiceClient) RegisterPolicyReceiveScript(ctx context.Context,
+	in *waverpc.RegisterPolicyReceiveScriptRequest, _ ...grpc.CallOption) (
+	*waverpc.RegisterPolicyReceiveScriptResponse, error) {
+
+	out := new(waverpc.RegisterPolicyReceiveScriptResponse)
+	err := c.client.Post(
+		ctx, "/v1/daemon/register-policy-receive-script", in, out,
+	)
+
+	return out, err
+}

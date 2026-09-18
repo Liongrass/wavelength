@@ -101,6 +101,13 @@ func generatedRegistry() []serviceSpec {
 					Comments: "ReceiveAuthECDH derives one Sphinx shared secret with the\nper-payment receive-auth key.",
 				},
 				{
+					Name:     "RegisterPolicyReceiveScript",
+					Aliases:  []string{"register-policy-receive-script"},
+					Input:    "waverpc.RegisterPolicyReceiveScriptRequest",
+					Output:   "waverpc.RegisterPolicyReceiveScriptResponse",
+					Comments: "RegisterPolicyReceiveScript proves this daemon participates in a custom\nTaproot policy and durably registers it with the operator. A retry\nupdates the same principal/script binding. No funding is performed.",
+				},
+				{
 					Name:     "GetIndexedVTXOByPkScript",
 					Aliases:  []string{"get-indexed-vtxo-by-pk-script"},
 					Input:    "waverpc.GetIndexedVTXOByPkScriptRequest",
