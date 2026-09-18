@@ -64,6 +64,12 @@ service DaemonService {
     rpc ReceiveAuthECDH (ReceiveAuthECDHRequest)
         returns (ReceiveAuthECDHResponse);
 
+    // RegisterPolicyReceiveScript proves this daemon participates in a custom
+    // Taproot policy and durably registers it with the operator. A retry
+    // updates the same principal/script binding. No funding is performed.
+    rpc RegisterPolicyReceiveScript (RegisterPolicyReceiveScriptRequest)
+        returns (RegisterPolicyReceiveScriptResponse);
+
     // GetIndexedVTXOByPkScript queries the authoritative indexer for the
     // first VTXO matching the given script and status filter.
     rpc GetIndexedVTXOByPkScript (GetIndexedVTXOByPkScriptRequest)
@@ -2943,4 +2949,17 @@ message ListPermissionsResponse {
     // method_permissions maps full RPC method URIs to their required
     // entity/action operations.
     map<string, MacaroonPermissionList> method_permissions = 1;
+}
+
+message RegisterPolicyReceiveScriptRequest {
+    // pk_script is the exact output the policy must reconstruct.
+    bytes pk_script = 1;
+
+    // policy_template is the canonical encoded Ark policy.
+    bytes policy_template = 2;
+}
+
+message RegisterPolicyReceiveScriptResponse {
+    // expires_at_unix_s is the bounded registration retention deadline.
+    uint64 expires_at_unix_s = 1;
 }
