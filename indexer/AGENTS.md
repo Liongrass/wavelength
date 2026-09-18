@@ -50,11 +50,11 @@ proofs for proof-of-control.
   digest, so every record it carries is covered by the signature. The optional
   policy template record (`proofTLVTypePolicyTemplate`, TLV type 12) is emitted
   only when non-empty, which keeps standard registrations byte-identical to the
-  pre-policy encoding while making a policy substitution on a custom
-  registration invalidate the signature under the same signer key.
+  pre-policy encoding while making a policy substitution on an exact-policy
+  query invalidate the signature under the same signer key.
 
 ## Deep Docs
 
-- [docs/custom-receive-registration.md](../docs/custom-receive-registration.md)
-  — What the custom-policy registration proof commits to and why the operator
+- [docs/custom-policy-queries.md](../docs/custom-policy-queries.md)
+  — What the exact-policy query proof commits to and why the operator
   must reconstruct the output itself.
