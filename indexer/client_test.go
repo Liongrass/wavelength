@@ -527,3 +527,55 @@ func (r *recordingRPCClient) lastRegisterReceiveScriptRequest(
 
 	return req
 }
+
+// TestRegisterReceiveScriptPolicyCommitsTemplate verifies custom registration
+// signs the actual output and complete policy with the participant key. A
+// policy substitution invalidates the signature even when the key is retained.
+func TestRegisterReceiveScriptPolicyCommitsTemplate(t *testing.T) {
+	t.Parallel()
+
+	key, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	pkScript := append(
+		[]byte{0x51, 0x20}, schnorr.SerializePubKey(key.PubKey())...,
+	)
+	policy := []byte("canonical-policy-fixture")
+	rpcClient := &recordingRPCClient{}
+	client := New(
+		rpcClient, &PrivKeySchnorrSigner{
+			Key: key,
+		}, "test-server", "client:test",
+		fn.None[btclog.Logger](),
+	)
+	expiresAt := time.Now().Add(28 * 24 * time.Hour)
+	_, err = client.RegisterReceiveScriptPolicy(
+		t.Context(), pkScript, policy, expiresAt, "custom policy",
+	)
+	require.NoError(t, err)
+	req := rpcClient.lastRegisterReceiveScriptRequest(t)
+	require.Equal(t, pkScript, req.PkScript)
+	require.Equal(t, uint64(expiresAt.Unix()), req.ExpiresAtUnixS)
+	proof := req.GetTaprootSchnorr()
+	var decodedPolicy []byte
+	stream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(
+			proofTLVTypePolicyTemplate, &decodedPolicy,
+		),
+	)
+	require.NoError(t, err)
+	require.NoError(t, stream.DecodeP2P(bytes.NewReader(proof.Message)))
+	require.Equal(t, policy, decodedPolicy)
+	sig, err := schnorr.ParseSignature(proof.Sig64)
+	require.NoError(t, err)
+	digest := chainhash.TaggedHash(proofTag(), proof.Message)
+	require.True(t, sig.Verify(digest[:], key.PubKey()))
+	changed := append([]byte(nil), proof.Message...)
+	changed[len(changed)-1] ^= 1
+	digest = chainhash.TaggedHash(proofTag(), changed)
+	require.False(t, sig.Verify(digest[:], key.PubKey()))
+
+	_, err = client.RegisterReceiveScriptPolicy(
+		t.Context(), pkScript, nil, expiresAt, "empty policy",
+	)
+	require.ErrorContains(t, err, "policy template is required")
+}

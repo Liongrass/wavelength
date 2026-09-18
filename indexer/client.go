@@ -163,6 +163,9 @@ const (
 	// proofTLVTypeSignerPubKey identifies the compressed participant pubkey
 	// used to sign script-scope query proofs.
 	proofTLVTypeSignerPubKey tlv.Type = 11
+
+	// proofTLVTypePolicyTemplate commits a custom output's complete policy.
+	proofTLVTypePolicyTemplate tlv.Type = 12
 )
 
 // New creates an Indexer client wrapper. The signer is used for all
@@ -307,6 +310,18 @@ func encodeProofTLVWithOwner(msgType, serverID, principal, purpose string,
 	pkScript, ownerPubKey, nonce []byte, issuedAt,
 	expiresAt uint64) ([]byte, error) {
 
+	return encodeProofTLVWithPolicy(
+		msgType, serverID, principal, purpose, pkScript, ownerPubKey,
+		nil, nonce, issuedAt, expiresAt,
+	)
+}
+
+// encodeProofTLVWithPolicy commits the complete output policy into an owner
+// proof. The optional record is omitted for existing standard registrations.
+func encodeProofTLVWithPolicy(msgType, serverID, principal, purpose string,
+	pkScript, ownerPubKey, policyTemplate, nonce []byte, issuedAt,
+	expiresAt uint64) ([]byte, error) {
+
 	proofTypeBytes := []byte(msgType)
 	version := uint32(registrationMessageVersion)
 	serverIDBytes := []byte(serverID)
@@ -359,6 +374,14 @@ func encodeProofTLVWithOwner(msgType, serverID, principal, purpose string,
 				proofTLVTypeOwnerPubKey, &ownerPubKey,
 				tlv.SizeVarBytes(&ownerPubKey), tlv.EVarBytes,
 				tlv.DVarBytes,
+			),
+		)
+	}
+
+	if len(policyTemplate) > 0 {
+		records = append(
+			records, tlv.MakePrimitiveRecord(
+				proofTLVTypePolicyTemplate, &policyTemplate,
 			),
 		)
 	}
@@ -756,6 +779,36 @@ func (c *Client) RegisterReceiveScriptTaproot(ctx context.Context,
 	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
 	error) {
 
+	return c.registerReceiveScript(
+		ctx, pkScript, nil, expiresAt, label, opts...,
+	)
+}
+
+// RegisterReceiveScriptPolicy registers a custom Taproot output with a signed
+// policy template. The operator must reconstruct the output and verify that
+// the signer has an operator-backed settlement path. Repeating the call upserts
+// the same principal/script binding; a lost response is safe to retry.
+func (c *Client) RegisterReceiveScriptPolicy(ctx context.Context, pkScript,
+	policyTemplate []byte, expiresAt time.Time, label string,
+	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
+	error) {
+
+	if len(policyTemplate) == 0 {
+		return nil, fmt.Errorf("policy template is required")
+	}
+
+	return c.registerReceiveScript(
+		ctx, pkScript, policyTemplate, expiresAt, label, opts...,
+	)
+}
+
+// registerReceiveScript signs a short-lived ownership proof and asks the
+// operator to persist a separately bounded receive-script registration.
+func (c *Client) registerReceiveScript(ctx context.Context, pkScript,
+	policyTemplate []byte, expiresAt time.Time, label string,
+	opts ...mailboxrpc.RPCOptions) (*arkrpc.RegisterReceiveScriptResponse,
+	error) {
+
 	if err := validateTaprootPkScript(pkScript); err != nil {
 		return nil, err
 	}
@@ -787,9 +840,10 @@ func (c *Client) RegisterReceiveScriptTaproot(ctx context.Context,
 		return nil, err
 	}
 
-	msgBytes, err := encodeProofTLVWithOwner(
+	msgBytes, err := encodeProofTLVWithPolicy(
 		registrationMessageType, c.serverID, c.principal,
-		purposeRegisterReceiveScript, pkScript, ownerPubKey, nonce,
+		purposeRegisterReceiveScript, pkScript, ownerPubKey,
+		policyTemplate, nonce,
 		uint64(
 			now.Unix(),
 		),
