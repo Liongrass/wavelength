@@ -51,3 +51,13 @@ helper file (`errors.go`) for structured wallet-lifecycle errors.
   identity or they will be handed each other's receive scripts. An empty key
   keeps the legacy allocate-a-fresh-script behavior; repeating a non-empty key
   with a *different* label is rejected rather than silently reallocated.
+- `RegisterPolicyReceiveScriptRequest` carries both the exact `pk_script` and
+  the canonical encoded `policy_template` because the daemon and the operator
+  each reconstruct the output from the policy and refuse a pair that does not
+  match. Sending only the script would leave the operator unable to check that
+  the registrant participates in the policy at all.
+- `RegisterPolicyReceiveScriptResponse.expires_at_unix_s` is a bounded
+  *retention* deadline for the registration, not a spend authorization and not
+  the lifetime of the output. The RPC registers an output for observation; it
+  never funds one. Repeating the call updates the same principal/script
+  binding, so a client that lost the response may safely retry.

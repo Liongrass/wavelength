@@ -1218,9 +1218,17 @@ func (s *paySession) waitForClaimPreimage(ctx context.Context) error {
 
 		refunded, err := s.tryCooperativeRefund(ctx)
 		if err != nil {
-			return err
+			var retryable *retryableActionError
+			if !errors.As(err, &retryable) {
+				return err
+			}
+			s.client.log.DebugS(
+				ctx,
+				"Retrying cooperative refund observation",
+				slog.String("err", err.Error()),
+			)
 		}
-		if refunded {
+		if err == nil && refunded {
 			return nil
 		}
 
