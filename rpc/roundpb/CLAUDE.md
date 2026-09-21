@@ -24,7 +24,11 @@ All `*.pb.go` files are generated — never edit directly; regenerate with
   `MethodSubmitVTXOForfeitSigs` (VTXO forfeit sigs).
 - `TreeFromProto` / `TreeToProto` — Convert between `*VTXOTree` proto and
   `lib/tree.Tree`; `TreeFromProto` takes `WithMaxTreeNodes` to bound the
-  deserialized node count (`DefaultMaxTreeNodes` = 50,000).
+  deserialized node count (`DefaultMaxTreeNodes` = 50,000). Both carry a
+  `lib/tree.AssetTreeContext` across the wire via `VTXOTree.asset_ref` and the
+  per-node `signing_tweak` / `asset_amount` / `asset_commitment_root` fields,
+  and `TreeFromProto` recomputes every node's `FinalKey` (it no longer returns
+  nodes with a nil `FinalKey` for the caller to materialize).
 - `OutpointFromProto`/`ToProto`, `TxOutFromProto`/`ToProto`,
   `PSBTFromBytes`/`ToBytes`, `MsgTxFromBytes`/`ToBytes`,
   `SchnorrSigFromBytes`/`ToBytes` — wire/proto ⇄ Go conversions for the
@@ -41,7 +45,8 @@ distinction.
 ## Relationships
 
 - **Depends on**: `lib/tree`, `lib/types` (conversion targets in
-  `convert.go`); otherwise generated proto types only.
+  `convert.go`), `github.com/lightninglabs/tap-sdk` (`ParseAssetRef`, for
+  canonical asset-reference validation); otherwise generated proto types only.
 - **Depended on by**: `round` (outbox routing, proto conversions, flow
   version), `db` (persisting round/VTXO proto blobs), `waved` (proto
   conversion, flow version).
@@ -70,6 +75,19 @@ distinction.
   the sibling decoder on the untrusted indexer receive path. Keep the
   two in step: a shape rejected by one and accepted by the other is a
   gap, not a difference in trust level.
+- **Asset trees are all-or-nothing on the wire.** Any per-node asset field
+  (`signing_tweak`, `asset_amount`, `asset_commitment_root`) without a
+  `VTXOTree.asset_ref` is rejected, so a sender cannot smuggle asset material
+  into a tree that decodes as Bitcoin-only. `asset_ref` must round-trip
+  `tapsdk.ParseAssetRef` in canonical encoding — a non-canonical spelling of the
+  same asset is rejected rather than normalized, so two encodings can never
+  produce two identities for one asset. `TreeToProto` runs the same validation
+  on the way out, so a malformed asset context fails at the sender.
+- **Asset nodes derive `FinalKey` from the asset signing tweak.** When an asset
+  context is present, `TreeFromProto` tweaks with
+  `AssetTreeContext.SigningTweak(node.Input)` instead of
+  `sweep_tapscript_root`. Using the sweep root on an asset tree yields keys that
+  fail `VerifySigned`.
 - `ValidateFlowVersion` must reject any `FlowVersion` other than the
   versions this build implements (currently only `FlowVersionV1`); never
   make it permissive by default.

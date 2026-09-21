@@ -18,6 +18,13 @@ descriptors through branch nodes to the batch output.
 - `SignerSession` — MuSig2 signing session for tree transactions, wrapping `input.MuSig2Signer`.
 - `Materializer` / `BTCMaterializer` — Interface and implementation for materializing tree nodes into actual Bitcoin transactions.
 - `TreeAssembler` — Two-pass builder (`BuildStructure` then `Materialize`) driven by `TreeConfig`.
+- `AssetTreeContext` — Side table attached to a `Tree` (`Tree.AssetContext`)
+  holding everything an asset-carrying tree needs beyond the Bitcoin structure:
+  the `AssetRef`, a per-node signing tweak that replaces `SweepTapscriptRoot`
+  when computing `FinalKey`, the per-node asset amount, and the per-leaf asset
+  commitment root and sealed transfer package. Builders populate it before
+  sharing the tree; `Validate(root)` checks it against the node graph. `nil` (or
+  `IsEmpty`) means a Bitcoin-only tree.
 - `Queue[T]` — Generic queue used internally for BFS tree traversal.
 
 ## Relationships
@@ -42,6 +49,11 @@ descriptors through branch nodes to the batch output.
   all outputs and recurses only into retained children. The traversal rejects
   cycles and nodes shared by multiple parents. `Node.Verify` checks only
   parent-child outpoint topology and is not a trust-boundary validator.
+- **An asset tree signs under the asset signing tweak, not the sweep root.**
+  When `Tree.AssetContext` is non-nil, each node's `FinalKey` is computed from
+  its cosigners and `AssetContext.SigningTweak(node.Input)`; the Bitcoin-only
+  path uses `SweepTapscriptRoot`. Mixing the two produces a key that verifies
+  against neither.
 - **Cache-aliasing invariant**: a `*Tree` is effectively immutable once published from
   a builder or resolver. Multiple downstream consumers may share the same `*Tree`
   pointer through caches and ancestry-fragment slices. Silently mutating a shared

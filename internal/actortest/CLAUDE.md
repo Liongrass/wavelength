@@ -21,6 +21,12 @@ state+outbox checkpointing.
 - `newLedgerActorForTest` (`ledger_e2e_test.go`) — Wires a real
   `ledger.LedgerActor` on the durable mailbox against the same SQLite DB, so
   ledger writes join the actor's fenced `Commit` transaction as in production.
+- `nackingSendStore` (`ledger_session_lane_test.go`) — A `db.LedgerStoreDB`
+  wrapper that fails the first outgoing OOR send leg, standing in for the
+  transient storage failures the ledger's retry policy rides out. Failing once
+  pushes that message's `available_at` into backoff so it sorts *behind* the
+  later-enqueued receive, which is what makes the session-lane ordering
+  guarantee observable rather than accidental.
 - Timeout constants: `outboxForwardProcessingTimeout`, `outboxDeliveryTimeout`,
   `durableAskResponseTimeout` — all 30s, kept aligned since DurableAsk
   responses and forwards are also delivered through the outbox.
@@ -30,3 +36,17 @@ state+outbox checkpointing.
 - **Depends on**: `baselib/actor`, `db` / `db/actordelivery` (real backends,
   not mocks), `ledger` (`LedgerActor` e2e coverage).
 - **Depended on by**: nothing (test-only).
+
+## Invariants
+
+- **Ordering tests must force the adverse interleaving, not hope for it.**
+  `TestOORSelfChangeSurvivesANackedSend` nacks the send so retry backoff moves
+  it behind the receive in the mailbox's `(priority, available_at, created_at)`
+  claim order. The assertion is that the session correlation key still keeps
+  the receive from being claimed while its lane's earlier message is queued, so
+  the receive is classified against a committed send leg and books as the
+  sender's own change rather than as revenue from a counterparty. A test that
+  merely enqueues in order proves nothing here.
+- Ledger replay assertions use `require.Never`, not `require.Eventually`: the
+  claim is that a redelivered event adds no rows, and only a negative
+  assertion over time can show that.

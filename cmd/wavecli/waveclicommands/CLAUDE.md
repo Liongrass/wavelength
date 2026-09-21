@@ -187,6 +187,14 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/cmd/wave
 - `recovery escalate` refuses to run on non-interactive stdin unless
   `--yes` is passed — it never blocks on a y/N prompt an agent can't
   answer.
+- **`ark vtxos list` defaults to the inventory set, not everything.** With no
+  `--status`, the daemon lists every VTXO except forfeited and spent ones,
+  newest first; only `live` entries are spendable. `--status` is repeatable and
+  rejects `UNSPECIFIED`; `--all` expands to every concrete status and is
+  mutually exclusive with `--status`. OOR checkpoint PSBTs are large, so the
+  CLI sets `exclude_checkpoint_psbts` unless the caller is in the plain default
+  listing or names `oor_final_checkpoint_psbts` in `--fields` — `--all` alone
+  does not pull them.
 - `ark vtxos refresh` is gated on fee consent: a real refresh fetches
   the dry-run estimate and prompts with it on a TTY, and refuses on
   non-interactive stdin without `--yes` (same posture as `leave --all`
