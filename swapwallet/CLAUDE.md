@@ -169,6 +169,33 @@ default builds avoid the swap executor's dependency graph.
   calls `listLiveVTXOsForLeave` for sweep-all enumeration.
 - `SendResponse.actual_amount_sat` carries the true outflow for sweep-all
   sends and SHOULD be echoed back before the send is treated as confirmed.
+- **The on-chain leave preview quotes every selected input, not the
+  destination amount.** Each forfeited VTXO pays its own fixed operator
+  components even when they all belong to one wallet, and a bounded send that
+  returns change prices the wrong principal if quoted once on the destination.
+  `quoteOnchainInputs` therefore calls `EstimateFee` per distinct
+  `(amount, remaining_blocks)` pair — memoized, with `remaining_blocks` derived
+  from `batch_expiry - block_height` and clamped to a minimum of 1 (zero would
+  mean "full default lifetime" to the operator) — and sums the results.
+- **A partial operator sum can never masquerade as a complete quote.** Missing
+  chain height, a missing batch expiry or amount on any input, an
+  `EstimateFee` failure, or an overflowing total discards the *entire* remote
+  estimate and falls back to the batch-size-1 `localOnchainFeeFloor`, reported
+  as `LOCAL_ONLY`. The one exception is an input the operator flags
+  `below_dust_warning`: that fails the preview with `FailedPrecondition` rather
+  than falling back, because substituting a local floor would hide an operator
+  quote already known to be uneconomic.
+- **Sweep-all is not affordable by construction.** The preview rejects a sweep
+  whose leave output would drop below `max(dust_limit, 1)` after fees, the same
+  way a bounded send is rejected when the selected total cannot cover amount
+  plus fee.
+- **Ledger-derived transitions are stamped with arrival time, not source
+  time.** A projection carrying its source row's creation time would sort as
+  older than the row it replaces and stay invisible to recency ordering,
+  pollers, and subscriber payloads. `stampLateTransition` advances
+  `updated_at_unix` past the stored row's value when the derived value does
+  not, and clamps to the stored value so a stepped-back wall clock never
+  regresses it.
 - **Cooperative-leave EXIT fee**: at completion
   (`applyCooperativeLeaveForfeited`), the forfeited source VTXO's
   settlement carries the forfeit round's operator fee (from the daemon

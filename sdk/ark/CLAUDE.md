@@ -76,8 +76,13 @@ transport, without duplicating Ark runtime behavior.
   server; it does not own the caller's `DaemonServer` runtime. `Close()`
   tears down only the private transport.
 - `ServerInfo` is a bootstrap-time operator-terms snapshot, including the
-  advisory `FreeRefreshWindowBlocks`; refresh after reconnect is not wired
-  through yet.
+  advisory `FreeRefreshWindowBlocks` and `VTXOConfirmations` (the confirmation
+  depth at which round-created VTXOs become spendable off-chain); refresh after
+  reconnect is not wired through yet.
+- **`ListVTXOs(ctx, nil)` lists the inventory set, not everything.** A nil
+  request returns every VTXO except forfeited and spent ones, newest first, of
+  which only live entries are spendable. Callers that want the full history
+  must set the statuses explicitly.
 - Pre-1.0, some methods intentionally return `waverpc` protobuf types
   directly. Those passthrough APIs are not yet treated as stable SDK-owned
   models.

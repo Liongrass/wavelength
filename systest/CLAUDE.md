@@ -13,7 +13,8 @@ for round and OOR-send scenarios.
 
 - `SysTestHarness` — Per-test wrapper around `harness.Harness` (Docker
   bitcoind + lnd) plus a per-test `actor.ActorSystem`, in-memory SQLite
-  `db.BoardingWalletStore`, and subsystem loggers. `NewSysTestHarness`
+  `db.BoardingWalletStore`, a running `ledger.LedgerActor` registered under
+  `ledger.NewServiceKey()`, and subsystem loggers. `NewSysTestHarness`
   isolates every test's Docker infra, actor system, and database.
 - `BoardingWalletFixture` — Higher-level fixture built on
   `SysTestHarness`: wires a chain source actor, `wallet.BoardingBackend`, and
@@ -30,7 +31,9 @@ for round and OOR-send scenarios.
 - **Depends on**: `harness` (Docker bitcoind/lnd test environment), `wallet`
   (boarding wallet actor under test), `chainsource`/`chainbackends`/
   `lndbackend` (chain backend wiring), `waved` (full in-process daemon for
-  round/send-VTXO tests), `db` (test-scoped SQLite stores).
+  round/send-VTXO tests), `db` / `db/actordelivery` (test-scoped SQLite stores
+  and the TX-aware delivery store), `ledger` (durable accounting actor behind
+  the wallet's ledger sink).
 - **Depended on by**: nothing (test-only, `systest`-tagged).
 
 ## Invariants
@@ -42,6 +45,11 @@ for round and OOR-send scenarios.
   so tests must not share a harness across `t.Parallel()` subtests.
 - Tests that need to run concurrently must call `ParallelN(t)` (not raw
   `t.Parallel()`) so the Docker-resource semaphore is respected.
+- **The harness must run a real ledger actor, not a dangling sink.** The wallet
+  commits its deposit leg *inside* the boarding intent's transaction, so a
+  ledger sink with no actor behind it rolls every confirmed deposit back. The
+  actor shares the wallet's database and delivery store precisely so that leg
+  joins the same transaction it does in the daemon.
 
 ## Deep Docs
 

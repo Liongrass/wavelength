@@ -33,6 +33,14 @@ btcwallet.BtcWallet regardless of the underlying chain source.
 ## Invariants
 
 - Taproot scripts must be imported under `KeyScopeBIP0086` (not the custom chain key scope), because btcwallet's block processing skips credit tracking for non-default scopes (`chainntfns.go:IsDefaultScope` check).
+- **`Wallet.Balance` reports the default account only.** It passes
+  `lnwallet.DefaultAccountName` to `ConfirmedBalance`, not the empty
+  "all accounts" string. Imported taproot scripts (boarding and exit outputs
+  registered via `ImportTaprootScript`) live in btcwallet's *imported* account
+  and are deliberately excluded: they are unspendable by the wallet's own key
+  ring, and the daemon already reports them under the separate boarding balance
+  fields, so counting them here would overstate what the wallet can actually
+  fund an exit or sweep with.
 - `ImportedAddrs` is in-memory only and must be repopulated from the DB on
   restart. `ImportTaprootScript` recovers from
   `waddrmgr.ErrDuplicateAddress` by resolving the existing address via

@@ -37,7 +37,15 @@ estimation, and optional v3 package relay via a pluggable `PackageSubmitter`.
   `rpcclient.ErrInsufficientFee`) instead of substring-matching reject
   strings.
 - `NewPackageTxError(wtxid, txid, reason)` — Eagerly maps the reject reason to
-  a typed sentinel at construction time.
+  a typed sentinel at construction time, and eagerly parses any
+  replacement-policy fee floors out of the reason string.
+- `ReplacementFeeConstraints` — Structured fee floors Bitcoin Core reports when
+  a replacement child cannot evict a conflicting transaction:
+  `ConflictingFee` (total fee the replacement must beat),
+  `AdditionalFeeDeficit` (extra fee needed for the incremental relay fee), and
+  `ConflictingFeeRateSatPerVByte` (integer part of the highest conflicting
+  feerate; a replacement must pay at least one sat/vByte above it). Retrieved
+  via `PackageTxError.ReplacementConstraints()`, which returns a deep copy.
 - `WalkPackageTxErrors(err, fn)` — Walks both `Unwrap() error` and
   `Unwrap() []error` shapes to invoke `fn` for every `*PackageTxError` in a
   joined error tree. Use this instead of `errors.As` when all per-tx entries
@@ -67,6 +75,15 @@ estimation, and optional v3 package relay via a pluggable `PackageSubmitter`.
 - `LndClientChainNotifier` enforces a 15-second timeout on registration to
   prevent hanging under LND block load.
 - Log messages use canonical txid strings (not reversed byte slices).
+- **`ReplacementFeeConstraints` fields are individually optional and
+  best-effort.** They are scraped from Bitcoin Core's human-readable
+  replacement-policy diagnostics, so a nil field means "this backend did not
+  report that constraint", never "the constraint is zero". The total-fee and
+  incremental-relay messages hold across Core 28–31; the conflicting-feerate
+  message only appears on Core 28–30, since cluster mempool replaced that
+  check. Callers must degrade gracefully when a field is absent rather than
+  treating the parse as authoritative, and a Core release that rewords these
+  strings silently yields nil — never a wrong number.
 - **A `Canceled` status is only shutdown noise when the owning context is also
   done.** Round completion stops each VTXO's block subscription, and a block
   already in flight can race that cancellation, so `GetBlockHash` or the
