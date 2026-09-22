@@ -399,6 +399,12 @@ when adding one.
   boundary remains authoritative. `CommitState` closes admission atomically
   with its signature-bearing checkpoint.
 
+- `000024_round_output_provenance` — retains each requested output's local
+  accounting origin and optional refresh source outpoint in the signature
+  checkpoint. Recovery preserves boarding, refresh, transfer, and automatic
+  refresh classification, including distinct refreshes with identical scripts.
+  Legacy requests retain unknown origin and no source; no pairing is guessed.
+
 ## Deep Docs
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — System-wide package map.
