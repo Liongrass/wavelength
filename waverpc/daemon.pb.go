@@ -7573,8 +7573,8 @@ type OORSessionInfo struct {
 	Status OORSessionStatus `protobuf:"varint,3,opt,name=status,proto3,enum=waverpc.OORSessionStatus" json:"status,omitempty"`
 	// phase is the detailed OOR FSM phase string.
 	Phase string `protobuf:"bytes,4,opt,name=phase,proto3" json:"phase,omitempty"`
-	// created_at is the Unix timestamp when the persisted package was first
-	// recorded, when known.
+	// created_at is the session creation time in Unix seconds. Package-only
+	// history uses the time the package was first recorded.
 	CreatedAt int64 `protobuf:"varint,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// updated_at is the Unix timestamp when the session/package was last
 	// updated, when known.
@@ -7688,7 +7688,8 @@ type ListOORSessionsRequest struct {
 	// daemon uses a default page size.
 	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// page_token is an opaque session cursor returned by a previous
-	// ListOORSessionsResponse.
+	// ListOORSessionsResponse. Cursors from the older session-ID ordering
+	// are rejected; restart with an empty token after upgrading.
 	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// direction_filter restricts results by local direction when set.
 	DirectionFilter OORSessionDirection `protobuf:"varint,3,opt,name=direction_filter,json=directionFilter,proto3,enum=waverpc.OORSessionDirection" json:"direction_filter,omitempty"`
@@ -7758,7 +7759,7 @@ func (x *ListOORSessionsRequest) GetStatusFilter() OORSessionStatus {
 
 type ListOORSessionsResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// sessions lists locally known OOR operation status entries.
+	// sessions lists locally known OOR operation status entries, newest first.
 	Sessions []*OORSessionInfo `protobuf:"bytes,1,rep,name=sessions,proto3" json:"sessions,omitempty"`
 	// next_page_token is an opaque cursor for the next page. Empty when
 	// there are no more results.

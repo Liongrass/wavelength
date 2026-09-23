@@ -1609,21 +1609,29 @@ func (r *oorRegistryBehavior) handleListSessions(ctx context.Context,
 func (r *oorRegistryBehavior) fillOutgoingSummary(ctx context.Context,
 	summary *SessionSummary, record *clientdb.OORSessionRegistryRecord) {
 
+	if err := FillOutgoingSummary(summary, record); err != nil {
+		r.logger(ctx).WarnS(
+			ctx,
+			"Failed to decode outgoing snapshot for listing",
+			err,
+			slog.String("session_id", summary.SessionID.String()),
+		)
+	}
+}
+
+// FillOutgoingSummary fills consumed inputs and retry diagnostics from one
+// outgoing snapshot. On decode failure the caller can retain coarse metadata.
+// Status RPCs use this only after selecting a bounded page from the database.
+func FillOutgoingSummary(summary *SessionSummary,
+	record *clientdb.OORSessionRegistryRecord) error {
+
 	if record.Direction != clientdb.OORSessionDirectionOutgoing ||
 		len(record.SnapshotData) == 0 {
-		return
+		return nil
 	}
-
 	snapshot, err := decodeOutgoingSnapshot(record.SnapshotData)
 	if err != nil {
-		r.logger(ctx).WarnS(ctx,
-			"Failed to decode outgoing snapshot for listing", err,
-			slog.String(
-				"session_id", summary.SessionID.String(),
-			),
-		)
-
-		return
+		return err
 	}
 
 	for i := range snapshot.TransferInputSnapshots {
@@ -1641,6 +1649,8 @@ func (r *oorRegistryBehavior) fillOutgoingSummary(ctx context.Context,
 	if summary.RetryReason == "" {
 		summary.RetryReason = snapshot.FailReason
 	}
+
+	return nil
 }
 
 // routeAsk forwards a request to a session's child. With a detachable caller
