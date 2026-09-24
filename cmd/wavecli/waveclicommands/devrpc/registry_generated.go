@@ -253,7 +253,7 @@ func generatedRegistry() []serviceSpec {
 					Aliases:  []string{"list-oor-sessions"},
 					Input:    "waverpc.ListOORSessionsRequest",
 					Output:   "waverpc.ListOORSessionsResponse",
-					Comments: "ListOORSessions returns locally known out-of-round transfer sessions.\nPending and failed sessions come from the durable OOR actor; completed\nsessions come from persisted OOR package artifacts.",
+					Comments: "ListOORSessions returns locally known out-of-round transfer sessions,\nnewest first by creation time, with stored session bytes breaking ties.\nPending and failed sessions come from the durable OOR actor; completed\nsessions come from persisted OOR package artifacts.",
 				},
 				{
 					Name:     "GetOORSession",

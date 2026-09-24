@@ -201,7 +201,8 @@ service DaemonService {
     // the client disconnects.
     rpc WatchRounds (WatchRoundsRequest) returns (stream WatchRoundsResponse);
 
-    // ListOORSessions returns locally known out-of-round transfer sessions.
+    // ListOORSessions returns locally known out-of-round transfer sessions,
+    // newest first by creation time, with stored session bytes breaking ties.
     // Pending and failed sessions come from the durable OOR actor; completed
     // sessions come from persisted OOR package artifacts.
     rpc ListOORSessions (ListOORSessionsRequest)
@@ -2136,8 +2137,8 @@ message OORSessionInfo {
     // phase is the detailed OOR FSM phase string.
     string phase = 4;
 
-    // created_at is the Unix timestamp when the persisted package was first
-    // recorded, when known.
+    // created_at is the session creation time in Unix seconds. Package-only
+    // history uses the time the package was first recorded.
     int64 created_at = 5;
 
     // updated_at is the Unix timestamp when the session/package was last
@@ -2160,7 +2161,8 @@ message ListOORSessionsRequest {
     int32 page_size = 1;
 
     // page_token is an opaque session cursor returned by a previous
-    // ListOORSessionsResponse.
+    // ListOORSessionsResponse. Cursors from the older session-ID ordering
+    // are rejected; restart with an empty token after upgrading.
     string page_token = 2;
 
     // direction_filter restricts results by local direction when set.
@@ -2171,7 +2173,7 @@ message ListOORSessionsRequest {
 }
 
 message ListOORSessionsResponse {
-    // sessions lists locally known OOR operation status entries.
+    // sessions lists locally known OOR operation status entries, newest first.
     repeated OORSessionInfo sessions = 1;
 
     // next_page_token is an opaque cursor for the next page. Empty when

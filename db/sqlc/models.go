@@ -230,11 +230,33 @@ type OorPackageDirection struct {
 	Name      string
 }
 
+type OorPackageStatus struct {
+	SessionID  []byte
+	Direction  int32
+	Status     int32
+	Phase      string
+	LastError  string
+	CreatedAt  int64
+	UpdatedAt  int64
+	HasPackage int32
+}
+
 type OorRecipientCursor struct {
 	RecipientPkScript []byte
 	LastEventID       int64
 	UpdatedAt         int64
 	LastSessionID     []byte
+}
+
+type OorRegistryStatus struct {
+	SessionID  []byte
+	Direction  int32
+	Status     int32
+	Phase      string
+	LastError  string
+	CreatedAt  int64
+	UpdatedAt  int64
+	HasPackage int32
 }
 
 type OorSessionRegistry struct {
@@ -250,6 +272,17 @@ type OorSessionRegistry struct {
 	FlowVersion     int32
 	CreatedAt       int64
 	UpdatedAt       int64
+}
+
+type OorStatus struct {
+	SessionID  []byte
+	Direction  int32
+	Status     int32
+	Phase      string
+	LastError  string
+	CreatedAt  int64
+	UpdatedAt  int64
+	HasPackage int32
 }
 
 type OorVtxoBinding struct {

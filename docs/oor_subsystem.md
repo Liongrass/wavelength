@@ -229,3 +229,46 @@ systest; and the drip-box / receive-throughput benchmarks — all with tests.
 - [`oor/CLAUDE.md`](../oor/CLAUDE.md) — package types and invariants.
 - [`docs/durable_actor_architecture.md`](durable_actor_architecture.md) — the
   CDC pattern, leases, and recovery the actor builds on.
+
+## Bounded status reads
+
+`ListOORSessions` and `GetOORSession` read the durable registry directly, the
+same source used by the registry actor's diagnostic summaries. Status remains
+available while that actor is starting or unavailable. A finalized package
+wins over registry status and direction, including an outgoing transfer whose
+change output is later observed by an incoming session with the same ID.
+
+Migration 25 adds scalar status views and indexes on `(created_at, session_id)`.
+`ListOORSessions` returns newest sessions first, with descending stored session
+bytes breaking timestamp ties. Registry creation time is authoritative; only
+package-only history uses the package creation time. Completing a registered
+session does not move it to the top. Registry-only sessions now expose their
+persisted timestamps rather than zero.
+
+The list query filters two disjoint sources: registry sessions with package
+metadata overrides, and packages that have no registry entry. Each source
+selects at most `page_size + 1` entries before the final ordered merge and
+limit. When the registry supplies a full candidate page, its oldest creation
+time becomes a lower bound for the package search: older packages cannot
+outrank the registry candidates. The bound includes timestamp ties so the
+session ID can decide their order. A partial registry page leaves the package
+search unrestricted to fill the page from older package-only history.
+
+This bounds payload reads and merge memory and avoids walking old overlapping
+packages when the registry fills the page. Filters, timestamp ties, skewed
+package/session dates and partial registry pages can still require additional
+scalar index work. No writer-maintained projection is added.
+
+The opaque versioned cursor contains both creation time and session ID, so it
+can resume even if the referenced row no longer exists. Legacy ID-only cursors
+are rejected with `InvalidArgument`; callers must restart with an empty token.
+Newer insertions do not shift continuation pages. Each request uses one read
+transaction, but pagination across requests is not a historical snapshot.
+
+Only selected sessions load bindings and, when needed for outgoing input or
+retry diagnostics, a registry snapshot. Status reads never load Ark PSBTs or
+checkpoint rows. A point lookup uses the existing session primary keys.
+Payload reads and the final merge are bounded by page size; selective filters
+may still examine scalar index entries that do not match. The indexes cost
+one build over existing history during migration and normal index maintenance
+on subsequent writes. This does not change transfer state or wire messages.

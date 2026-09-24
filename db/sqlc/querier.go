@@ -129,11 +129,14 @@ type Querier interface {
 	GetMacaroonRootKey(ctx context.Context, id []byte) (Macaroon, error)
 	GetOORDispatchAttemptByIdempotencyKey(ctx context.Context, idempotencyKey string) (OorDispatchAttempt, error)
 	GetOORDispatchAttemptBySessionID(ctx context.Context, sessionID []byte) (OorDispatchAttempt, error)
+	// Incoming snapshots cannot contribute outgoing input or retry diagnostics.
+	GetOOROutgoingStatusSnapshot(ctx context.Context, sessionID []byte) (OorSessionRegistry, error)
 	GetOORPackage(ctx context.Context, sessionID []byte) (OorPackage, error)
 	GetOORPackageByOutpoint(ctx context.Context, arg GetOORPackageByOutpointParams) (GetOORPackageByOutpointRow, error)
 	GetOORPackageByOutpointAndKind(ctx context.Context, arg GetOORPackageByOutpointAndKindParams) (GetOORPackageByOutpointAndKindRow, error)
 	GetOORRecipientCursor(ctx context.Context, recipientPkScript []byte) (OorRecipientCursor, error)
 	GetOORSessionRegistry(ctx context.Context, sessionID []byte) (OorSessionRegistry, error)
+	GetOORStatus(ctx context.Context, sessionID []byte) (OorStatus, error)
 	GetOORVTXOBindingByOutpoint(ctx context.Context, arg GetOORVTXOBindingByOutpointParams) (OorVtxoBinding, error)
 	GetOORVTXOBindingByOutpointAndKind(ctx context.Context, arg GetOORVTXOBindingByOutpointAndKindParams) (OorVtxoBinding, error)
 	GetOwnedReceiveScript(ctx context.Context, pkScript []byte) (OwnedReceiveScript, error)
@@ -369,6 +372,11 @@ type Querier interface {
 	ListOORPackages(ctx context.Context) ([]OorPackage, error)
 	ListOORPackagesByDirection(ctx context.Context, direction int32) ([]OorPackage, error)
 	ListOORRecipientCursors(ctx context.Context) ([]OorRecipientCursor, error)
+	// Bound both ordered sources before the final merge, including SQLite where
+	// an outer LIMIT alone would sort the entire UNION result.
+	// A full registry page already outranks every older package. Keep timestamp
+	// ties for the ID tie-breaker; a partial page must still search older history.
+	ListOORStatus(ctx context.Context, arg ListOORStatusParams) ([]ListOORStatusRow, error)
 	ListOORVTXOBindingsBySession(ctx context.Context, sessionID []byte) ([]ListOORVTXOBindingsBySessionRow, error)
 	ListOwnedReceiveScripts(ctx context.Context) ([]OwnedReceiveScript, error)
 	// Only status = 'pending' rows replay; a 'failed' intent is terminally

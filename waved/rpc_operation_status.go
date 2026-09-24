@@ -3,9 +3,13 @@ package waved
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -95,7 +99,7 @@ func (r *RPCServer) ListOORSessions(ctx context.Context,
 		return nil, err
 	}
 
-	page, nextToken := pageOORSessions(sessions, req.PageToken, pageSize)
+	page, nextToken := pageOORSessions(sessions, pageSize)
 
 	return &waverpc.ListOORSessionsResponse{
 		Sessions:      page,
@@ -124,120 +128,131 @@ func (r *RPCServer) GetOORSession(ctx context.Context,
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	normalizedID := sessionID.String()
 
-	listReq := &waverpc.ListOORSessionsRequest{}
-	sessions, err := r.listOORSessions(ctx, listReq)
+	store := r.newOORStatusStore()
+	if store == nil {
+		return nil, status.Error(
+			codes.NotFound, "OOR session not found",
+		)
+	}
+	summary, err := store.Get(ctx, sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, status.Error(
+			codes.NotFound, "OOR session not found",
+		)
+	}
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to get OOR "+
+			"session: %v", err)
 	}
 
-	for _, session := range sessions {
-		if session.GetSessionId() == normalizedID {
-			return &waverpc.GetOORSessionResponse{
-				Session: session,
-			}, nil
-		}
-	}
-
-	return nil, status.Error(codes.NotFound, "OOR session not found")
+	return &waverpc.GetOORSessionResponse{
+		Session: r.oorStatusToProto(ctx, summary),
+	}, nil
 }
 
-// listOORSessions merges actor summaries and persisted package artifacts.
+// newOORStatusStore reads the same durable registry state the OOR actor uses
+// for summaries, together with authoritative package metadata.
+func (r *RPCServer) newOORStatusStore() *db.OORStatusStore {
+	if r.server.db == nil {
+		return nil
+	}
+
+	return db.NewOORStatusStore(
+		db.NewStore(
+			r.server.db.DB, r.server.db.Queries,
+			r.server.db.Backend(), r.server.log,
+		),
+	)
+}
+
+// listOORSessions selects one merged, filtered page plus a lookahead row.
+// It never asks the actor to scan retained terminal snapshots.
 func (r *RPCServer) listOORSessions(ctx context.Context,
 	req *waverpc.ListOORSessionsRequest) ([]*waverpc.OORSessionInfo,
 	error) {
 
-	if req == nil {
-		req = &waverpc.ListOORSessionsRequest{}
-	}
-
-	allReq := &waverpc.ListOORSessionsRequest{}
-	live, err := r.queryOORSessionSummaries(ctx, allReq)
+	cursor, err := decodeOORStatusCursor(req.GetPageToken())
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.InvalidArgument, "invalid "+
+			"page_token: %v; restart pagination with an empty "+
+			"page_token", err)
 	}
-
-	persisted, err := r.queryPersistedOORSessions(ctx, req)
+	store := r.newOORStatusStore()
+	if store == nil {
+		return nil, nil
+	}
+	direction := db.OORSessionDirection(req.GetDirectionFilter())
+	statusFilter := int32(req.GetStatusFilter()) - 1
+	pageSize := req.GetPageSize()
+	if pageSize <= 0 {
+		pageSize = defaultListOORSessionsPageSize
+	}
+	summaries, err := store.List(
+		ctx, cursor, direction, statusFilter, int64(pageSize)+1,
+	)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to list OOR "+
+			"sessions: %v", err)
 	}
-
-	if shouldQueryPersistedOORLiveOverlay(req) {
-		overlay, err := r.queryPersistedOORSessionsForLive(ctx, live)
-		if err != nil {
-			return nil, err
-		}
-
-		persisted = append(persisted, overlay...)
-	}
-
-	return mergeOORSessionLists(live, persisted, req), nil
-}
-
-// mergeOORSessionLists combines actor and package-store views for OOR status.
-func mergeOORSessionLists(live, persisted []*waverpc.OORSessionInfo,
-	req *waverpc.ListOORSessionsRequest) []*waverpc.OORSessionInfo {
-
-	if req == nil {
-		req = &waverpc.ListOORSessionsRequest{}
-	}
-
-	merged := make(map[string]*waverpc.OORSessionInfo)
-
-	for _, session := range persisted {
-		merged[session.GetSessionId()] = session
-	}
-
-	for _, session := range live {
-		if existing, ok := merged[session.GetSessionId()]; ok {
-			mergeOORSessionInfo(existing, session)
-			continue
-		}
-
-		merged[session.GetSessionId()] = session
-	}
-
-	sessions := make([]*waverpc.OORSessionInfo, 0, len(merged))
-	for _, session := range merged {
-		if !oorSessionMatchesFilters(session, req) {
-			continue
-		}
-
-		sessions = append(sessions, session)
-	}
-
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].GetSessionId() < sessions[j].GetSessionId()
-	})
-
-	return sessions
-}
-
-// mergeOORSessionInfo fills artifact-backed fields missing from live state.
-func mergeOORSessionInfo(dst *waverpc.OORSessionInfo,
-	src *waverpc.OORSessionInfo) {
-
-	if dst == nil || src == nil {
-		return
-	}
-
-	if dst.CreatedAt == 0 {
-		dst.CreatedAt = src.GetCreatedAt()
-	}
-	if dst.UpdatedAt == 0 {
-		dst.UpdatedAt = src.GetUpdatedAt()
-	}
-	if len(dst.ConsumedOutpoints) == 0 {
-		dst.ConsumedOutpoints = append(
-			[]string(nil), src.GetConsumedOutpoints()...,
+	sessions := make([]*waverpc.OORSessionInfo, 0, len(summaries))
+	for i := range summaries {
+		sessions = append(
+			sessions, r.oorStatusToProto(ctx, &summaries[i]),
 		)
 	}
-	if len(dst.CreatedOutpoints) == 0 {
-		dst.CreatedOutpoints = append(
-			[]string(nil), src.GetCreatedOutpoints()...,
-		)
+
+	return sessions, nil
+}
+
+// oorStatusToProto projects metadata and only the selected session's details.
+// Persisted artifacts override the registry's direction, phase and status.
+func (r *RPCServer) oorStatusToProto(ctx context.Context,
+	summary *db.OORStatusSummary) *waverpc.OORSessionInfo {
+
+	row := summary.Metadata
+	info := &waverpc.OORSessionInfo{
+		SessionId:     chainhash.Hash(row.SessionID).String(),
+		Direction:     waverpc.OORSessionDirection(row.Direction),
+		Status:        waverpc.OORSessionStatus(row.Status + 1),
+		Phase:         row.Phase,
+		FailureReason: row.LastError,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
+		ConsumedOutpoints: outpointsToStrings(
+			summary.ConsumedOutpoints,
+		),
+		CreatedOutpoints: outpointsToStrings(summary.CreatedOutpoints),
 	}
+	if summary.Registry != nil {
+		live := oor.SessionSummary{
+			RetryReason: summary.Registry.LastError,
+		}
+		// Keep the existing coarse status fallback for malformed
+		// diagnostic snapshots; they do not invalidate a persisted
+		// completion.
+		if err := oor.FillOutgoingSummary(
+			&live, summary.Registry,
+		); err != nil {
+
+			r.server.log.WarnS(
+				ctx,
+				"Failed to decode outgoing snapshot for listing",
+				err,
+				slog.String("session_id", info.SessionId),
+			)
+		}
+		if len(info.ConsumedOutpoints) == 0 {
+			info.ConsumedOutpoints = outpointsToStrings(
+				live.InputOutpoints,
+			)
+		}
+		if row.HasPackage == 0 {
+			info.FailureReason = live.RetryReason
+		}
+	}
+
+	return info
 }
 
 // queryOORSessionSummaries fetches live OOR summaries from the actor.
@@ -293,119 +308,6 @@ func (r *RPCServer) queryOORSessionSummaries(ctx context.Context,
 	}
 
 	return out, nil
-}
-
-// queryPersistedOORSessions fetches completed package status from disk.
-func (r *RPCServer) queryPersistedOORSessions(ctx context.Context,
-	req *waverpc.ListOORSessionsRequest) ([]*waverpc.OORSessionInfo,
-	error) {
-
-	if !shouldListPersistedOORPackages(req) {
-		return nil, nil
-	}
-
-	store := r.newLocalOORArtifactStore()
-	if store == nil {
-		return nil, nil
-	}
-
-	direction := protoToPackageDirection(req.GetDirectionFilter())
-	packages, err := store.ListPackages(ctx, direction)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list "+
-			"persisted OOR packages: %v", err)
-	}
-
-	out := make([]*waverpc.OORSessionInfo, 0, len(packages))
-	for _, pkg := range packages {
-		info := oorPackageToProto(pkg)
-		if !oorSessionMatchesFilters(info, req) {
-			continue
-		}
-
-		out = append(out, info)
-	}
-
-	return out, nil
-}
-
-// queryPersistedOORSessionsForLive fetches persisted package entries only for
-// live actor sessions. This preserves artifact-backed corrections for filtered
-// list calls without forcing every pending or failed query to materialize the
-// full package store.
-func (r *RPCServer) queryPersistedOORSessionsForLive(ctx context.Context,
-	live []*waverpc.OORSessionInfo) ([]*waverpc.OORSessionInfo, error) {
-
-	if len(live) == 0 {
-		return nil, nil
-	}
-
-	store := r.newLocalOORArtifactStore()
-	if store == nil {
-		return nil, nil
-	}
-
-	seen := make(map[string]struct{}, len(live))
-	out := make([]*waverpc.OORSessionInfo, 0, len(live))
-	for _, session := range live {
-		sessionID := session.GetSessionId()
-		if _, ok := seen[sessionID]; ok {
-			continue
-		}
-		seen[sessionID] = struct{}{}
-
-		hash, err := parseOORSessionID(sessionID)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "parse live "+
-				"OOR session id: %v", err)
-		}
-
-		pkg, err := store.GetPackage(ctx, hash)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to "+
-				"get persisted OOR package: %v", err)
-		}
-
-		out = append(out, oorPackageToProto(pkg))
-	}
-
-	return out, nil
-}
-
-// shouldListPersistedOORPackages reports whether a list request can include
-// completed package entries from a bounded store scan.
-func shouldListPersistedOORPackages(req *waverpc.ListOORSessionsRequest) bool {
-	switch req.GetStatusFilter() {
-	case waverpc.OORSessionStatus_OOR_SESSION_STATUS_PENDING,
-		waverpc.OORSessionStatus_OOR_SESSION_STATUS_FAILED:
-		return false
-
-	default:
-		return true
-	}
-}
-
-// shouldQueryPersistedOORLiveOverlay reports whether live summaries need
-// targeted package lookups before final filter evaluation.
-func shouldQueryPersistedOORLiveOverlay(
-	req *waverpc.ListOORSessionsRequest) bool {
-
-	if req.GetDirectionFilter() != waverpc.
-		OORSessionDirection_OOR_SESSION_DIRECTION_UNSPECIFIED {
-		return true
-	}
-
-	switch req.GetStatusFilter() {
-	case waverpc.OORSessionStatus_OOR_SESSION_STATUS_PENDING,
-		waverpc.OORSessionStatus_OOR_SESSION_STATUS_FAILED:
-		return true
-
-	default:
-		return false
-	}
 }
 
 // roundSummaryToProto converts one persisted round summary to waverpc.
@@ -517,44 +419,6 @@ func oorSessionSummaryToProto(
 	}
 }
 
-// oorPackageToProto converts one persisted OOR package artifact to waverpc.
-func oorPackageToProto(pkg *db.OORPackageBundle) *waverpc.OORSessionInfo {
-	if pkg == nil {
-		return nil
-	}
-
-	completed := waverpc.OORSessionStatus_OOR_SESSION_STATUS_COMPLETED
-	info := &waverpc.OORSessionInfo{
-		SessionId: pkg.SessionID.String(),
-		Direction: packageDirectionToProto(pkg.Direction),
-		Status:    completed,
-		Phase:     "completed",
-		CreatedAt: pkg.CreatedAt.Unix(),
-		UpdatedAt: pkg.UpdatedAt.Unix(),
-	}
-
-	for _, binding := range pkg.Bindings {
-		switch binding.LinkKind {
-		case db.OORPackageLinkKindConsumedInput:
-			info.ConsumedOutpoints = append(
-				info.ConsumedOutpoints,
-				binding.Outpoint.String(),
-			)
-
-		case db.OORPackageLinkKindCreatedOutput:
-			info.CreatedOutpoints = append(
-				info.CreatedOutpoints,
-				binding.Outpoint.String(),
-			)
-		}
-	}
-
-	sort.Strings(info.ConsumedOutpoints)
-	sort.Strings(info.CreatedOutpoints)
-
-	return info
-}
-
 // oorSessionMatchesFilters reports whether a session should be returned.
 func oorSessionMatchesFilters(info *waverpc.OORSessionInfo,
 	req *waverpc.ListOORSessionsRequest) bool {
@@ -579,32 +443,47 @@ func oorSessionMatchesFilters(info *waverpc.OORSessionInfo,
 	return true
 }
 
-// pageOORSessions slices sorted OOR sessions using a session-id cursor.
-func pageOORSessions(sessions []*waverpc.OORSessionInfo, pageToken string,
+// pageOORSessions trims the lookahead row and encodes the last returned key.
+// SQL already applied the cursor and deterministic creation-time ordering.
+func pageOORSessions(sessions []*waverpc.OORSessionInfo,
 	pageSize int32) ([]*waverpc.OORSessionInfo, string) {
 
-	start := 0
-	if pageToken != "" {
-		for i, session := range sessions {
-			if session.GetSessionId() > pageToken {
-				start = i
-				break
-			}
-			start = i + 1
-		}
+	if len(sessions) <= int(pageSize) {
+		return sessions, ""
+	}
+	page := sessions[:pageSize]
+	last := page[len(page)-1]
+	token := fmt.Sprintf("v1:%d:%s", last.CreatedAt, last.SessionId)
+
+	return page, base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+
+// decodeOORStatusCursor accepts only the creation-time cursor format. Legacy
+// ID-only cursors use another ordering and must restart rather than skip rows.
+func decodeOORStatusCursor(token string) (*db.OORStatusCursor, error) {
+	if token == "" {
+		return nil, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return nil, fmt.Errorf("malformed cursor encoding")
+	}
+	parts := strings.Split(string(data), ":")
+	if len(parts) != 3 || parts[0] != "v1" || len(parts[2]) != 64 {
+		return nil, fmt.Errorf("unsupported cursor format")
+	}
+	createdAt, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("malformed cursor timestamp")
+	}
+	id, err := chainhash.NewHashFromStr(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("malformed cursor session ID")
 	}
 
-	end := start + int(pageSize)
-	if end > len(sessions) {
-		end = len(sessions)
-	}
-
-	page := sessions[start:end]
-	if end >= len(sessions) {
-		return page, ""
-	}
-
-	return page, page[len(page)-1].GetSessionId()
+	return &db.OORStatusCursor{
+		CreatedAt: createdAt, SessionID: *id,
+	}, nil
 }
 
 // outpointsToStrings converts wire outpoints to their canonical strings.
@@ -645,45 +524,6 @@ func oorDirectionToProto(
 			OORSessionDirection_OOR_SESSION_DIRECTION_OUTGOING
 
 	case oor.SessionDirectionIncoming:
-		return waverpc.
-			OORSessionDirection_OOR_SESSION_DIRECTION_INCOMING
-
-	default:
-		return waverpc.
-			OORSessionDirection_OOR_SESSION_DIRECTION_UNSPECIFIED
-	}
-}
-
-// protoToPackageDirection maps an optional daemon RPC direction filter.
-func protoToPackageDirection(
-	direction waverpc.OORSessionDirection) *db.OORPackageDirection {
-
-	switch direction {
-	case waverpc.OORSessionDirection_OOR_SESSION_DIRECTION_OUTGOING:
-		outgoing := db.OORPackageDirectionOutgoing
-
-		return &outgoing
-
-	case waverpc.OORSessionDirection_OOR_SESSION_DIRECTION_INCOMING:
-		incoming := db.OORPackageDirectionIncoming
-
-		return &incoming
-
-	default:
-		return nil
-	}
-}
-
-// packageDirectionToProto maps persisted OOR package direction to RPC.
-func packageDirectionToProto(
-	direction db.OORPackageDirection) waverpc.OORSessionDirection {
-
-	switch direction {
-	case db.OORPackageDirectionOutgoing:
-		return waverpc.
-			OORSessionDirection_OOR_SESSION_DIRECTION_OUTGOING
-
-	case db.OORPackageDirectionIncoming:
 		return waverpc.
 			OORSessionDirection_OOR_SESSION_DIRECTION_INCOMING
 

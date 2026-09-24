@@ -220,7 +220,8 @@ type DaemonServiceClient interface {
 	// round state updates as they occur. The stream stays open until
 	// the client disconnects.
 	WatchRounds(ctx context.Context, in *WatchRoundsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchRoundsResponse], error)
-	// ListOORSessions returns locally known out-of-round transfer sessions.
+	// ListOORSessions returns locally known out-of-round transfer sessions,
+	// newest first by creation time, with stored session bytes breaking ties.
 	// Pending and failed sessions come from the durable OOR actor; completed
 	// sessions come from persisted OOR package artifacts.
 	ListOORSessions(ctx context.Context, in *ListOORSessionsRequest, opts ...grpc.CallOption) (*ListOORSessionsResponse, error)
@@ -907,7 +908,8 @@ type DaemonServiceServer interface {
 	// round state updates as they occur. The stream stays open until
 	// the client disconnects.
 	WatchRounds(*WatchRoundsRequest, grpc.ServerStreamingServer[WatchRoundsResponse]) error
-	// ListOORSessions returns locally known out-of-round transfer sessions.
+	// ListOORSessions returns locally known out-of-round transfer sessions,
+	// newest first by creation time, with stored session bytes breaking ties.
 	// Pending and failed sessions come from the durable OOR actor; completed
 	// sessions come from persisted OOR package artifacts.
 	ListOORSessions(context.Context, *ListOORSessionsRequest) (*ListOORSessionsResponse, error)
