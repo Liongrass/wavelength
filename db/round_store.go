@@ -1674,17 +1674,33 @@ func vtxoRequestToRoundParams(ctx context.Context, q RoundStore, now int64,
 			"encode VTXO policy template: %w", err)
 	}
 
+	// Refresh siblings can share a script. Preserve their source identity
+	// instead of trying to reconstruct a pairing from scripts after
+	// restart.
+	var sourceHash []byte
+	var sourceIndex sql.NullInt64
+	if req.RefreshSourceOutpoint != nil {
+		sourceHash = req.RefreshSourceOutpoint.Hash[:]
+		sourceIndex = sql.NullInt64{
+			Int64: int64(req.RefreshSourceOutpoint.Index),
+			Valid: true,
+		}
+	}
+
 	return sqlc.InsertRoundVtxoRequestParams{
-		RoundID:        roundID,
-		RequestIndex:   int32(requestIndex),
-		Amount:         int64(req.Amount),
-		PkScript:       pkScript,
-		Expiry:         expiry,
-		PolicyTemplate: policyTemplate,
-		ClientPubkey:   clientPubkey,
-		OperatorPubkey: operatorPubkey,
-		OwnerKeyID:     ownerKeyID,
-		SigningKeyID:   signingKeyID,
+		RoundID:            roundID,
+		RequestIndex:       int32(requestIndex),
+		Amount:             int64(req.Amount),
+		PkScript:           pkScript,
+		Expiry:             expiry,
+		PolicyTemplate:     policyTemplate,
+		ClientPubkey:       clientPubkey,
+		OperatorPubkey:     operatorPubkey,
+		OwnerKeyID:         ownerKeyID,
+		SigningKeyID:       signingKeyID,
+		Origin:             int32(req.Origin),
+		RefreshSourceHash:  sourceHash,
+		RefreshSourceIndex: sourceIndex,
 	}, nil
 }
 
@@ -1736,15 +1752,29 @@ func dbVtxoRequestRowToVTXORequest(ctx context.Context, q RoundStore,
 		ownerKey = desc
 	}
 
+	var refreshSource *wire.OutPoint
+	if t.RefreshSourceIndex.Valid {
+		hash, err := chainhash.NewHash(t.RefreshSourceHash)
+		if err != nil {
+			return nil, fmt.Errorf("decode refresh source: %w", err)
+		}
+		refreshSource = &wire.OutPoint{
+			Hash:  *hash,
+			Index: uint32(t.RefreshSourceIndex.Int64),
+		}
+	}
+
 	return &types.VTXORequest{
-		Amount:         btcutil.Amount(t.Amount),
-		PolicyTemplate: bytes.Clone(t.PolicyTemplate),
-		PkScript:       bytes.Clone(t.PkScript),
-		ClientKey:      clientPubkey,
-		OwnerKey:       ownerKey,
-		Expiry:         uint32(t.Expiry),
-		OperatorKey:    operatorPubkey,
-		SigningKey:     signingKey,
+		Amount:                btcutil.Amount(t.Amount),
+		PolicyTemplate:        bytes.Clone(t.PolicyTemplate),
+		PkScript:              bytes.Clone(t.PkScript),
+		ClientKey:             clientPubkey,
+		OwnerKey:              ownerKey,
+		Expiry:                uint32(t.Expiry),
+		OperatorKey:           operatorPubkey,
+		SigningKey:            signingKey,
+		Origin:                types.VTXOOrigin(t.Origin),
+		RefreshSourceOutpoint: refreshSource,
 	}, nil
 }
 

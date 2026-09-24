@@ -1319,7 +1319,15 @@ CREATE TABLE round_vtxo_requests (
 
     -- signing_key_id references the internal_keys registry row for the
     -- signing descriptor (signing_pubkey paired with its lnd KeyLocator).
-    signing_key_id BIGINT REFERENCES internal_keys(id),
+    signing_key_id BIGINT REFERENCES internal_keys(id), origin INTEGER NOT NULL DEFAULT 0
+    CHECK (origin BETWEEN 0 AND 4), refresh_source_hash BLOB
+    CHECK (refresh_source_hash IS NULL OR length(refresh_source_hash) = 32), refresh_source_index BIGINT
+    CHECK (
+        (refresh_source_hash IS NULL AND refresh_source_index IS NULL)
+        OR
+        (refresh_source_hash IS NOT NULL AND refresh_source_index IS NOT NULL
+         AND refresh_source_index BETWEEN 0 AND 4294967295)
+    ),
 
     PRIMARY KEY (round_id, request_index),
     FOREIGN KEY (round_id) REFERENCES rounds(round_id) ON DELETE CASCADE
