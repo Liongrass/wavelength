@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -75,12 +76,7 @@ func (m AskResponse) Encode(w io.Writer) error {
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return err
-	}
-
-	return stream.Encode(w)
+	return tlvutil.EncodeRecords(w, records...)
 }
 
 // Decode deserializes the message from the provided reader.
@@ -103,12 +99,7 @@ func (m *AskResponse) Decode(r io.Reader) error {
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return err
-	}
-
-	if _, err := stream.DecodeWithParsedTypes(r); err != nil {
+	if _, err := tlvutil.DecodeRecords(r, records...); err != nil {
 		return err
 	}
 

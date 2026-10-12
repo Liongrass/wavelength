@@ -1,7 +1,6 @@
 package oor
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 
@@ -9,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	oortx "github.com/lightninglabs/wavelength/lib/tx/oor"
 	mailboxrpc "github.com/lightninglabs/wavelength/mailbox/rpc"
 	"github.com/lightninglabs/wavelength/rpc/oorpb"
@@ -571,6 +571,8 @@ func protoEnvelope(typeName string, payload []byte) proto.Message {
 	}
 }
 
+// encodeRetryPayload persists the stable retry identity for an outgoing actor
+// effect.
 func encodeRetryPayload(after time.Duration, reason string) ([]byte, error) {
 	if after < 0 {
 		return nil, fmt.Errorf("retry delay must be non-negative")
@@ -588,15 +590,5 @@ func encodeRetryPayload(after time.Duration, reason string) ([]byte, error) {
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := stream.Encode(&buf); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return tlvutil.EncodeRecordsToBytes(records...)
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/wavelength/baselib/actor"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	mailboxconn "github.com/lightninglabs/wavelength/mailbox/conn"
 	mailboxpb "github.com/lightninglabs/wavelength/mailbox/pb"
 	mailboxrpc "github.com/lightninglabs/wavelength/mailbox/rpc"
@@ -270,15 +271,10 @@ func (m *SendClientEventRequest) Encode(w io.Writer) error {
 		corrKeyBytes,
 	)
 
-	stream, err := tlv.NewStream(
-		payload.Record(), msgIDRec.Record(), idemRec.Record(),
+	return tlvutil.EncodeRecords(
+		w, payload.Record(), msgIDRec.Record(), idemRec.Record(),
 		svcRec.Record(), methodRec.Record(), corrKeyRec.Record(),
 	)
-	if err != nil {
-		return err
-	}
-
-	return stream.Encode(w)
 }
 
 // Decode deserializes the message from the provided reader. The proto payload
@@ -297,15 +293,10 @@ func (m *SendClientEventRequest) Decode(r io.Reader) error {
 	methodRec := tlv.ZeroRecordT[rpcMethodRecordTLV, []byte]()
 	corrKeyRec := tlv.ZeroRecordT[correlationKeyRecordTLV, []byte]()
 
-	stream, err := tlv.NewStream(
-		payload.Record(), msgIDRec.Record(), idemRec.Record(),
+	if _, err := tlvutil.DecodeRecords(
+		r, payload.Record(), msgIDRec.Record(), idemRec.Record(),
 		svcRec.Record(), methodRec.Record(), corrKeyRec.Record(),
-	)
-	if err != nil {
-		return err
-	}
-
-	if _, err := stream.DecodeWithParsedTypes(r); err != nil {
+	); err != nil {
 		return err
 	}
 
@@ -443,12 +434,7 @@ func (m *SendRPCRequest) Encode(w io.Writer) error {
 		},
 	)
 
-	stream, err := tlv.NewStream(envRec.Record())
-	if err != nil {
-		return err
-	}
-
-	return stream.Encode(w)
+	return tlvutil.EncodeRecords(w, envRec.Record())
 }
 
 // Decode deserializes the message from the provided reader.
@@ -459,12 +445,7 @@ func (m *SendRPCRequest) Decode(r io.Reader) error {
 	]()
 	envRec.Val.Val = &mailboxpb.Envelope{}
 
-	stream, err := tlv.NewStream(envRec.Record())
-	if err != nil {
-		return err
-	}
-
-	if _, err := stream.DecodeWithParsedTypes(r); err != nil {
+	if _, err := tlvutil.DecodeRecords(r, envRec.Record()); err != nil {
 		return err
 	}
 
@@ -591,15 +572,10 @@ func (m *SendUnaryRequest) Encode(w io.Writer) error {
 		[]byte(m.CorrelationID),
 	)
 
-	stream, err := tlv.NewStream(
-		bodyRec.Record(), msgIDRec.Record(), idemRec.Record(),
+	return tlvutil.EncodeRecords(
+		w, bodyRec.Record(), msgIDRec.Record(), idemRec.Record(),
 		svcRec.Record(), methodRec.Record(), corrRec.Record(),
 	)
-	if err != nil {
-		return err
-	}
-
-	return stream.Encode(w)
 }
 
 // Decode deserializes the message from the provided reader.
@@ -616,15 +592,10 @@ func (m *SendUnaryRequest) Decode(r io.Reader) error {
 	methodRec := tlv.ZeroRecordT[rpcMethodRecordTLV, []byte]()
 	corrRec := tlv.ZeroRecordT[rpcCorrelationRecordTLV, []byte]()
 
-	stream, err := tlv.NewStream(
-		bodyRec.Record(), msgIDRec.Record(), idemRec.Record(),
+	if _, err := tlvutil.DecodeRecords(
+		r, bodyRec.Record(), msgIDRec.Record(), idemRec.Record(),
 		svcRec.Record(), methodRec.Record(), corrRec.Record(),
-	)
-	if err != nil {
-		return err
-	}
-
-	if _, err := stream.DecodeWithParsedTypes(r); err != nil {
+	); err != nil {
 		return err
 	}
 

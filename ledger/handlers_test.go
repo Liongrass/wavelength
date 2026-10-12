@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
@@ -2804,7 +2805,7 @@ func TestVTXOSentMsgProceedsFlagRoundTrips(t *testing.T) {
 		sessionID      = make([]byte, 32)
 		amountSat      = uint64(20_000)
 		roundID        = make([]byte, 16)
-		outpoint       = outpointRecord{}
+		outpoint       = wire.OutPoint{}
 		idempotencyKey = []byte("legacy-leave-key")
 	)
 	roundID[0] = 0x8b
@@ -2813,7 +2814,7 @@ func TestVTXOSentMsgProceedsFlagRoundTrips(t *testing.T) {
 		tlv.MakePrimitiveRecord(vtxoSentSessionIDType, &sessionID),
 		tlv.MakePrimitiveRecord(vtxoSentAmountSatType, &amountSat),
 		tlv.MakePrimitiveRecord(vtxoSentRoundIDType, &roundID),
-		makeOutpointRecord(vtxoSentOutpointType, &outpoint),
+		tlvutil.OutPointRecord(vtxoSentOutpointType, &outpoint),
 		tlv.MakePrimitiveRecord(
 			vtxoSentIdempotencyType, &idempotencyKey,
 		),
