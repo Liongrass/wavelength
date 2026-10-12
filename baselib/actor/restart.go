@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -75,12 +76,7 @@ func (m *RestartMessage) Encode(w io.Writer) error {
 		tlv.MakePrimitiveRecord(9, &updatedAt),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return err
-	}
-
-	return stream.Encode(w)
+	return tlvutil.EncodeRecords(w, records...)
 }
 
 // Decode deserializes a TLV stream into the RestartMessage. Creates local
@@ -97,16 +93,11 @@ func (m *RestartMessage) Decode(r io.Reader) error {
 	)
 
 	// Build stream with pointers to local variables.
-	stream, err := tlv.NewStream(
-		actorID.Record(), stateType.Record(), stateData.Record(),
+	// Decode and get typeMap showing which fields were present.
+	typeMap, err := tlvutil.DecodeRecords(
+		r, actorID.Record(), stateType.Record(), stateData.Record(),
 		version.Record(), updatedAt.Record(),
 	)
-	if err != nil {
-		return err
-	}
-
-	// Decode and get typeMap showing which fields were present.
-	typeMap, err := stream.DecodeWithParsedTypes(r)
 	if err != nil {
 		return err
 	}
