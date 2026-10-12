@@ -6,6 +6,7 @@ import (
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightninglabs/wavelength/unrollplan"
 	fn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -298,17 +299,12 @@ func encodeCheckpoint(value *actorCheckpoint) ([]byte, error) {
 		)
 	}
 
-	stream, err := tlv.NewStream(records...)
+	raw, err := tlvutil.EncodeRecordsToBytes(records...)
 	if err != nil {
-		return nil, fmt.Errorf("create checkpoint stream: %w", err)
-	}
-
-	var buf bytes.Buffer
-	if err := stream.Encode(&buf); err != nil {
 		return nil, fmt.Errorf("encode checkpoint: %w", err)
 	}
 
-	return buf.Bytes(), nil
+	return raw, nil
 }
 
 // decodeCheckpoint parses TLV-encoded checkpoint bytes back into an
@@ -345,8 +341,8 @@ func decodeCheckpoint(raw []byte) (*actorCheckpoint, error) {
 		retrySame      uint8
 	)
 
-	stream, err := tlv.NewStream(
-		tlv.MakePrimitiveRecord(
+	parsed, err := tlvutil.DecodeRecords(
+		bytes.NewReader(raw), tlv.MakePrimitiveRecord(
 			checkpointVersionRecordType, &version,
 		),
 		tlv.MakePrimitiveRecord(
@@ -395,11 +391,6 @@ func decodeCheckpoint(raw []byte) (*actorCheckpoint, error) {
 			checkpointRetrySameRecordType, &retrySame,
 		),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("create checkpoint stream: %w", err)
-	}
-
-	parsed, err := stream.DecodeWithParsedTypes(bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("decode checkpoint: %w", err)
 	}
