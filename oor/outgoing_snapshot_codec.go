@@ -1,12 +1,12 @@
 package oor
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 	"time"
 
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -40,6 +40,8 @@ const (
 	snapshotFailedPrePONRRecordType tlv.Type = 27
 )
 
+// encodeOutgoingSnapshot serializes outgoing transfer state, including retry
+// and admission evidence.
 func encodeOutgoingSnapshot(snapshot *OutgoingSnapshot) ([]byte, error) {
 	if snapshot == nil {
 		return nil, fmt.Errorf("snapshot must be provided")
@@ -107,17 +109,7 @@ func encodeOutgoingSnapshot(snapshot *OutgoingSnapshot) ([]byte, error) {
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := stream.Encode(&buf); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return tlvutil.EncodeRecordsToBytes(records...)
 }
 
 func decodeOutgoingSnapshot(raw []byte) (*OutgoingSnapshot, error) {
@@ -178,13 +170,9 @@ func decodeOutgoingSnapshotWithLimits(raw []byte,
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return nil, err
-	}
-
-	reader := bytes.NewReader(raw)
-	if _, err := stream.DecodeWithParsedTypes(reader); err != nil {
+	if _, err := tlvutil.DecodeRecordsFromBytes(
+		raw, records...,
+	); err != nil {
 		return nil, err
 	}
 

@@ -1,11 +1,11 @@
 package oor
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
 	"github.com/btcsuite/btcd/psbt/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightninglabs/wavelength/lib/tx/psbtutil"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -337,17 +337,7 @@ func encodeIncomingSnapshot(snapshot *IncomingSnapshot) ([]byte, error) {
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := stream.Encode(&buf); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return tlvutil.EncodeRecordsToBytes(records...)
 }
 
 // decodeIncomingSnapshotWithLimits decodes one incoming snapshot and applies
@@ -411,13 +401,9 @@ func decodeIncomingSnapshotWithLimits(raw []byte,
 		),
 	}
 
-	stream, err := tlv.NewStream(records...)
-	if err != nil {
-		return nil, err
-	}
-
-	reader := bytes.NewReader(raw)
-	if _, err := stream.DecodeWithParsedTypes(reader); err != nil {
+	if _, err := tlvutil.DecodeRecordsFromBytes(
+		raw, records...,
+	); err != nil {
 		return nil, err
 	}
 
