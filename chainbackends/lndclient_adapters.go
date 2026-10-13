@@ -650,6 +650,7 @@ func NewLNDBackendFromLndClient(cfg LNDBackendFromLndClientConfig) (*LNDBackend,
 	broadcaster := NewLndClientTxBroadcaster(cfg.LND.WalletKit)
 
 	backend := NewLNDBackend(notifier, feeEstimator, broadcaster)
+	backend.chainKit = cfg.LND.ChainKit
 	backend.Log = cfg.Log
 	backend.packageSubmitter = cfg.PackageSubmitter
 

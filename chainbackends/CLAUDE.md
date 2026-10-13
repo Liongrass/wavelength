@@ -65,7 +65,10 @@ estimation, and optional v3 package relay via a pluggable `PackageSubmitter`.
 ## Invariants
 
 - `LNDBackend` requires an lnd instance (local or remote via lndclient).
-- Provides real-time notifications via lnd's chainntnfs package.
+- Remote `BestBlock` queries use `ChainKit.GetBestBlock` on every read.
+  Notification processing can trail the live chain; RPC errors propagate
+  without falling back to that tip. In-process backends retain the notifier
+  path. Confirmation and spend subscriptions use chainntnfs.
 - `PackageSubmitter` is optional; package-capable backends return an error
   from `SubmitPackage` when no submitter is set. `waved` selects one at
   startup: an explicit `waved.Config.PackageSubmitter` wins (bitcoind flags

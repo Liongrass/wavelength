@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/wavelength/build"
 	"github.com/lightninglabs/wavelength/chainsource"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -88,10 +89,15 @@ type PackageSubmitter interface {
 // is available.
 //
 // The backend delegates all operations to the underlying lnd components:
-// chainntnfs for notifications and chainfee for fee estimation.
+// chainntnfs for notifications, chainfee for fee estimation, and ChainKit
+// for live chain queries over remote connections.
 type LNDBackend struct {
 	// notifier provides chain notification services from lnd.
 	notifier chainntnfs.ChainNotifier
+
+	// chainKit queries the live chain tip for remote lnd connections.
+	// In-process backends use the notifier when no ChainKit is available.
+	chainKit lndclient.ChainKitClient
 
 	// feeEstimator provides fee estimation services from lnd.
 	feeEstimator chainfee.Estimator
@@ -169,12 +175,23 @@ func (b *LNDBackend) EstimateFee(ctx context.Context, targetConf uint32) (
 }
 
 // BestBlock returns the current best block height and hash from lnd's view of
-// the blockchain. We register for a single block notification to get the
-// current tip.
+// the blockchain. Remote connections query ChainKit directly because block
+// notification processing can lag the live chain. In-process backends use the
+// notifier's initial block event.
 func (b *LNDBackend) BestBlock(ctx context.Context) (int32, chainhash.Hash,
 	error) {
 
 	b.logger(ctx).DebugS(ctx, "Querying best block from LND")
+
+	if b.chainKit != nil {
+		hash, height, err := b.chainKit.GetBestBlock(ctx)
+		if err != nil {
+			return 0, chainhash.Hash{}, fmt.Errorf("get live best "+
+				"block: %w", err)
+		}
+
+		return height, hash, nil
+	}
 
 	// Register for a single block notification to get the current tip.
 	event, err := b.notifier.RegisterBlockEpochNtfn(nil)
