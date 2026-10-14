@@ -297,6 +297,7 @@ func (h *Harness) startTapdContainer(cfg tapdConfig) *dockertest.Resource {
 	cmd := []string{
 		fmt.Sprintf("--tapddir=%s", tapdDirInContainer),
 		"--network=regtest",
+		"--proofactivationheight=1",
 		fmt.Sprintf("--lnd.host=%s:10009", lndName),
 		fmt.Sprintf("--lnd.macaroonpath=%s",
 			"/lnd/data/chain/bitcoin/regtest/admin.macaroon"),

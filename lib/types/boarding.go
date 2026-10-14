@@ -444,6 +444,61 @@ type BoardingRequest struct {
 	// maybeRebuildBoardingProof recovery path reconstructs it from the
 	// chain backend for any persisted intent that lacks one.
 	TxProof fn.Option[TxProof]
+
+	// AssetRef identifies the Taproot Asset carried by the boarding
+	// output (group key reference for grouped assets). Empty for
+	// Bitcoin-only boarding.
+	AssetRef string
+
+	// AssetAmount is the asset amount the boarding output carries.
+	// Non-zero exactly when AssetRef is set.
+	AssetAmount uint64
+
+	// AssetDigest scopes the boarding output's deterministic OP_TRUE asset
+	// script key. It binds the claim, not spendability; the operator
+	// verifies AssetWitness against AssetProof. 32 bytes when AssetRef is
+	// set.
+	AssetDigest []byte
+
+	// AssetProof is the boarded asset's confirmed proof file.
+	AssetProof []byte
+
+	// AssetCommitmentLeafHash is the tap hash of the boarding output's
+	// asset commitment leaf, the tapscript sibling of the boarding
+	// policy tree. Authenticated by the composed-script recompute.
+	// 32 bytes when AssetRef is set.
+	AssetCommitmentLeafHash []byte
+
+	// AssetWitness is the boarded asset's OP_TRUE witness stack. It
+	// carries no authority — the asset script key is anyone-can-spend
+	// by design — so it stays outside the auth digest. The operator must
+	// verify it against the proved script key before accepting the deposit.
+	AssetWitness [][]byte
+}
+
+// ValidateAssetFields checks the signed asset claim's shape. Proof and witness
+// bytes are verified separately and are absent from decoded auth messages.
+func (b *BoardingRequest) ValidateAssetFields() error {
+	if b == nil {
+		return fmt.Errorf("boarding request is required")
+	}
+	if b.AssetRef == "" {
+		if b.AssetAmount != 0 || len(b.AssetDigest) != 0 ||
+			len(b.AssetCommitmentLeafHash) != 0 ||
+			len(b.AssetProof) != 0 || len(b.AssetWitness) != 0 {
+			return fmt.Errorf("boarding asset fields require an " +
+				"asset ref")
+		}
+
+		return nil
+	}
+	if b.AssetAmount == 0 || len(b.AssetDigest) != 32 ||
+		len(b.AssetCommitmentLeafHash) != 32 {
+		return fmt.Errorf("asset boarding requires a non-zero amount " +
+			"and 32-byte digest and commitment leaf hash")
+	}
+
+	return nil
 }
 
 // BoardingInputSignature represents the client's signature for a boarding
