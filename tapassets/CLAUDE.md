@@ -2,16 +2,15 @@
 
 ## Purpose
 
-Adapts tap-sdk custom-anchor transitions to Ark structures, so a VTXO tree can
-carry Taproot Assets instead of only satoshis. Two flows live here: moving
-confirmed assets into a single caller-funded *batch output*
-(`BatchAnchorCommitter`), and materializing the asset-aware VTXO tree that
-hangs below that batch output (`BuildAssetTree`). Both wrap every tapd commit
-in a durable journal so a restart mid-commit replays the sealed package rather
-than re-signing a second, conflicting transition.
+Builds asset boarding outputs (`Onboarder`), caller-funded batch anchors
+(`BatchAnchorCommitter`), and asset VTXO trees (`BuildAssetTree`) through
+tap-sdk. Durable journals retain committed packages for restart recovery.
 
 ## Key Types
 
+- `Onboarder` — Funds and publishes a composed boarding output from tapd
+  inventory, returns asset change, and journals the owner keys, sealed package,
+  and signed transaction. `FileStore` supplies an atomic file-backed journal.
 - `BatchAnchorCommitter` — Creates caller-funded asset batch outputs.
   `DeriveScript` produces the batch output script before funding, `Commit`
   seals the transfer package against a funded PSBT, and `Publish` records the
@@ -32,8 +31,9 @@ than re-signing a second, conflicting transition.
 - `TreeLeafAnchor` / `StandardVTXOLeafAnchor` — Taproot material (uncomposed
   pkScript, internal key, canonical tap leaves) for a leaf VTXO output, before
   the asset root is composed in.
-- `Store` — Journal persistence for completed transition packages. Implementations
-  must replace each value atomically. `ErrStoreNotFound` signals an absent key.
+- `Store` — Durable, atomic journal persistence for attempts and completed
+  transition packages. `ErrStoreNotFound` signals an absent key. Callers own
+  workflow serialization and wallet input reservations.
 
 ## Relationships
 
@@ -41,9 +41,8 @@ than re-signing a second, conflicting transition.
   wallet, proof verifiers), `lib/tree` (`Node`, `Tree`, `LeafDescriptor`
   structures to materialize into), `lib/arkscript` (leaf policy construction
   for `StandardVTXOLeafAnchor`), `lib/tx/psbtutil` (PSBT encode/decode).
-- **Depended on by**: nothing yet — the package is the asset-tree building
-  block that the round/asset wiring will consume; it imports no other repo
-  subsystem beyond `lib`, and no repo package imports it today.
+- **Depended on by**: no production caller yet; daemon onboarding and round
+  runtime wiring consume these APIs in later integration work.
 - **Sends** / **Receives**: none. This is a synchronous library, not an actor;
   it exchanges no mailbox messages.
 
