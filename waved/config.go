@@ -377,6 +377,10 @@ type Config struct {
 	// acknowledge that the daemon's own RPC listener runs without
 	// transport security. See the lightning-infra tracking issue for the
 	// deployment rationale.
+	//
+	// It also permits the public dev wallet password that the
+	// WAVED_LWWALLET_SEED path falls back to when WAVED_WALLET_PASSWORD
+	// is unset.
 	AllowInsecureMainnet bool `mapstructure:"allow-insecure-mainnet"`
 
 	// Unroll configures the unilateral-exit subsystem.

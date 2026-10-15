@@ -216,9 +216,8 @@ func newRootCmd() *cobra.Command {
 	// TCP listeners, which Validate() otherwise refuses.
 	f.Bool(
 		"allow-insecure-mainnet", cfg.AllowInsecureMainnet, "permit "+
-			"rpc.notls and rpc.no-macaroons on mainnet TCP "+
-			"listeners (transport security is expected to be "+
-			"provided externally)",
+			"rpc.notls, rpc.no-macaroons, and the dev wallet "+
+			"password on mainnet, which are otherwise refused",
 	)
 
 	registerOperatorFeeFlags(f, cfg)

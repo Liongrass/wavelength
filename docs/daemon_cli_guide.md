@@ -162,7 +162,7 @@ prefix and dots replaced by underscores:
 | Variable | Description |
 |----------|-------------|
 | `WAVED_WALLET_PASSWORD` | Wallet password for create/unlock |
-| `WAVED_LWWALLET_SEED` | Hex-encoded raw seed (dev/CI only) |
+| `WAVED_LWWALLET_SEED` | Hex-encoded raw seed (dev/CI only). Without `WAVED_WALLET_PASSWORD` the wallet uses a public dev password, which mainnet refuses unless `allow-insecure-mainnet` is set |
 | `WAVED_LWWALLET_SEED_BIRTHDAY` | Creation date of that seed, `YYYY-MM-DD` or RFC3339 |
 | `WAVED_NETWORK` | Bitcoin network override |
 | `WAVED_WALLET_TYPE` | Wallet backend type |
