@@ -1,6 +1,6 @@
 # If you change this please also update GO_VERSION in the Makefile (then run
 # `make lint` to see where else it needs to be updated as well).
-FROM golang:1.26.0-bookworm@sha256:2a0ba12e116687098780d3ce700f9ce3cb340783779646aafbabed748fa6677c
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
 
 LABEL maintainer="Olaoluwa Osuntokun <laolu32@gmail.com>"
 

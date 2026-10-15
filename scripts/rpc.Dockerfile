@@ -1,7 +1,7 @@
 # Dockerfile for protobuf compilation. This ensures consistent proto generation
 # across different development environments without requiring local protoc
 # installations.
-FROM golang:1.26.0-bookworm
+FROM golang:1.26.9-bookworm
 
 RUN apt-get update && apt-get install -y \
   git \

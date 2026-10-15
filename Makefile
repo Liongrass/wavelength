@@ -34,7 +34,7 @@ LLFORMAT_BIN := $(CURDIR)/$(TOOLS_DIR)/llformat
 
 # GO_VERSION is the Go version used for the release build, docker files, and
 # GitHub Actions. This is the reference version for the project.
-GO_VERSION := 1.26.0
+GO_VERSION := 1.26.9
 
 GOBUILD := $(GOCC) build -v
 GOINSTALL := $(GOCC) install -v
