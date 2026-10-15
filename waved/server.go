@@ -1242,16 +1242,15 @@ func (s *Server) runInner(ctx context.Context, shutdownFn func()) error {
 		// continues startup with the wallet in a non-ready
 		// state and waits for InitWallet or UnlockWallet
 		// RPCs.
-		s.tryAutoUnlockLwwallet(ctx)
+		if err := s.tryAutoUnlockLwwallet(ctx); err != nil {
+			return err
+		}
 
 	case WalletTypeBtcwallet:
-		// In btcwallet mode, use the same auto-unlock flow
-		// as lwwallet but start a neutrino-backed wallet.
-		s.tryAutoUnlockBtcwallet(ctx)
-
-		// Register neutrino cleanup immediately so it fires
-		// even if a later startup step (dialServer, actor
-		// system init) fails before the main defer block.
+		// Register neutrino cleanup before auto-unlock pre-starts
+		// it so it fires even if auto-unlock or a later startup
+		// step (dialServer, actor system init) fails before the
+		// main defer block.
 		defer func() {
 			s.neutrinoSvc.WhenSome(
 				func(svc *btcwbackend.NeutrinoService) {
@@ -1259,6 +1258,12 @@ func (s *Server) runInner(ctx context.Context, shutdownFn func()) error {
 				},
 			)
 		}()
+
+		// In btcwallet mode, use the same auto-unlock flow
+		// as lwwallet but start a neutrino-backed wallet.
+		if err := s.tryAutoUnlockBtcwallet(ctx); err != nil {
+			return err
+		}
 
 	default:
 		return fmt.Errorf("unknown wallet type %q", s.cfg.Wallet.Type)
@@ -1903,15 +1908,17 @@ func (s *Server) refreshProofKeyBackend() {
 // database that can be opened with a password from the environment or
 // a password file. If no password source is available, the daemon
 // starts with the wallet in a non-ready state awaiting the InitWallet
-// or UnlockWallet RPC.
-func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
+// or UnlockWallet RPC. Other failures are logged and leave the wallet
+// in the same state. Only a refused env-seed password is returned,
+// which stops startup.
+func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) error {
 	// Check for a raw seed in the environment (dev/CI path).
 	envSeed, err := LoadSeedFromEnv()
 	if err != nil {
 		s.log.WarnS(ctx, "Invalid seed in environment variable",
 			err)
 
-		return
+		return nil
 	}
 
 	// Probe for an existing wallet database. This decides between
@@ -1921,7 +1928,7 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 	if err != nil {
 		s.log.ErrorS(ctx, "Failed to probe wallet database", err)
 
-		return
+		return nil
 	}
 
 	// Any existing database means the wallet is at least Locked, so
@@ -1944,16 +1951,18 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 			seed = nil
 		}
 
-		password, ok := LoadPasswordFromEnv()
-		if !ok {
-			password = devWalletPassword
+		password, err := envSeedWalletPassword(
+			ctx, s.log, s.cfg.Network, s.cfg.AllowInsecureMainnet,
+		)
+		if err != nil {
+			return err
 		}
 
 		birthday, err := LoadSeedBirthdayFromEnv()
 		if err != nil {
 			s.log.ErrorS(ctx, "Invalid seed birthday", err)
 
-			return
+			return nil
 		}
 
 		if err := s.startLwwallet(
@@ -1966,10 +1975,10 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 				err,
 			)
 
-			return
+			return nil
 		}
 
-		return
+		return nil
 	}
 
 	if !exists {
@@ -1979,7 +1988,7 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 
 		s.walletState.Store(int32(WalletStateNone))
 
-		return
+		return nil
 	}
 
 	// A wallet database exists (state already marked Locked above).
@@ -1996,7 +2005,7 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 				err,
 			)
 
-			return
+			return nil
 		}
 
 		ok = true
@@ -2008,7 +2017,7 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 				"awaiting UnlockWallet RPC",
 		)
 
-		return
+		return nil
 	}
 
 	s.log.InfoS(ctx, "Auto-unlocking lwwallet")
@@ -2021,9 +2030,9 @@ func (s *Server) tryAutoUnlockLwwallet(ctx context.Context) {
 	); err != nil {
 
 		s.log.ErrorS(ctx, "Failed to start lwwallet", err)
-
-		return
 	}
+
+	return nil
 }
 
 // startLwwallet creates and starts the lightweight wallet. A non-nil
@@ -2106,8 +2115,9 @@ func (s *Server) startLwwallet(ctx context.Context, seed []byte,
 // that P2P peer connection and header sync can proceed in parallel
 // while the daemon waits for the InitWallet or UnlockWallet RPC.
 // The pre-started service is stored in s.neutrinoSvc and reused by
-// startBtcwallet when the seed becomes available.
-func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
+// startBtcwallet when the seed becomes available. As with
+// tryAutoUnlockLwwallet, only a refused env-seed password is returned.
+func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) error {
 	// Start neutrino early so it can connect to P2P peers and
 	// sync headers while we wait for the wallet seed. This
 	// dramatically reduces the time startBtcwallet needs when
@@ -2126,7 +2136,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 		s.log.WarnS(ctx,
 			"Invalid seed in environment variable", err)
 
-		return
+		return nil
 	}
 
 	// Probe for an existing wallet database. This decides between
@@ -2136,7 +2146,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 	if err != nil {
 		s.log.ErrorS(ctx, "Failed to probe wallet database", err)
 
-		return
+		return nil
 	}
 
 	// Any existing database means the wallet is at least Locked, so
@@ -2160,9 +2170,11 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 			seed = nil
 		}
 
-		password, ok := LoadPasswordFromEnv()
-		if !ok {
-			password = devWalletPassword
+		password, err := envSeedWalletPassword(
+			ctx, s.log, s.cfg.Network, s.cfg.AllowInsecureMainnet,
+		)
+		if err != nil {
+			return err
 		}
 
 		// A raw hex seed carries no birthday, so without an
@@ -2175,7 +2187,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 		if err != nil {
 			s.log.ErrorS(ctx, "Invalid seed birthday", err)
 
-			return
+			return nil
 		}
 
 		if err := s.startBtcwallet(
@@ -2188,10 +2200,10 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 				err,
 			)
 
-			return
+			return nil
 		}
 
-		return
+		return nil
 	}
 
 	if !exists {
@@ -2201,7 +2213,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 
 		s.walletState.Store(int32(WalletStateNone))
 
-		return
+		return nil
 	}
 
 	// A wallet database exists (state already marked Locked above).
@@ -2217,7 +2229,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 				err,
 			)
 
-			return
+			return nil
 		}
 
 		ok = true
@@ -2229,7 +2241,7 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 				"awaiting UnlockWallet RPC",
 		)
 
-		return
+		return nil
 	}
 
 	s.log.InfoS(ctx, "Auto-unlocking btcwallet")
@@ -2243,9 +2255,9 @@ func (s *Server) tryAutoUnlockBtcwallet(ctx context.Context) {
 
 		s.log.ErrorS(ctx,
 			"Failed to start btcwallet", err)
-
-		return
 	}
+
+	return nil
 }
 
 // preStartNeutrino creates and starts the neutrino chain service

@@ -8,6 +8,7 @@ import (
 	"github.com/lightninglabs/wavelength/btcwbackend"
 	"github.com/lightninglabs/wavelength/lwwallet"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 // TestConfigValidateAcceptsSupportedNetworks verifies the daemon accepts every
@@ -132,6 +133,134 @@ func TestConfigValidateMainnetInsecureRPC(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+// TestConfigValidateMainnetGatewayListenAddr verifies the plain-HTTP gateway
+// must bind loopback on mainnet unless allow-insecure-mainnet is set, and that
+// the rule ignores disabled gateways, injected listeners, and test networks.
+func TestConfigValidateMainnetGatewayListenAddr(t *testing.T) {
+	t.Parallel()
+
+	const loopbackErr = "must be a loopback address"
+
+	tests := []struct {
+		name       string
+		network    string
+		listenAddr string
+		disabled   bool
+		injected   bool
+		override   bool
+		wantErr    string
+	}{
+		{
+			name:       "default localhost",
+			listenAddr: DefaultRPCGatewayHost,
+		},
+		{
+			name:       "localhost any case",
+			listenAddr: "LocalHost:10031",
+		},
+		{
+			name:       "ipv4 loopback",
+			listenAddr: "127.0.0.1:10031",
+		},
+		{
+			name:       "ipv4 loopback range",
+			listenAddr: "127.0.0.2:10031",
+		},
+		{
+			name:       "ipv6 loopback",
+			listenAddr: "[::1]:10031",
+		},
+		{
+			name:       "empty host binds all interfaces",
+			listenAddr: ":10031",
+			wantErr:    loopbackErr,
+		},
+		{
+			name:       "ipv4 unspecified",
+			listenAddr: "0.0.0.0:10031",
+			wantErr:    loopbackErr,
+		},
+		{
+			name:       "ipv6 unspecified",
+			listenAddr: "[::]:10031",
+			wantErr:    loopbackErr,
+		},
+		{
+			name:       "routable ip",
+			listenAddr: "192.168.1.10:10031",
+			wantErr:    loopbackErr,
+		},
+		{
+			name:       "hostname",
+			listenAddr: "waved.internal:10031",
+			wantErr:    loopbackErr,
+		},
+		{
+			name:       "missing port",
+			listenAddr: "localhost",
+			wantErr:    "invalid rpc.gateway.listenaddr",
+		},
+		{
+			name:       "unbracketed ipv6",
+			listenAddr: "::1",
+			wantErr:    "invalid rpc.gateway.listenaddr",
+		},
+		{
+			name:       "override allows all interfaces",
+			listenAddr: "0.0.0.0:10031",
+			override:   true,
+		},
+		{
+			name:       "disabled gateway ignored",
+			listenAddr: "0.0.0.0:10031",
+			disabled:   true,
+		},
+		{
+			name:       "injected listener ignored",
+			listenAddr: "0.0.0.0:10031",
+			injected:   true,
+		},
+		{
+			name:       "signet allows all interfaces",
+			network:    "signet",
+			listenAddr: "0.0.0.0:10031",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := DefaultConfig()
+			cfg.Network = "mainnet"
+			if tc.network != "" {
+				cfg.Network = tc.network
+			}
+			cfg.AllowMainnet = true
+			cfg.AllowInsecureMainnet = tc.override
+			cfg.RPC.Gateway.ListenAddr = tc.listenAddr
+			cfg.RPC.Gateway.Enabled = !tc.disabled
+			if tc.injected {
+				listener := bufconn.Listen(1024)
+				t.Cleanup(func() {
+					require.NoError(t, listener.Close())
+				})
+				cfg.RPC.Gateway.Listener = listener
+			}
+
+			err := cfg.Validate()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
 		})
 	}
 }

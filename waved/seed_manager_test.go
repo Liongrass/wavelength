@@ -1,11 +1,13 @@
 package waved
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/aezeed"
 	"github.com/stretchr/testify/require"
 )
@@ -101,6 +103,93 @@ func TestLoadSeedFromEnv(t *testing.T) {
 	_, err = LoadSeedFromEnv()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid seed length")
+}
+
+// TestEnvSeedWalletPassword verifies the env-seed path only falls back to
+// the public dev password where that is acceptable: silently on local test
+// networks, with a warning on public ones, and on mainnet only after an
+// explicit allow-insecure-mainnet opt-in.
+func TestEnvSeedWalletPassword(t *testing.T) {
+	tests := []struct {
+		name          string
+		network       string
+		allowInsecure bool
+		envPassword   string
+		wantPassword  []byte
+		wantErr       string
+		wantWarn      bool
+	}{
+		{
+			name:    "mainnet refused",
+			network: "mainnet",
+			wantErr: "allow-insecure-mainnet",
+		},
+		{
+			name:          "mainnet allowed with override",
+			network:       "mainnet",
+			allowInsecure: true,
+			wantPassword:  devWalletPassword,
+			wantWarn:      true,
+		},
+		{
+			name:         "mainnet env password",
+			network:      "mainnet",
+			envPassword:  "operator-password",
+			wantPassword: []byte("operator-password"),
+		},
+		{
+			name:         "signet warns",
+			network:      "signet",
+			wantPassword: devWalletPassword,
+			wantWarn:     true,
+		},
+		{
+			name:         "regtest silent",
+			network:      "regtest",
+			wantPassword: devWalletPassword,
+		},
+		{
+			name:         "simnet silent",
+			network:      "simnet",
+			wantPassword: devWalletPassword,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(walletPasswordEnvVar, tc.envPassword)
+
+			var logs bytes.Buffer
+			log := btclog.NewSLogger(
+				btclog.NewDefaultHandler(&logs),
+			)
+
+			password, err := envSeedWalletPassword(
+				t.Context(), log, tc.network, tc.allowInsecure,
+			)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				require.Nil(t, password)
+				require.Empty(t, logs.String())
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantPassword, password)
+
+			if !tc.wantWarn {
+				require.Empty(t, logs.String())
+
+				return
+			}
+
+			require.Contains(
+				t, logs.String(),
+				"insecure dev password",
+			)
+		})
+	}
 }
 
 // TestLoadPasswordFromFile verifies reading passwords from files.

@@ -1,13 +1,16 @@
 package waved
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/wavelength/walletcore"
 	"github.com/lightningnetwork/lnd/aezeed"
 )
@@ -61,6 +64,39 @@ func zeroBytes(b []byte) {
 // operator-created wallets: the InitWallet and UnlockWallet RPCs
 // always require an explicit password.
 var devWalletPassword = []byte("dev-insecure-password")
+
+// envSeedWalletPassword returns the private passphrase for a wallet created
+// or opened through the seedEnvVar path: walletPasswordEnvVar when set, else
+// devWalletPassword. Because that fallback is public, mainnet refuses it
+// unless allowInsecureMainnet is set, and every network other than regtest
+// and simnet logs a warning when it is used.
+func envSeedWalletPassword(ctx context.Context, log btclog.Logger,
+	network string, allowInsecureMainnet bool) ([]byte, error) {
+
+	if password, ok := LoadPasswordFromEnv(); ok {
+		return password, nil
+	}
+
+	switch network {
+	case "regtest", "simnet":
+		return devWalletPassword, nil
+
+	case "mainnet":
+		if !allowInsecureMainnet {
+			return nil, fmt.Errorf("%s requires %s on mainnet "+
+				"unless allow-insecure-mainnet is set",
+				seedEnvVar, walletPasswordEnvVar)
+		}
+	}
+
+	log.WarnS(ctx, "Wallet uses the insecure dev password",
+		nil,
+		slog.String("network", network),
+		slog.String("password_env", walletPasswordEnvVar),
+	)
+
+	return devWalletPassword, nil
+}
 
 // GenerateSeed generates a new aezeed cipher seed and returns its
 // 24-word mnemonic representation. The optional passphrase protects
