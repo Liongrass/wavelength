@@ -1198,6 +1198,123 @@ func TestForfeitRequestRejectsInvalidParticipantSignature(t *testing.T) {
 	require.Empty(t, h.outboxMessages)
 }
 
+// TestForfeitRequestRejectsUnboundSpendPath verifies that an explicit forfeit
+// spend path must commit to the VTXO's pkScript. A well-formed path for another
+// output is rejected before any signature is produced or state changes.
+func TestForfeitRequestRejectsUnboundSpendPath(t *testing.T) {
+	t.Parallel()
+
+	h := newRealVTXOSigningHarness(t)
+	vtxo := h.newTestDescriptor()
+	live := &LiveState{
+		VTXO:              vtxo,
+		LastCheckedHeight: 100,
+	}
+	h.withState(live)
+
+	_, otherClientPub := generateTestKeyPair(t)
+	policy, err := arkscript.NewVTXOPolicy(
+		otherClientPub, vtxo.OperatorKey, vtxo.RelativeExpiry,
+	)
+	require.NoError(t, err)
+	spendInfo, err := policy.CollabSpendInfo()
+	require.NoError(t, err)
+
+	h.env.ForfeitParticipantSigner = func(_ context.Context,
+		_ *ForfeitParticipantSignRequest) (
+		[]*types.ForfeitParticipantSig, error) {
+
+		t.Fatal("participant signer called for unbound spend path")
+
+		return nil, nil
+	}
+
+	connectorOutput := h.newTestConnectorOutput()
+	evt := &round.ForfeitRequestEvent{
+		RoundID:               "round-unbound-forfeit-spend",
+		ConnectorOutpoint:     h.newTestOutpoint(),
+		ConnectorPkScript:     connectorOutput.PkScript,
+		ConnectorAmount:       connectorOutput.Value,
+		ServerForfeitPkScript: h.newServerForfeitScript(),
+		ForfeitSpend: &arkscript.SpendPath{
+			SpendInfo: spendInfo,
+		},
+	}
+
+	_, err = h.sendEvent(evt)
+	require.ErrorContains(t, err, "does not bind to VTXO pkScript")
+	require.Empty(t, h.outboxMessages)
+	require.Same(t, live, h.currentState)
+}
+
+// TestForfeitRequestRejectsStalePkScript verifies a forfeit spend path that
+// binds to the policy-derived script is still rejected when the stored
+// pkScript, which the forfeit signature uses as its prevout, differs from it.
+func TestForfeitRequestRejectsStalePkScript(t *testing.T) {
+	t.Parallel()
+
+	h := newRealVTXOSigningHarness(t)
+	vtxo := h.newTestDescriptor()
+
+	policy, err := arkscript.NewVTXOPolicy(
+		vtxo.ClientKey.PubKey, vtxo.OperatorKey, vtxo.RelativeExpiry,
+	)
+	require.NoError(t, err)
+	spendInfo, err := policy.CollabSpendInfo()
+	require.NoError(t, err)
+
+	_, otherClientPub := generateTestKeyPair(t)
+	otherTapscript, err := arkscript.VTXOTapScript(
+		otherClientPub, vtxo.OperatorKey, testExitDelay,
+	)
+	require.NoError(t, err)
+	otherKey, err := otherTapscript.TaprootKey()
+	require.NoError(t, err)
+	vtxo.PkScript, err = txscript.PayToTaprootScript(otherKey)
+	require.NoError(t, err)
+
+	live := &LiveState{
+		VTXO:              vtxo,
+		LastCheckedHeight: 100,
+	}
+	h.withState(live)
+
+	h.env.ForfeitParticipantSigner = func(_ context.Context,
+		_ *ForfeitParticipantSignRequest) (
+		[]*types.ForfeitParticipantSig, error) {
+
+		t.Fatal("participant signer called for stale pkScript")
+
+		return nil, nil
+	}
+
+	connectorOutput := h.newTestConnectorOutput()
+	evt := &round.ForfeitRequestEvent{
+		RoundID:               "round-stale-forfeit-pkscript",
+		ConnectorOutpoint:     h.newTestOutpoint(),
+		ConnectorPkScript:     connectorOutput.PkScript,
+		ConnectorAmount:       connectorOutput.Value,
+		ServerForfeitPkScript: h.newServerForfeitScript(),
+		ForfeitSpend: &arkscript.SpendPath{
+			SpendInfo: spendInfo,
+		},
+	}
+
+	_, err = h.sendEvent(evt)
+	require.ErrorContains(t, err, "does not match its policy")
+	require.Empty(t, h.outboxMessages)
+	require.Same(t, live, h.currentState)
+}
+
+// TestResolveForfeitSpendPathRequiresDescriptor verifies a missing descriptor
+// is an error rather than a nil dereference.
+func TestResolveForfeitSpendPathRequiresDescriptor(t *testing.T) {
+	t.Parallel()
+
+	_, err := resolveForfeitSpendPath(nil, &round.ForfeitRequestEvent{})
+	require.ErrorContains(t, err, "vtxo descriptor is required")
+}
+
 func signForfeitParticipantRequest(t *testing.T,
 	req *ForfeitParticipantSignRequest,
 	priv *btcec.PrivateKey) *schnorr.Signature {

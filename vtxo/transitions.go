@@ -1,6 +1,7 @@
 package vtxo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -493,6 +494,10 @@ func (s *LiveState) handleForfeitRequest(ctx context.Context,
 func resolveForfeitSpendPath(vtxo *Descriptor,
 	evt *ForfeitRequestEvent) (*arkscript.SpendPath, error) {
 
+	if vtxo == nil {
+		return nil, fmt.Errorf("vtxo descriptor is required")
+	}
+
 	if vtxo.TaprootAssetRoot != nil {
 		return nil, ErrAssetVTXORequiresTransition
 	}
@@ -503,11 +508,26 @@ func resolveForfeitSpendPath(vtxo *Descriptor,
 			return nil, err
 		}
 
-		return evt.ForfeitSpend, nil
-	}
+		// The signer trusts the path's script and control block, so
+		// they must commit to the output this VTXO actually locks. The
+		// forfeit signature uses the stored pkScript as its prevout, so
+		// it must also match the policy-derived script.
+		pkScript, err := vtxo.EffectivePkScript()
+		if err != nil {
+			return nil, fmt.Errorf("derive VTXO pkScript: %w", err)
+		}
+		if !bytes.Equal(pkScript, vtxo.PkScript) {
+			return nil, fmt.Errorf("stored VTXO pkScript does " +
+				"not match its policy")
+		}
 
-	if vtxo == nil {
-		return nil, fmt.Errorf("vtxo descriptor is required")
+		err = evt.ForfeitSpend.VerifyBindsToPkScript(pkScript)
+		if err != nil {
+			return nil, fmt.Errorf("forfeit spend path does not "+
+				"bind to VTXO pkScript: %w", err)
+		}
+
+		return evt.ForfeitSpend, nil
 	}
 
 	policy, err := arkscript.NewVTXOPolicy(
