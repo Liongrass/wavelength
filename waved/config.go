@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -378,9 +379,9 @@ type Config struct {
 	// transport security. See the lightning-infra tracking issue for the
 	// deployment rationale.
 	//
-	// It also permits the public dev wallet password that the
-	// WAVED_LWWALLET_SEED path falls back to when WAVED_WALLET_PASSWORD
-	// is unset.
+	// It also permits a non-loopback rpc.gateway.listenaddr, and the
+	// public dev wallet password that the WAVED_LWWALLET_SEED path falls
+	// back to when WAVED_WALLET_PASSWORD is unset.
 	AllowInsecureMainnet bool `mapstructure:"allow-insecure-mainnet"`
 
 	// Unroll configures the unilateral-exit subsystem.
@@ -1365,6 +1366,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rpc gateway listen address or injected " +
 			"listener is required")
 	}
+	if err := c.validateGatewayListenAddr(); err != nil {
+		return err
+	}
 	if err := validateGatewayAllowedOrigins(
 		c.RPC.Gateway.AllowedOrigins,
 	); err != nil {
@@ -1794,6 +1798,43 @@ func (c *Config) validateRPCSecurity() error {
 	}
 
 	return nil
+}
+
+// validateGatewayListenAddr keeps the HTTP/JSON gateway on loopback on
+// mainnet. The gateway serves plain HTTP and forwards the macaroon header, so
+// a reachable bind address exposes the credential to the network.
+func (c *Config) validateGatewayListenAddr() error {
+	gateway := c.RPC.Gateway
+	if c.Network != "mainnet" || c.AllowInsecureMainnet ||
+		!gateway.Enabled || gateway.Listener != nil {
+		return nil
+	}
+
+	host, _, err := net.SplitHostPort(gateway.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("invalid rpc.gateway.listenaddr %q: %w",
+			gateway.ListenAddr, err)
+	}
+
+	if isLoopbackListenHost(host) {
+		return nil
+	}
+
+	return fmt.Errorf("rpc.gateway.listenaddr %q must be a loopback "+
+		"address on mainnet unless allow-insecure-mainnet is set",
+		gateway.ListenAddr)
+}
+
+// isLoopbackListenHost reports whether a listener bound to host is reachable
+// only over loopback. An empty host binds every interface.
+func isLoopbackListenHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	addr, err := netip.ParseAddr(host)
+
+	return err == nil && addr.IsLoopback()
 }
 
 // expandPaths normalizes filesystem path fields by expanding a leading tilde to
