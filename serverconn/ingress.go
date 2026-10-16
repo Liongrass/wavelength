@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/lightninglabs/wavelength/baselib/actor"
@@ -572,6 +573,15 @@ func (a *ServerConnectionActor) dispatchBatch(ctx context.Context,
 		// without advancing the ack cursor so the envelope is preserved
 		// for a future compatible restart, and never acknowledge or
 		// dispatch it.
+		// Drop foreign senders first: their envelopes are never
+		// dispatched, so their version pair must not be able to stop
+		// ingress either.
+		if !a.inboundSenderAllowed(env) {
+			a.logForeignSender(ctx, env)
+
+			continue
+		}
+
 		if err := a.validateInboundEnvelope(env); err != nil {
 			return lastCommitted, err
 		}
@@ -745,6 +755,49 @@ func (a *ServerConnectionActor) dispatchBatch(ctx context.Context,
 	return lastCommitted, nil
 }
 
+// inboundSenderAllowed reports whether env comes from one of the configured
+// inbound senders. With none configured, every sender is allowed.
+func (a *ServerConnectionActor) inboundSenderAllowed(
+	env *mailboxpb.Envelope) bool {
+
+	senders := a.cfg.InboundSenders
+
+	return len(senders) == 0 || slices.Contains(senders, env.Sender)
+}
+
+// dropForeignSenders returns envelopes without those from senders outside the
+// configured inbound senders.
+func (a *ServerConnectionActor) dropForeignSenders(ctx context.Context,
+	envelopes []*mailboxpb.Envelope) []*mailboxpb.Envelope {
+
+	if len(a.cfg.InboundSenders) == 0 {
+		return envelopes
+	}
+
+	kept := make([]*mailboxpb.Envelope, 0, len(envelopes))
+	for _, env := range envelopes {
+		if !a.inboundSenderAllowed(env) {
+			a.logForeignSender(ctx, env)
+
+			continue
+		}
+
+		kept = append(kept, env)
+	}
+
+	return kept
+}
+
+// logForeignSender records an envelope dropped for its sender.
+func (a *ServerConnectionActor) logForeignSender(ctx context.Context,
+	env *mailboxpb.Envelope) {
+
+	a.log.InfoS(ctx, "Dropping envelope from unexpected sender",
+		slog.String("sender", env.Sender),
+		slog.Uint64("event_seq", env.EventSeq),
+	)
+}
+
 // ackRemote calls Edge.AckUpTo with the given cursor.
 func (a *ServerConnectionActor) ackRemote(
 	ctx context.Context, cursor uint64,
@@ -848,6 +901,12 @@ func (a *ServerConnectionActor) runFoldedDispatch(ctx context.Context,
 	// taken back. Checking every envelope first means one permanently
 	// incompatible envelope anywhere in the batch stops the loop before
 	// any of the batch is acted on.
+	// Envelopes from unexpected senders are dropped before version
+	// validation, so they can neither reach a waiter or a request handler
+	// nor stop ingress with a bad version pair. The batch cursor still
+	// covers them, so they are acknowledged and never pulled again.
+	envelopes = a.dropForeignSenders(ctx, envelopes)
+
 	for _, env := range envelopes {
 		if err := a.validateInboundEnvelope(env); err != nil {
 			return state, err

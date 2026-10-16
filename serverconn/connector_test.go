@@ -934,3 +934,154 @@ func TestIngress_IdleFlushPersistsAckWatermark(t *testing.T) {
 // (TestRetryDelayClampsToMax, TestRetryDelayUsesDefaults) -- the formula
 // itself moved to that subpackage so the SDK pull loop and this actor's
 // ingress loop share one schedule.
+
+// TestIngress_DropsForeignSenders verifies that with InboundSenders set, the
+// ingress loop dispatches only envelopes from those senders, never hands a
+// foreign response to a waiter, is not stopped by a foreign envelope with an
+// unsupported version pair, and still acks past the dropped envelopes.
+func TestIngress_DropsForeignSenders(t *testing.T) {
+	t.Parallel()
+
+	// The transaction-aware store takes the folded dispatch path; hiding
+	// ExecTx takes the direct one.
+	t.Run("folded", func(t *testing.T) {
+		t.Parallel()
+		runForeignSenderIngress(t, false)
+	})
+	t.Run("direct", func(t *testing.T) {
+		t.Parallel()
+		runForeignSenderIngress(t, true)
+	})
+}
+
+// runForeignSenderIngress runs the foreign-sender ingress scenario, through
+// the direct dispatch path when direct is set.
+func runForeignSenderIngress(t *testing.T, direct bool) {
+	t.Helper()
+
+	var (
+		dispatched   []*mailboxpb.Envelope
+		dispatchedMu sync.Mutex
+	)
+	dispatchers := map[mailboxrpc.ServiceMethod]EnvelopeDispatcher{
+		{
+			Service: "test.Svc",
+			Method:  "DoThing",
+		}: func(_ context.Context, env *mailboxpb.Envelope) error {
+			dispatchedMu.Lock()
+			dispatched = append(dispatched, env)
+			dispatchedMu.Unlock()
+
+			return nil
+		},
+	}
+
+	mb := newInMemoryMailbox()
+	cfg := newTestConnectorConfig(mb, newMemCheckpointStore())
+	if direct {
+		cfg.Store = struct{ actor.DeliveryStore }{cfg.Store}
+	}
+	cfg.Dispatchers = dispatchers
+	cfg.InboundSenders = []string{"server-1"}
+	cfg.RetryBaseDelay = 10 * time.Millisecond
+	cfg.RetryMaxDelay = 50 * time.Millisecond
+	conn := NewServerConnectionActor(cfg)
+
+	corrID := CorrelationID("foreign-corr")
+	future := conn.RegisterWaiter(corrID)
+
+	body, err := anypb.New(wrapperspb.String("forged"))
+	require.NoError(t, err)
+	for _, rpc := range []*mailboxpb.RpcMeta{
+		{
+			Kind:    mailboxpb.RpcMeta_KIND_EVENT,
+			Service: "test.Svc",
+			Method:  "DoThing",
+		},
+		{
+			Kind:          mailboxpb.RpcMeta_KIND_RESPONSE,
+			CorrelationId: string(corrID),
+		},
+	} {
+		status := mb.send(&mailboxpb.Envelope{
+			ProtocolVersion:    1,
+			ArkProtocolVersion: 1,
+			Sender:             "attacker",
+			Recipient:          "client-1",
+			Body:               body,
+			Rpc:                rpc,
+		})
+		require.True(t, status.Ok, status.Message)
+	}
+
+	// A foreign envelope with a zero version pair would mark the
+	// connector incompatible if it were validated.
+	status := mb.send(&mailboxpb.Envelope{
+		Sender:    "attacker",
+		Recipient: "client-1",
+		Body:      body,
+		Rpc: &mailboxpb.RpcMeta{
+			Kind:    mailboxpb.RpcMeta_KIND_EVENT,
+			Service: "test.Svc",
+			Method:  "DoThing",
+		},
+	})
+	require.True(t, status.Ok, status.Message)
+
+	sendEventToMailbox(t, mb, "client-1", "test.Svc", "DoThing")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	require.NoError(t, conn.StartIngress(ctx))
+	defer conn.StopIngress()
+
+	// The batch is acked past all four envelopes.
+	require.Eventually(t, func() bool {
+		return mb.getAckedUpTo("client-1") >= 4
+	}, 5*time.Second, 10*time.Millisecond)
+
+	dispatchedMu.Lock()
+	require.Len(t, dispatched, 1)
+	require.Equal(t, "server-1", dispatched[0].Sender)
+	dispatchedMu.Unlock()
+
+	awaitCtx, awaitCancel := context.WithTimeout(
+		t.Context(), 100*time.Millisecond,
+	)
+	defer awaitCancel()
+	require.True(t, future.Await(awaitCtx).IsErr())
+}
+
+// TestDropForeignSenders verifies the batch filter used before the folded
+// dispatch splits a batch.
+func TestDropForeignSenders(t *testing.T) {
+	t.Parallel()
+
+	envs := []*mailboxpb.Envelope{
+		{
+			Sender:   "operator",
+			EventSeq: 1,
+		},
+		{
+			Sender:   "attacker",
+			EventSeq: 2,
+		},
+		{
+			Sender:   IndexerMailboxID,
+			EventSeq: 3,
+		},
+	}
+
+	open := NewServerConnectionActor(DefaultConnectorConfig())
+	require.Len(t, open.dropForeignSenders(t.Context(), envs), 3)
+
+	cfg := DefaultConnectorConfig()
+	cfg.InboundSenders = []string{"operator", IndexerMailboxID}
+	bound := NewServerConnectionActor(cfg)
+
+	kept := bound.dropForeignSenders(t.Context(), envs)
+	require.Len(t, kept, 2)
+	require.Equal(t, uint64(1), kept[0].EventSeq)
+	require.Equal(t, uint64(3), kept[1].EventSeq)
+}
