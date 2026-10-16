@@ -294,6 +294,10 @@ type Server struct {
 	// identity key.
 	localMailboxID string
 
+	// remoteMailboxID is the operator's operator:client mailbox, the only
+	// destination for answers to inbound requests.
+	remoteMailboxID string
+
 	// authSigHex caches the hex-encoded Schnorr auth signature
 	// so response envelopes can include it without re-computing.
 	authSigHex string
@@ -3867,9 +3871,11 @@ func (s *Server) handleInboundRPC(ctx context.Context,
 		headers[serverconn.TLSBindHeaderKey] = s.tlsBindSigHex
 	}
 
+	// The answer goes to the operator, whatever the request's ReplyTo
+	// names: it carries this client's mailbox auth headers.
 	responseEnv := &mailboxpb.Envelope{
 		Sender:    s.localMailboxID,
-		Recipient: env.Rpc.ReplyTo,
+		Recipient: s.remoteMailboxID,
 		Headers:   headers,
 		Body:      body,
 		Rpc: &mailboxpb.RpcMeta{
@@ -3885,14 +3891,11 @@ func (s *Server) handleInboundRPC(ctx context.Context,
 	// client's negotiated mailbox transport and Ark protocol versions.
 	s.runtime.StampEnvelope(responseEnv)
 
-	_, err = edge.Send(ctx, &mailboxpb.SendRequest{
+	resp, err := edge.Send(ctx, &mailboxpb.SendRequest{
 		Envelope: responseEnv,
 	})
-	if err != nil {
-		return fmt.Errorf("send RPC response: %w", err)
-	}
 
-	return nil
+	return serverconn.SendResponseError("send RPC response", resp, err)
 }
 
 // initDatabase opens the SQLite database and creates the actor
@@ -4212,6 +4215,7 @@ func (s *Server) connectAndBootstrapMailbox(ctx context.Context) error {
 	remoteMailboxID := serverconn.CompoundMailboxID(
 		operatorMBID, s.localMailboxID,
 	)
+	s.remoteMailboxID = remoteMailboxID
 
 	// Sign the Schnorr auth proving key ownership, bound to
 	// the compound recipient mailbox. This goes through the memo so
@@ -4246,6 +4250,13 @@ func (s *Server) connectAndBootstrapMailbox(ctx context.Context) error {
 	connCfg.Edge = edge
 	connCfg.LocalMailboxID = s.localMailboxID
 	connCfg.RemoteMailboxID = remoteMailboxID
+
+	// Only the operator, under its own key or as this client's per-client
+	// runtime, and its indexer write to this client's mailbox. Envelopes
+	// from any other sender are dropped.
+	connCfg.InboundSenders = []string{
+		remoteMailboxID, operatorMBID, serverconn.IndexerMailboxID,
+	}
 
 	// Bind the runtime to the negotiated Ark protocol version.
 	// DefaultConnectorConfig already binds mailbox transport v1.
