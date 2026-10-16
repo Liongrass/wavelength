@@ -51,6 +51,15 @@ func edgeResponseError[T edgeStatusCarrier](op string, resp T,
 	return nil
 }
 
+// SendResponseError maps an Edge.Send result to the error its caller should
+// return, so a mailbox rejection reported in the response status is not
+// mistaken for a delivered envelope.
+func SendResponseError(op string, resp *mailboxpb.SendResponse,
+	err error) error {
+
+	return edgeResponseError(op, resp, err)
+}
+
 // compatibilityError returns the cached permanent version error if the
 // connector has transitioned to the terminal INCOMPATIBLE state, or nil while
 // it is still COMPATIBLE. Send paths consult this before contacting the edge.

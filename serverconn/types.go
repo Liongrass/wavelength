@@ -115,6 +115,10 @@ type DurableUnaryQuery interface {
 	ServiceMethod() mailboxrpc.ServiceMethod
 }
 
+// IndexerMailboxID is the sender the operator's indexer stamps on its responses
+// and events.
+const IndexerMailboxID = "svc:indexer"
+
 // ConnectorConfig holds all dependencies and tuning knobs for the server
 // connection actor. The connector is the single boundary for all mailbox
 // traffic between the client and the remote server.
@@ -131,6 +135,11 @@ type ConnectorConfig struct {
 	// RemoteMailboxID is the remote server's mailbox identifier. Outbound
 	// envelopes are addressed to this mailbox.
 	RemoteMailboxID string
+
+	// InboundSenders lists the senders whose envelopes this connection
+	// dispatches. Envelopes from any other sender are acknowledged with
+	// their batch and dropped. Empty dispatches every sender.
+	InboundSenders []string
 
 	// MailboxProtocolVersion is the immutable mailbox transport version
 	// stamped on every outbound envelope. It defines envelope framing and

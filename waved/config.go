@@ -379,9 +379,10 @@ type Config struct {
 	// transport security. See the lightning-infra tracking issue for the
 	// deployment rationale.
 	//
-	// It also permits a non-loopback rpc.gateway.listenaddr, and the
-	// public dev wallet password that the WAVED_LWWALLET_SEED path falls
-	// back to when WAVED_WALLET_PASSWORD is unset.
+	// It also permits a non-loopback rpc.gateway.listenaddr, plaintext
+	// server.insecure and swap.serverinsecure links, and the public dev
+	// wallet password that the WAVED_LWWALLET_SEED path falls back to
+	// when WAVED_WALLET_PASSWORD is unset.
 	AllowInsecureMainnet bool `mapstructure:"allow-insecure-mainnet"`
 
 	// Unroll configures the unilateral-exit subsystem.
@@ -1358,6 +1359,9 @@ func (c *Config) Validate() error {
 	if err := c.validateRPCSecurity(); err != nil {
 		return err
 	}
+	if err := c.validateOutboundTLS(); err != nil {
+		return err
+	}
 	if c.RPC.Gateway == nil {
 		return fmt.Errorf("rpc gateway config is required")
 	}
@@ -1795,6 +1799,49 @@ func (c *Config) validateRPCSecurity() error {
 
 	if !c.RPC.NoMacaroons && c.RPC.MacaroonPath == "" {
 		c.RPC.MacaroonPath = c.rpcMacaroonPath()
+	}
+
+	return nil
+}
+
+// validateOutboundTLS refuses plaintext links to the operator and to the swap
+// server on mainnet unless allow-insecure-mainnet is set. Both links carry the
+// client's mailbox credentials and payment traffic.
+func (c *Config) validateOutboundTLS() error {
+	if c.Network != "mainnet" || c.AllowInsecureMainnet {
+		return nil
+	}
+
+	if c.Server != nil && c.Server.Insecure {
+		return fmt.Errorf("server.insecure is refused on mainnet " +
+			"unless allow-insecure-mainnet is set")
+	}
+	if c.Swap != nil && c.Swap.ServerInsecure {
+		return fmt.Errorf("swap.serverinsecure is refused on mainnet " +
+			"unless allow-insecure-mainnet is set")
+	}
+
+	// A REST address with an explicit http:// scheme is used as given,
+	// whatever the insecure flags say.
+	addrs := []struct {
+		name string
+		addr string
+	}{
+		{
+			name: "server.host",
+			addr: c.ArkServerAddress(),
+		},
+		{
+			name: "swap.serveraddress",
+			addr: c.SwapServerAddress(),
+		},
+	}
+	for _, a := range addrs {
+		if strings.HasPrefix(strings.ToLower(a.addr), "http://") {
+			return fmt.Errorf("%s %q is plaintext HTTP, which is "+
+				"refused on mainnet unless "+
+				"allow-insecure-mainnet is set", a.name, a.addr)
+		}
 	}
 
 	return nil

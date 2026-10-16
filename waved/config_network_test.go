@@ -265,6 +265,97 @@ func TestConfigValidateMainnetGatewayListenAddr(t *testing.T) {
 	}
 }
 
+// TestConfigValidateMainnetOutboundTLS verifies that plaintext links to the
+// operator and to the swap server are refused on mainnet unless
+// allow-insecure-mainnet is set, and allowed on other networks.
+func TestConfigValidateMainnetOutboundTLS(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		network    string
+		server     bool
+		swap       bool
+		serverHost string
+		swapHost   string
+		override   bool
+		wantErr    string
+	}{
+		{
+			name: "tls links",
+		},
+		{
+			name:    "plaintext operator link",
+			server:  true,
+			wantErr: "server.insecure is refused on mainnet",
+		},
+		{
+			name:    "plaintext swap link",
+			swap:    true,
+			wantErr: "swap.serverinsecure is refused on mainnet",
+		},
+		{
+			name:       "plaintext operator rest url",
+			serverHost: "http://operator.example:8080",
+			wantErr:    "is plaintext HTTP",
+		},
+		{
+			name:     "plaintext swap rest url",
+			swapHost: "HTTP://swap.example:8080",
+			wantErr:  "is plaintext HTTP",
+		},
+		{
+			name:       "https rest urls",
+			serverHost: "https://operator.example",
+			swapHost:   "https://swap.example",
+		},
+		{
+			name:       "override permits plaintext links",
+			server:     true,
+			swap:       true,
+			serverHost: "http://operator.example:8080",
+			override:   true,
+		},
+		{
+			name:    "signet permits plaintext links",
+			network: "signet",
+			server:  true,
+			swap:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := DefaultConfig()
+			cfg.Network = "mainnet"
+			if tc.network != "" {
+				cfg.Network = tc.network
+			}
+			cfg.AllowMainnet = true
+			cfg.AllowInsecureMainnet = tc.override
+			cfg.Server.Insecure = tc.server
+			cfg.Swap.ServerInsecure = tc.swap
+			if tc.serverHost != "" {
+				cfg.Server.Host = tc.serverHost
+			}
+			if tc.swapHost != "" {
+				cfg.Swap.ServerAddress = tc.swapHost
+			}
+
+			err := cfg.Validate()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestConfigValidateWalletDefaults verifies Validate fills in the
 // network-default Esplora/fee URL for the lwwallet and btcwallet backends
 // when left empty, and still requires an explicit value on networks with no
