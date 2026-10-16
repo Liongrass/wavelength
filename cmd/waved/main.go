@@ -217,8 +217,8 @@ func newRootCmd() *cobra.Command {
 	f.Bool(
 		"allow-insecure-mainnet", cfg.AllowInsecureMainnet, "permit "+
 			"rpc.notls, rpc.no-macaroons, a non-loopback "+
-			"gateway address, and the dev wallet password on "+
-			"mainnet",
+			"gateway, plaintext server and swap links, and the "+
+			"dev wallet password on mainnet",
 	)
 
 	registerOperatorFeeFlags(f, cfg)
