@@ -1,6 +1,7 @@
 package wasmwallet
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,7 +82,7 @@ func TestWasmAssetStaging(t *testing.T) {
 
 			cmd := exec.CommandContext(
 				t.Context(),
-				"make", "wasm-wallet",
+				"make", "--silent", "wasm-wallet",
 			)
 			cmd.Dir = root
 			t.Setenv("LOOKUP", lookup)
@@ -90,6 +91,14 @@ func TestWasmAssetStaging(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected lookup failure: %s",
 						output)
+				}
+
+				// Quiet Make suppresses recipe echoes, so this
+				// detects an attempted copy, not the recipe
+				// text.
+				if bytes.Contains(output, []byte("/assets/")) {
+					t.Fatalf("lookup reached asset "+
+						"copy: %s", output)
 				}
 
 				return

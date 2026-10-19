@@ -40,7 +40,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ inputs.release_tag || github.event.pull_request.number || github.ref }}
+  group: mobile-${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -176,7 +176,7 @@ jobs:
         with:
           ref: ${{ needs.release-source.outputs.sha }}
 
-      - name: Setup Go ${{ env.GO_VERSION }}
+      - name: Setup Go ${{ needs.release-source.outputs.go-version }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ needs.release-source.outputs.go-version }}
@@ -231,7 +231,7 @@ jobs:
         with:
           ref: ${{ needs.release-source.outputs.sha }}
 
-      - name: Setup Go ${{ env.GO_VERSION }}
+      - name: Setup Go ${{ needs.release-source.outputs.go-version }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ needs.release-source.outputs.go-version }}
@@ -272,7 +272,7 @@ jobs:
         with:
           ref: ${{ needs.release-source.outputs.sha }}
 
-      - name: Setup Go ${{ env.GO_VERSION }}
+      - name: Setup Go ${{ needs.release-source.outputs.go-version }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ needs.release-source.outputs.go-version }}
