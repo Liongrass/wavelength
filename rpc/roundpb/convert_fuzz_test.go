@@ -25,6 +25,15 @@ var fuzzHash32 = []byte{
 	0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 }
 
+// fuzzPubKey is the compressed secp256k1 generator point. It parses, so a
+// co-signer seeded with it lets the fuzzer get past key parsing and reach the
+// child index validation that follows.
+var fuzzPubKey = []byte{
+	0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0,
+	0x62, 0x95, 0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d,
+	0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+}
+
 // FuzzOutpointFromProto fuzzes the tx-hash bytes and output index. The
 // 32-byte length gate guards a fixed-size copy, so off-length inputs
 // (notably 31/33 bytes) are the interesting cases.
@@ -143,6 +152,12 @@ func FuzzTreeFromProtoFields(f *testing.F) {
 		fuzzHash32, int64(1000), []byte{0x51}, uint32(0), uint32(1),
 		make([]byte, 33), make([]byte, 64), fuzzHash32,
 	)
+	// Seed: a parseable co-signer with a forward child, so mutations
+	// reach the child output and index guards.
+	f.Add(
+		fuzzHash32, int64(1000), []byte{0x51}, uint32(0), uint32(1),
+		fuzzPubKey, []byte{}, fuzzHash32,
+	)
 	// Seed: child index points back at the parent (cycle), zero node
 	// amount, empty co-signer/sig.
 	f.Add(
@@ -210,6 +225,11 @@ func FuzzTreeFromProtoFields(f *testing.F) {
 
 		// Only assertion: no panic. The default node-count bound
 		// applies; the converter may return any error.
+		_, _ = TreeFromProto(pt)
+
+		// A nil node entry is rejected, not dereferenced. It gets its
+		// own call so it cannot mask the child validation above.
+		pt.Nodes = append(pt.Nodes, nil)
 		_, _ = TreeFromProto(pt)
 	})
 }
