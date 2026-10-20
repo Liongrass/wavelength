@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightninglabs/wavelength/lib/tree"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -229,7 +230,8 @@ func (t *txOutRecord) Record() tlv.Record {
 	}
 
 	return tlv.MakeDynamicRecord(
-		0, t, recordSize, txOutEncoder, txOutDecoder,
+		0, t, recordSize, txOutEncoder,
+		tlvutil.ExactDecoder(txOutDecoder),
 	)
 }
 
@@ -303,7 +305,8 @@ func (t *txOutsRecord) Record() tlv.Record {
 	}
 
 	return tlv.MakeDynamicRecord(
-		0, t, recordSize, txOutsEncoder, txOutsDecoder,
+		0, t, recordSize, txOutsEncoder,
+		tlvutil.ExactDecoder(txOutsDecoder),
 	)
 }
 
@@ -377,7 +380,8 @@ func txOutsDecoder(r io.Reader, val interface{}, buf *[8]byte, l uint64) error {
 			// length before make([]byte, scriptLen).
 			if scriptLen > l {
 				return fmt.Errorf("output script length %d "+
-					"exceeds record length %d", scriptLen, l)
+					"exceeds record length %d", scriptLen,
+					l)
 			}
 
 			pkScript := make([]byte, scriptLen)
@@ -411,7 +415,8 @@ func (p *pubKeysRecord) Record() tlv.Record {
 	}
 
 	return tlv.MakeDynamicRecord(
-		0, p, recordSize, pubKeysEncoder, pubKeysDecoder,
+		0, p, recordSize, pubKeysEncoder,
+		tlvutil.ExactDecoder(pubKeysDecoder),
 	)
 }
 

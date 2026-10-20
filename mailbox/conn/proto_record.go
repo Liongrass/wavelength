@@ -5,6 +5,7 @@ import (
 	"io"
 	"reflect"
 
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/tlv"
 	"google.golang.org/protobuf/proto"
 )
@@ -43,7 +44,7 @@ func (w *WrappedProto[T]) Record() tlv.Record {
 
 	return tlv.MakeDynamicRecord(
 		protoRecordType, w, sizeFunc, wrappedProtoEncoder[T],
-		wrappedProtoDecoder[T],
+		tlvutil.ExactDecoder(wrappedProtoDecoder[T]),
 	)
 }
 

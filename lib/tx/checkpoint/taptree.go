@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -44,7 +45,7 @@ func EncodeTapTree(leaves [][]byte) ([]byte, error) {
 				)
 			},
 			leavesEncoder,
-			leavesDecoder,
+			tlvutil.ExactDecoder(leavesDecoder),
 		),
 	}
 
@@ -74,13 +75,12 @@ func DecodeTapTree(data []byte) ([][]byte, error) {
 	tlvStream, err := tlv.NewStream(
 		tlv.MakePrimitiveRecord(typeTapscriptType, &typ),
 		tlv.MakeDynamicRecord(
-			typeTapscriptLeaves,
-			&leaves,
+			typeTapscriptLeaves, &leaves,
 			func() uint64 {
 				return recordSize(leavesEncoder, &leaves)
 			},
 			leavesEncoder,
-			leavesDecoder,
+			tlvutil.ExactDecoder(leavesDecoder),
 		),
 	)
 	if err != nil {
@@ -185,8 +185,9 @@ func leavesDecoder(r io.Reader, val interface{}, buf *[8]byte, l uint64) error {
 			}
 
 			// Buffer the exact leaf blob and validate its inner
-			// record framing before decoding, so the inner DVarBytes
-			// and unknown-record paths cannot over-allocate either.
+			// record framing before decoding, so the inner
+			// DVarBytes and unknown-record paths cannot
+			// over-allocate either.
 			leafBlob := make([]byte, blobSize)
 			if _, err := io.ReadFull(
 				&innerTlvReader, leafBlob,

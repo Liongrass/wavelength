@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/wavelength/baselib/tlvutil"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -61,7 +62,7 @@ func (n *Node) Record() tlv.Record {
 	}
 
 	return tlv.MakeDynamicRecord(
-		0, n, sizeFn, nodeEncoder, nodeDecoder,
+		0, n, sizeFn, nodeEncoder, tlvutil.ExactDecoder(nodeDecoder),
 	)
 }
 
