@@ -46,10 +46,10 @@ func TestBtcwalletRPCUsesClientBufconn(t *testing.T) {
 		require.NoError(t, listener.Close())
 		serveErr := <-errChan
 		require.True(
-			t,
-			serveErr == nil ||
+			t, serveErr == nil ||
 				errors.Is(serveErr, grpc.ErrServerStopped),
-			"unexpected gRPC server error: %v", serveErr,
+			"unexpected gRPC server error: %v",
+			serveErr,
 		)
 	}()
 

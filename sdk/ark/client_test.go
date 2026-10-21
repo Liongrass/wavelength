@@ -308,10 +308,10 @@ func startFakeDaemonServerWithService(t *testing.T,
 		server.Stop()
 		serveErr := <-errChan
 		require.True(
-			t,
-			serveErr == nil ||
+			t, serveErr == nil ||
 				errors.Is(serveErr, grpc.ErrServerStopped),
-			"unexpected gRPC server error: %v", serveErr,
+			"unexpected gRPC server error: %v",
+			serveErr,
 		)
 	})
 
