@@ -1,6 +1,6 @@
 module github.com/lightninglabs/wavelength/tools/linters
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/golangci/plugin-module-register v0.1.2
