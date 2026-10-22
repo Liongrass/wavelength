@@ -6,6 +6,11 @@ Client-side Ark round participation FSM implementing boarding (on-chain to
 off-chain), refresh (VTXO rollover), and leave (off-chain to on-chain exit)
 protocols with MuSig2 signing ceremonies.
 
+Scheduled waits publish a value snapshot in
+`PendingRoundAssembly.BatchWait` for status readers. Do not read the mutable
+`ClientEnvironment.scheduled` from RPC goroutines. The wait is logged once
+when selected and is still an in-memory attempt.
+
 ## Key Types
 
 For field-level detail, use `go doc github.com/lightninglabs/wavelength/round.<Symbol>`.

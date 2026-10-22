@@ -510,6 +510,10 @@ func (h *history) deriveActivity(ctx context.Context,
 	// summary does not).
 	entries = dedupeByID(entries)
 
+	if err := h.applyBatchWaits(ctx, entries); err != nil {
+		return nil, err
+	}
+
 	filtered := filterEntries(entries, req.GetPendingOnly(), kindFilter)
 
 	// Sort by updated_at descending — most recent first.

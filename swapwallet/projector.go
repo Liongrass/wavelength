@@ -469,6 +469,23 @@ func entryToProjection(entry *wavewalletrpc.WalletEntry) (db.ActivityProjection,
 		requestJSON = string(raw)
 	}
 
+	var batchWaitJSON string
+	pending := entry.GetStatus() ==
+		wavewalletrpc.EntryStatus_ENTRY_STATUS_PENDING
+	if pending && progress.GetBatchWindow() != nil {
+		raw, err := protojson.Marshal(
+			&wavewalletrpc.WalletEntryProgress{
+				WaitingReason: progress.GetWaitingReason(),
+				BatchWindow:   progress.GetBatchWindow(),
+			},
+		)
+		if err != nil {
+			return db.ActivityProjection{}, fmt.Errorf("marshal "+
+				"batch wait: %w", err)
+		}
+		batchWaitJSON = string(raw)
+	}
+
 	var confHeight *int64
 	if h := progress.GetConfirmationHeight(); h > 0 {
 		v := int64(h)
@@ -504,6 +521,7 @@ func entryToProjection(entry *wavewalletrpc.WalletEntry) (db.ActivityProjection,
 		ConfirmationHeight: confHeight,
 		VtxoOutpoint:       progress.GetVtxoOutpoint(),
 		RequestJSON:        requestJSON,
+		BatchWaitJSON:      batchWaitJSON,
 		EntryJSON:          string(entryJSON),
 		CreatedAtUnix:      createdAt,
 		UpdatedAtUnix:      updatedAt,
@@ -582,6 +600,22 @@ func rowToWalletEntry(row sqlc.ActivityEntry) (*wavewalletrpc.WalletEntry,
 		},
 		CreatedAtUnix: row.CreatedAtUnix,
 		UpdatedAtUnix: row.UpdatedAtUnix,
+	}
+
+	// Scheduling metadata shares the same atomic projection as phase and
+	// status. Terminal operations never retain a pending wait.
+	if row.BatchWaitJson != "" && entry.GetStatus() ==
+		wavewalletrpc.EntryStatus_ENTRY_STATUS_PENDING {
+
+		wait := &wavewalletrpc.WalletEntryProgress{}
+		opts := protojson.UnmarshalOptions{DiscardUnknown: true}
+		if err := opts.Unmarshal(
+			[]byte(row.BatchWaitJson), wait,
+		); err != nil {
+			return nil, fmt.Errorf("unmarshal batch wait: %w", err)
+		}
+		entry.Progress.WaitingReason = wait.GetWaitingReason()
+		entry.Progress.BatchWindow = wait.GetBatchWindow()
 	}
 
 	// failure_code is presence-tracked on the wire: absent means "no

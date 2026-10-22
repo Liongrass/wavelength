@@ -16,6 +16,12 @@ transparently — the caller only sees wallet vocabulary.
 The whole package lives behind `//go:build wavewalletrpc && swapruntime` so
 default builds avoid the swap executor's dependency graph.
 
+Pending deposits and cooperative sends gain scheduled batch timing during
+activity reconciliation (`batch_wait.go`). Correlate deposits by boarding
+address and sends by input outpoint. Store changes on the existing entry and
+resumable event stream; clear the window after leaving assembly. The live round
+snapshot has a five-second deadline and uses the existing 60-second reconciler.
+
 ## Key Types
 
 - `Service` — gRPC handler implementing `wavewalletrpc.WalletServiceServer`.
