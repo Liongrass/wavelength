@@ -127,6 +127,7 @@ func renderWalletActivityTable(out io.Writer,
 			entry.GetId(),
 			entry.GetNote(),
 		)
+		renderActivityBatchWait(w, entry)
 	}
 
 	return w.Flush()
@@ -199,4 +200,44 @@ func emptyDash(value string) string {
 // formatSat renders a signed satoshi amount with its unit.
 func formatSat(value int64) string {
 	return fmt.Sprintf("%d sat", value)
+}
+
+// renderActivityBatchWait keeps scheduled progress next to its pending row
+// without widening every activity column. Explicit UTC labels avoid mixing
+// operator timestamps with the table's local last-update timestamp.
+func renderActivityBatchWait(out io.Writer, entry *wavewalletrpc.WalletEntry) {
+	if entry.GetStatus() != wavewalletrpc.EntryStatus_ENTRY_STATUS_PENDING {
+		return
+	}
+
+	progress := entry.GetProgress()
+	if reason := progress.GetWaitingReason(); reason != "" {
+		fmt.Fprintf(out, "  Waiting reason: %s\n", reason)
+	}
+	window := progress.GetBatchWindow()
+	if window == nil {
+		return
+	}
+
+	opens := formatBatchTime(window.GetRegistrationOpensUnix() * 1000)
+	cutoff := formatBatchTime(window.GetCutoffUnix() * 1000)
+	fmt.Fprintf(
+		out, "  Registration window (UTC): %s to %s\n", opens, cutoff,
+	)
+	fmt.Fprintf(
+		out, "  Planned join (UTC): %s\n",
+		formatBatchTime(
+			window.GetPlannedJoinUnixMs(),
+		),
+	)
+}
+
+// formatBatchTime renders an operator-clock timestamp with millisecond
+// precision. Zero means unknown, not the Unix epoch.
+func formatBatchTime(unixMs int64) string {
+	if unixMs == 0 {
+		return "-"
+	}
+
+	return time.UnixMilli(unixMs).UTC().Format("2006-01-02 15:04:05.000")
 }
