@@ -26,6 +26,9 @@ state transitions and validation rules live under [Invariants](#invariants).
   `PartialSigsSentState`, `ForfeitSignaturesCollectingState`,
   `InputSigSentState`, `ConfirmedState`, `ClientFailedState`,
   `RecoveryInitiatedState`.
+- `ScheduledBatchWait` — value snapshot (`Opens`, `Cutoff`, `PlannedJoin`, all
+  on the operator clock) stored in `PendingRoundAssembly.BatchWait`. A zero
+  `Cutoff` means no scheduled wait has been selected.
 - `ClientEvent` — sealed inbound event interface. Notable members:
   `JoinRoundQuoteReceived` (carries reseal `SealPass`), `QuoteAccepted`,
   `QuoteRejected`, `ForfeitCollectionTimedOut`, `ForfeitSignatureResponse`,

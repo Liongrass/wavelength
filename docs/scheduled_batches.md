@@ -257,16 +257,18 @@ duration. Repeated timer checks do not repeat this message.
 In the wallet activity API, pending deposits and cooperative sends expose the
 same timing under `WalletEntry.progress.waiting_reason` and
 `WalletEntry.progress.batch_window`. `wavecli activity` prints the waiting
-reason, registration window, and planned join below each waiting row, with UTC
-labels. `wavecli activity --format expanded` and `activity inspect` show the
-same details; `--format json` exposes the structured fields. Both the daemon
+reason, registration window, and planned join after the table, labelled by
+activity ID and with UTC timestamps. `wavecli activity --format expanded` and
+`activity inspect` show the same details; `--format json` exposes the structured fields. Both the daemon
 and CLI need a version with these fields and renderers.
 
 These fields update the existing activity
 entry and its resumable event stream; they do not create another payment entry.
 The existing reconciliation loop refreshes them every 60 seconds, so this view
-can lag live round status. Unchanged timing produces no new event. A later
-attempt can replace the window, and reconciliation clears it after the round
+can lag live round status. If the round lookup fails or times out, the last known
+wait stays visible while lifecycle updates continue. A terminal activity state
+clears its wait even during an outage. Unchanged timing produces no new event.
+A later attempt can replace the window, and reconciliation clears it after the round
 advances or the client restarts without that attempt. Refresh-only rounds are
 visible through round status and logs; they do not create a wallet activity row.
 

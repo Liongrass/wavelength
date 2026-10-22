@@ -4,6 +4,7 @@ package swapwallet
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/lightninglabs/wavelength/ledger"
@@ -16,14 +17,22 @@ import (
 // batchWaitRPC supplies the optional live round status to activity tests.
 type batchWaitRPC struct {
 	*fakeRPCServer
-	rounds []*waverpc.RoundInfo
+	rounds          []*waverpc.RoundInfo
+	err             error
+	waitForDeadline bool
 }
 
 // ListRounds returns a detached test snapshot of the selected batch window.
-func (f *batchWaitRPC) ListRounds(context.Context, *waverpc.ListRoundsRequest) (
-	*waverpc.ListRoundsResponse, error) {
+func (f *batchWaitRPC) ListRounds(ctx context.Context,
+	_ *waverpc.ListRoundsRequest) (*waverpc.ListRoundsResponse, error) {
 
-	return &waverpc.ListRoundsResponse{Rounds: f.rounds}, nil
+	if f.waitForDeadline {
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
+
+	return &waverpc.ListRoundsResponse{Rounds: f.rounds}, f.err
 }
 
 // TestActivityBatchWaitReconciliation exercises real persistence and replay:
@@ -34,13 +43,18 @@ func TestActivityBatchWaitReconciliation(t *testing.T) {
 	runtime, store, rpc := newReconcileFixture(t)
 	const address = "bcrt1qbatchwait"
 	const id = "deposit-" + address
+	// The ledger reports an on-chain-confirmed deposit with an active
+	// boarding intent as "boarding" until its round confirms.
 	rpc.listTxResp = &waverpc.ListTransactionsResponse{
 		Transactions: []*waverpc.TransactionHistoryEntry{{
 			Type:               "boarding",
 			Subtype:            ledger.EventWalletUTXOCreated,
-			ConfirmationStatus: "pending", AmountSat: 100000,
-			Txid: "boarding-txid", BoardingAddress: address,
-			CreatedAtUnixS: 100,
+			ConfirmationStatus: "boarding",
+			AmountSat:          100000,
+			ConfirmationHeight: 100,
+			Txid:               "boarding-txid",
+			BoardingAddress:    address,
+			CreatedAtUnixS:     100,
 		}},
 	}
 	info := &waverpc.RoundInfo{
@@ -68,6 +82,11 @@ func TestActivityBatchWaitReconciliation(t *testing.T) {
 	runtime.reconcileActivity(ctx)
 	got := listedEntry(t, h, id)
 	require.Equal(
+		t, wavewalletrpc.EntryStatus_ENTRY_STATUS_PENDING, got.Status,
+	)
+	require.Equal(t, int32(100), got.GetProgress().GetConfirmationHeight())
+	require.Equal(t, "boarding", got.GetProgress().GetPhaseLabel())
+	require.Equal(
 		t, info.WaitingReason, got.GetProgress().GetWaitingReason(),
 	)
 	require.Equal(
@@ -89,6 +108,29 @@ func TestActivityBatchWaitReconciliation(t *testing.T) {
 		replay.GetProgress().GetBatchWindow(),
 	)
 
+	runtime.reconcileActivity(ctx)
+	events, err = store.PullEvents(ctx, 0, 100)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	// A failed optional snapshot must not clear the saved wait or append a
+	// clear/re-add pair. Exercise both a transport failure and the actual
+	// bounded actor-query deadline, then the first successful retry.
+	provider.err = errors.New("round actor unavailable")
+	for _, wait := range []bool{false, true} {
+		provider.waitForDeadline = wait
+		runtime.reconcileActivity(ctx)
+		require.Equal(
+			t, int64(1800000060),
+			listedEntry(t, h, id).GetProgress().GetBatchWindow().
+				GetCutoffUnix(),
+		)
+		events, err = store.PullEvents(ctx, 0, 100)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+	}
+	provider.err = nil
+	provider.waitForDeadline = false
 	runtime.reconcileActivity(ctx)
 	events, err = store.PullEvents(ctx, 0, 100)
 	require.NoError(t, err)
@@ -217,4 +259,72 @@ func TestEarliestActivityBatchWait(t *testing.T) {
 		}
 		require.Same(t, earlier, waits["address"])
 	}
+}
+
+// TestActivityBatchWaitFailureAllowsLifecycle keeps required activity updates
+// and no-store reads working while the optional round actor is unavailable.
+func TestActivityBatchWaitFailureAllowsLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	runtime, store, rpc := newReconcileFixture(t)
+	const subtype = ledger.EventWalletUTXOCreated
+	const reason = "Waiting for scheduled batch registration"
+	rpc.listTxResp = &waverpc.ListTransactionsResponse{}
+	for _, address := range []string{"waiting", "settling"} {
+		rpc.listTxResp.Transactions = append(
+			rpc.listTxResp.Transactions,
+			&waverpc.TransactionHistoryEntry{
+				Type:               "boarding",
+				Subtype:            subtype,
+				ConfirmationStatus: "boarding",
+				ConfirmationHeight: 100,
+				AmountSat:          100000,
+				Txid:               address + "-txid",
+				BoardingAddress:    address,
+				CreatedAtUnixS:     100,
+			},
+		)
+	}
+	provider := &batchWaitRPC{fakeRPCServer: rpc,
+		rounds: []*waverpc.RoundInfo{{
+			BoardingAddresses: []string{
+				"waiting",
+				"settling",
+			},
+			WaitingReason: reason,
+			BatchWindow: &waverpc.ScheduledBatchWindow{
+				CutoffUnix: 1800000060,
+			},
+		}},
+	}
+	runtime.deps.RPCServer = provider
+	runtime.reconcileActivity(ctx)
+
+	provider.err = errors.New("round actor unavailable")
+	rpc.listTxResp.Transactions[1].ConfirmationStatus = "confirmed"
+	runtime.reconcileActivity(ctx)
+	h := newHistory(runtime.deps, runtime)
+	waiting := listedEntry(t, h, "deposit-waiting")
+	require.NotNil(t, waiting.GetProgress().GetBatchWindow())
+	settled := listedEntry(t, h, "deposit-settling")
+	require.Equal(
+		t, wavewalletrpc.EntryStatus_ENTRY_STATUS_COMPLETE,
+		settled.Status,
+	)
+	require.Nil(t, settled.GetProgress().GetBatchWindow())
+	events, err := store.PullEvents(ctx, 0, 100)
+	require.NoError(t, err)
+	require.Len(t, events, 3)
+
+	// Legacy embeddings without a canonical store still return lifecycle
+	// data and counts even when they cannot enrich it with live timing.
+	deps := *runtime.deps
+	deps.ActivityStore = nil
+	h = newHistory(&deps, runtime)
+	list, err := h.List(ctx, &wavewalletrpc.ListRequest{})
+	require.NoError(t, err)
+	require.Len(t, list.GetActivity().GetEntries(), 2)
+	count, err := h.countPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), count)
 }

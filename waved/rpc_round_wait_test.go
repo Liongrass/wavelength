@@ -124,3 +124,33 @@ func TestWatchRoundWaitChanges(t *testing.T) {
 	changedRoundStatuses(previous, []*waverpc.RoundInfo{a})
 	require.NotContains(t, previous, "b")
 }
+
+// TestListRoundsPendingWaitsIgnorePageSize pins the live-round contract: SQL
+// pagination must never hide a simultaneous pending registration.
+func TestListRoundsPendingWaitsIgnorePageSize(t *testing.T) {
+	t.Parallel()
+	system := newRoundActorWithStates(
+		t, map[string]round.FSMStateInfo{
+			"pending-a": {
+				State:  &round.PendingRoundAssembly{},
+				IsTemp: true,
+			},
+			"pending-b": {
+				State:  &round.PendingRoundAssembly{},
+				IsTemp: true,
+			},
+		},
+	)
+	defer func() {
+		require.NoError(t, system.Shutdown(t.Context()))
+	}()
+	srv := &RPCServer{server: &Server{actorSystem: system}}
+	resp, err := srv.ListRounds(t.Context(), &waverpc.ListRoundsRequest{
+		StateFilter: waverpc.RoundState_ROUND_STATE_PENDING_ASSEMBLY,
+		PageSize:    1,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetRounds(), 2)
+	keys := []string{resp.Rounds[0].RoundKey, resp.Rounds[1].RoundKey}
+	require.ElementsMatch(t, []string{"pending-a", "pending-b"}, keys)
+}

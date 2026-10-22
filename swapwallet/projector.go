@@ -18,6 +18,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// activityProjectionOptions controls optional enrichment independently of the
+// authoritative lifecycle fields. A failed snapshot must not clear a wait.
+type activityProjectionOptions struct {
+	preserveBatchWait bool
+}
+
 // project writes one emitted WalletEntry into the canonical activity log: it
 // upserts the current-state row and appends the transition event, atomically.
 // It returns the event_seq and effective entry assigned to the appended
@@ -29,8 +35,8 @@ import (
 // A caller stamps a live update with the returned seq and can gate a follow-up
 // side effect on the row actually landing. When no store is wired, projection
 // is a no-op and the legacy derive-on-read path continues unchanged.
-func (r *Runtime) project(ctx context.Context,
-	entry *wavewalletrpc.WalletEntry) (int64, *wavewalletrpc.WalletEntry,
+func (r *Runtime) project(ctx context.Context, entry *wavewalletrpc.WalletEntry,
+	opts ...activityProjectionOptions) (int64, *wavewalletrpc.WalletEntry,
 	error) {
 
 	if r.deps == nil || r.deps.ActivityStore == nil {
@@ -61,6 +67,13 @@ func (r *Runtime) project(ctx context.Context,
 		effectiveEntry = mergeActivityContext(
 			existingEntry, effectiveEntry,
 		)
+		for _, opt := range opts {
+			if opt.preserveBatchWait {
+				preserveActivityBatchWait(
+					existingEntry, effectiveEntry,
+				)
+			}
+		}
 		stampLateTransition(
 			effectiveEntry, existingRow.UpdatedAtUnix, time.Now(),
 		)
@@ -203,12 +216,13 @@ func (r *Runtime) projectAndEmit(ctx context.Context,
 // seq (0 when change-suppressed / no store) and the projection error, so the
 // reconciler can gate its pending-clear on a durable write. See projectMu.
 func (r *Runtime) projectEmitLocked(ctx context.Context,
-	entry *wavewalletrpc.WalletEntry) (int64, error) {
+	entry *wavewalletrpc.WalletEntry, opts ...activityProjectionOptions) (
+	int64, error) {
 
 	r.projectMu.Lock()
 	defer r.projectMu.Unlock()
 
-	seq, effectiveEntry, err := r.project(ctx, entry)
+	seq, effectiveEntry, err := r.project(ctx, entry, opts...)
 
 	switch {
 	case r.deps == nil || r.deps.ActivityStore == nil:
@@ -230,10 +244,11 @@ func (r *Runtime) projectEmitLocked(ctx context.Context,
 // next pass — and the pending record is cleared only after a durable project,
 // so a partial page never strands or corrupts a row.
 func (r *Runtime) projectDerivedPage(ctx context.Context,
-	entries []*wavewalletrpc.WalletEntry) {
+	entries []*wavewalletrpc.WalletEntry, preserveBatchWait bool) {
 
+	opts := activityProjectionOptions{preserveBatchWait: preserveBatchWait}
 	for _, entry := range entries {
-		if _, err := r.projectEmitLocked(ctx, entry); err != nil {
+		if _, err := r.projectEmitLocked(ctx, entry, opts); err != nil {
 			continue
 		}
 
@@ -326,7 +341,7 @@ func (r *Runtime) reprojectActivity(ctx context.Context,
 			break
 		}
 
-		r.projectDerivedPage(ctx, entries)
+		r.projectDerivedPage(ctx, entries, h.batchWaitUnavailable)
 		projected += len(entries)
 
 		offset += uint32(len(entries))
@@ -378,7 +393,7 @@ func (r *Runtime) reprojectRecentActivity(ctx context.Context,
 	}
 
 	entries := list.GetEntries()
-	r.projectDerivedPage(ctx, entries)
+	r.projectDerivedPage(ctx, entries, h.batchWaitUnavailable)
 
 	return len(entries), nil
 }

@@ -146,7 +146,8 @@ For field-level detail, use `go doc github.com/lightninglabs/wavelength/cmd/wave
 ## Invariants
 
 - Activity table, expanded, and inspection views show scheduled waiting
-  metadata below pending entries. Window and planned-join times are explicitly
+  metadata for pending entries. In tables, render ID-labelled details after
+  flushing all rows to preserve column alignment. Window and join times are
   UTC; absent metadata and terminal entries do not display a wait.
 
 

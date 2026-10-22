@@ -9,6 +9,7 @@ import (
 
 	"github.com/lightninglabs/wavelength/rpc/wavewalletrpc"
 	"github.com/lightninglabs/wavelength/waverpc"
+	"google.golang.org/protobuf/proto"
 )
 
 // roundStatusProvider is optional for embeddings that predate round progress.
@@ -49,7 +50,6 @@ func (h *history) applyBatchWaits(ctx context.Context,
 	defer cancel()
 	rounds, err := provider.ListRounds(queryCtx, &waverpc.ListRoundsRequest{
 		StateFilter: waverpc.RoundState_ROUND_STATE_PENDING_ASSEMBLY,
-		PageSize:    1,
 	})
 	if err != nil {
 		return fmt.Errorf("query pending batch windows: %w", err)
@@ -152,4 +152,25 @@ func rememberEarliestWait(waits map[string]*waverpc.RoundInfo, key string,
 
 		waits[key] = info
 	}
+}
+
+// preserveActivityBatchWait retains only optional wait metadata when its source
+// is unavailable. This runs under projectMu with the existing-row read so a
+// concurrent projection cannot be overwritten with an older wait. Terminal
+// lifecycle changes remain authoritative and always clear the stored window.
+func preserveActivityBatchWait(existing, next *wavewalletrpc.WalletEntry) {
+	if !batchWaitEligible(next) ||
+		existing.GetProgress().GetBatchWindow() == nil {
+		return
+	}
+
+	if next.Progress == nil {
+		next.Progress = &wavewalletrpc.WalletEntryProgress{}
+	}
+	next.Progress.WaitingReason = existing.GetProgress().GetWaitingReason()
+	next.Progress.BatchWindow = &wavewalletrpc.ScheduledBatchWindow{}
+	proto.Merge(
+		next.Progress.BatchWindow,
+		existing.GetProgress().GetBatchWindow(),
+	)
 }

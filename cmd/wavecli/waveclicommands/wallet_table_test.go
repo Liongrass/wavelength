@@ -304,3 +304,68 @@ func TestActivityBatchWaitRendering(t *testing.T) {
 	renderActivityBatchWait(&out, entry)
 	require.Empty(t, out.String())
 }
+
+// TestActivityBatchWaitTableAlignment keeps every row aligned with the header
+// when early rows have wait details and later rows widen different columns.
+func TestActivityBatchWaitTableAlignment(t *testing.T) {
+	t.Parallel()
+	entries := []*wrpc.WalletEntry{
+		{Id: "first", Kind: wrpc.EntryKind_ENTRY_KIND_EXIT,
+			Status:    wrpc.EntryStatus_ENTRY_STATUS_PENDING,
+			AmountSat: 1, Progress: &wrpc.WalletEntryProgress{
+				PhaseLabel:    "boarding",
+				WaitingReason: "waiting",
+			},
+		},
+		{Id: "middle-longer", Kind: wrpc.EntryKind_ENTRY_KIND_DEPOSIT,
+			Status:    wrpc.EntryStatus_ENTRY_STATUS_PENDING,
+			AmountSat: 123456789,
+			Progress: &wrpc.WalletEntryProgress{
+				PhaseLabel:    "boarding",
+				WaitingReason: "waiting",
+			},
+		},
+		{Id: "last", Kind: wrpc.EntryKind_ENTRY_KIND_SEND,
+			Status: wrpc.EntryStatus_ENTRY_STATUS_COMPLETE,
+			Progress: &wrpc.WalletEntryProgress{
+				PhaseLabel: "confirmed",
+			}},
+	}
+	var out bytes.Buffer
+	require.NoError(
+		t,
+		renderWalletActivityTable(
+			&out, activityResponse(entries...),
+		),
+	)
+	lines := strings.Split(out.String(), "\n")
+	for i, entry := range entries {
+		for _, column := range []struct{ header, value string }{
+			{
+				"KIND",
+				formatEntryKind(entry.Kind),
+			},
+			{
+				"STATUS",
+				formatEntryStatus(entry.Status),
+			},
+			{
+				"PHASE",
+				entry.Progress.PhaseLabel,
+			},
+			{
+				"ID",
+				entry.Id,
+			},
+		} {
+			require.Equal(
+				t, strings.Index(lines[0], column.header),
+				strings.Index(lines[i+1], column.value),
+				column.header,
+			)
+		}
+	}
+	require.Contains(t, out.String(), "Batch wait for first:")
+	require.Contains(t, out.String(), "Batch wait for middle-longer:")
+	require.NotContains(t, out.String(), "Batch wait for last:")
+}

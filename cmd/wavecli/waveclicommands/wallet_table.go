@@ -127,10 +127,34 @@ func renderWalletActivityTable(out io.Writer,
 			entry.GetId(),
 			entry.GetNote(),
 		)
-		renderActivityBatchWait(w, entry)
 	}
 
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	// Detail lines terminate tabwriter alignment blocks. Write them only
+	// after the complete table, labelling each with its activity ID.
+	var details strings.Builder
+	for _, entry := range resp.GetActivity().GetEntries() {
+		if entry.GetStatus() !=
+			wavewalletrpc.EntryStatus_ENTRY_STATUS_PENDING {
+
+			continue
+		}
+		progress := entry.GetProgress()
+		if progress.GetWaitingReason() == "" &&
+			progress.GetBatchWindow() == nil {
+
+			continue
+		}
+		fmt.Fprintf(&details, "\nBatch wait for %s:\n", entry.GetId())
+		renderActivityBatchWait(&details, entry)
+	}
+
+	_, err := io.WriteString(out, details.String())
+
+	return err
 }
 
 // renderWalletActivityExpanded renders activity entries as markdown-like
